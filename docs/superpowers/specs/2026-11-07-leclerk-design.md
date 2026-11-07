@@ -213,8 +213,24 @@ Checks run whenever a unit is created or its settings change. They run against
 ### 4.5 Health checks
 
 - A health check is defined at **resource** level and runs **per unit**,
-  receiving that unit's settings. It defaults to the type's built-in check and
-  can be replaced by a user-defined command.
+  receiving that unit's settings.
+- **Each type offers a set of named built-in checks; a resource picks one of
+  them or a custom script** (user decision). Proposed set (my call):
+  - `device`:
+    - `exists`;
+    - `accessible` (openable read/write by this user);
+    - `not-open` (user decision: no process has the file or device open; only
+      processes of the same OS user are visible, which is enough here);
+    - `none`;
+    - default: `exists` + `not-open` (my call).
+  - `service`: `tcp-connect` (default for connect units), `port-free` (default
+    for listen units), `http` (GET on the endpoint returns 2xx), `none`;
+  - `generic`: `none` (default);
+  - any type: `custom` with a script.
+
+  A resource that doesn't choose gets its type's default. **Checks can be
+  combined** (my call): a resource's health check is a list, every entry must
+  pass, and the first failure is reported.
   - My call: a user-defined command gets the settings as environment variables,
     not substituted into the command text, so a malicious or careless setting
     can't inject shell. Exit status 0 means healthy. It has a timeout.
