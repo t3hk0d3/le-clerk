@@ -1,0 +1,2370 @@
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+use leclerk::clock::ManualClock;
+use leclerk::inventory::{
+    Inventory, InventoryError, NewResource, NewUnit, PromotionError, Promotions, ResourcePatch,
+    UnitPatch, View, Warning,
+};
+use leclerk::model::{
+    BuiltinCheck, Caller, Check, HealthSpec, HolderRef, ProjectKey, Resource, ResourceId,
+    ResourceType, Scope, UnitId, UnitSettings,
+};
+use leclerk::scope::{ProjectResolver, ScopeError};
+use leclerk::store::{Store, audit};
+use tempfile::TempDir;
+
+fn rid(s: &str) -> ResourceId {
+    ResourceId::parse(s).unwrap()
+}
+
+fn uid(s: &str) -> UnitId {
+    UnitId::parse(s).unwrap()
+}
+
+fn project(p: &str) -> ProjectKey {
+    ProjectKey(PathBuf::from(p))
+}
+
+fn caller(project_path: Option<&str>) -> Caller {
+    Caller {
+        holder: HolderRef::User {
+            tag: "tester".into(),
+        },
+        project: project_path.map(project),
+        user_requested: None,
+    }
+}
+
+fn device_settings(path: &str) -> UnitSettings {
+    UnitSettings::Device {
+        path: PathBuf::from(path),
+    }
+}
+
+fn new_device(id: &str, scope: Scope) -> NewResource {
+    NewResource {
+        id: rid(id),
+        ty: ResourceType::Device,
+        scope,
+        description: "a board".into(),
+        notes: String::new(),
+        health: None,
+    }
+}
+
+fn new_unit(id: &str, path: &str) -> NewUnit {
+    NewUnit {
+        id: uid(id),
+        settings: device_settings(path),
+        notes: String::new(),
+    }
+}
+
+struct Fixture {
+    store: Store,
+    inv: Inventory,
+    promos: Promotions,
+    clock: Arc<ManualClock>,
+}
+
+fn fixture() -> Fixture {
+    let clock = Arc::new(ManualClock::new(1_000));
+    Fixture {
+        store: Store::open_in_memory().unwrap(),
+        inv: Inventory::new(clock.clone()),
+        promos: Promotions::new(clock.clone()),
+        clock,
+    }
+}
+
+impl Fixture {
+    /// Create a device resource with one unit; returns the resource as stored.
+    fn seed(&mut self, who: &Caller, id: &str, scope: Scope, unit: &str) -> Resource {
+        self.store
+            .tx(|tx| {
+                self.inv.create_resource(tx, who, &new_device(id, scope))?;
+                self.inv.add_unit(
+                    tx,
+                    who,
+                    &rid(id),
+                    &new_unit(unit, &format!("/dev/seed-{id}-{unit}")),
+                )?;
+                self.inv.get_resource(tx, who, &rid(id))
+            })
+            .unwrap()
+    }
+
+    fn audit_actions(&mut self) -> Vec<String> {
+        self.store
+            .tx(audit::all)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.action)
+            .collect()
+    }
+}
+
+mod store {
+    use super::*;
+
+    mod open {
+        use super::*;
+
+        mod on_a_file_path {
+            use super::*;
+
+            #[test]
+            fn enables_wal_and_foreign_keys_and_persists() {
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("sub").join("clerk.db");
+                {
+                    let mut store = Store::open(&path).unwrap();
+                    let (mode, fk): (String, i64) = store
+                        .tx(|tx| -> Result<_, leclerk::store::StoreError> {
+                            Ok((
+                                tx.conn()
+                                    .query_row("PRAGMA journal_mode", [], |r| r.get(0))?,
+                                tx.conn()
+                                    .query_row("PRAGMA foreign_keys", [], |r| r.get(0))?,
+                            ))
+                        })
+                        .unwrap();
+                    assert_eq!(mode, "wal");
+                    assert_eq!(fk, 1);
+                    let who = caller(None);
+                    let inv = Inventory::new(Arc::new(ManualClock::new(5)));
+                    store
+                        .tx(|tx| inv.create_resource(tx, &who, &new_device("a", Scope::User)))
+                        .unwrap();
+                }
+                let mut store = Store::open(&path).unwrap();
+                let inv = Inventory::new(Arc::new(ManualClock::new(5)));
+                let got = store.tx(|tx| inv.get_resource(tx, &caller(None), &rid("a")));
+                assert!(got.is_ok());
+            }
+        }
+    }
+
+    mod tx {
+        use super::*;
+
+        mod on_error {
+            use super::*;
+
+            #[test]
+            fn rolls_back_all_changes() {
+                let mut f = fixture();
+                let who = caller(None);
+                let res: Result<(), InventoryError> = f.store.tx(|tx| {
+                    f.inv
+                        .create_resource(tx, &who, &new_device("a", Scope::User))?;
+                    Err(InventoryError::NotFound)
+                });
+                assert!(res.is_err());
+                let got = f.store.tx(|tx| f.inv.get_resource(tx, &who, &rid("a")));
+                assert!(matches!(got, Err(InventoryError::NotFound)));
+            }
+        }
+    }
+}
+
+mod project_resolver {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn repo() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        (tmp, root)
+    }
+
+    mod resolve {
+        use super::*;
+
+        mod on_cwd_inside_a_git_repo {
+            use super::*;
+
+            #[test]
+            fn returns_the_canonical_common_git_dir() {
+                let (_tmp, root) = repo();
+                let sub = root.join("src").join("deep");
+                std::fs::create_dir_all(&sub).unwrap();
+                let key = ProjectResolver::resolve(&sub).unwrap();
+                assert_eq!(key, ProjectKey(root.join(".git")));
+            }
+        }
+
+        mod on_cwd_inside_a_linked_worktree {
+            use super::*;
+
+            #[test]
+            fn returns_the_same_key_as_the_main_checkout() {
+                let (tmp, root) = repo();
+                let wt = tmp.path().canonicalize().unwrap().join("wt");
+                git(
+                    &root,
+                    &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "side"],
+                );
+                let main_key = ProjectResolver::resolve(&root).unwrap();
+                let wt_key = ProjectResolver::resolve(&wt).unwrap();
+                assert_eq!(wt_key, main_key);
+            }
+        }
+
+        mod on_cwd_outside_any_git_repo {
+            use super::*;
+
+            #[test]
+            fn returns_the_canonical_cwd() {
+                let tmp = TempDir::new().unwrap();
+                let dir = tmp.path().canonicalize().unwrap();
+                let key = ProjectResolver::resolve(&dir).unwrap();
+                assert_eq!(key, ProjectKey(dir));
+            }
+        }
+
+        mod on_nonexistent_cwd {
+            use super::*;
+
+            #[test]
+            fn returns_no_such_directory() {
+                let tmp = TempDir::new().unwrap();
+                let err = ProjectResolver::resolve(&tmp.path().join("nope")).unwrap_err();
+                assert!(matches!(err, ScopeError::NoSuchDirectory(_)));
+            }
+        }
+    }
+}
+
+mod inventory {
+    use super::*;
+
+    mod create_resource {
+        use super::*;
+
+        mod on_new_id_in_scope {
+            use super::*;
+
+            fn create_with_health(f: &mut Fixture) -> Resource {
+                let who = caller(Some("/p/a"));
+                let health = HealthSpec {
+                    checks: vec![Check::Builtin(BuiltinCheck::Exists)],
+                };
+                f.store
+                    .tx(|tx| {
+                        let mut n = new_device("esp32", Scope::Project(project("/p/a")));
+                        n.notes = "bench 2".into();
+                        n.health = Some(health);
+                        f.inv.create_resource(tx, &who, &n).map(|c| c.value)
+                    })
+                    .unwrap()
+            }
+
+            #[test]
+            fn persists_type_scope_description_and_health() {
+                let mut f = fixture();
+                create_with_health(&mut f);
+                let who = caller(Some("/p/a"));
+                let got = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("esp32")))
+                    .unwrap();
+                assert_eq!(got.ty, ResourceType::Device);
+                assert_eq!(got.scope, Scope::Project(project("/p/a")));
+                assert_eq!(got.description, "a board");
+                assert_eq!(got.notes, "bench 2");
+                assert_eq!(
+                    got.health,
+                    Some(HealthSpec {
+                        checks: vec![Check::Builtin(BuiltinCheck::Exists)]
+                    })
+                );
+                assert_eq!(got.created_at, 1_000);
+            }
+
+            #[test]
+            fn writes_audit_entry_resource_created() {
+                let mut f = fixture();
+                create_with_health(&mut f);
+                let entries = f.store.tx(audit::all).unwrap();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].action, "resource_created");
+                assert_eq!(entries[0].at, 1_000);
+                assert_eq!(
+                    entries[0].actor,
+                    HolderRef::User {
+                        tag: "tester".into()
+                    }
+                );
+                assert_eq!(entries[0].detail["id"], "esp32");
+            }
+
+            #[test]
+            fn records_user_requested_reason_in_audit() {
+                let mut f = fixture();
+                let mut who = caller(None);
+                who.user_requested = Some("user asked".into());
+                f.store
+                    .tx(|tx| {
+                        f.inv
+                            .create_resource(tx, &who, &new_device("a", Scope::User))
+                    })
+                    .unwrap();
+                let entries = f.store.tx(audit::all).unwrap();
+                assert_eq!(entries[0].user_requested.as_deref(), Some("user asked"));
+            }
+        }
+
+        mod on_id_already_used_in_same_scope {
+            use super::*;
+
+            #[test]
+            fn returns_already_exists() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .create_resource(tx, &who, &new_device("a", Scope::User))
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::AlreadyExists));
+            }
+        }
+
+        mod on_project_scope_other_than_the_callers {
+            use super::*;
+
+            #[test]
+            fn returns_scope_not_allowed_and_persists_nothing() {
+                let mut f = fixture();
+                let who = caller(Some("/p/a"));
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv.create_resource(
+                            tx,
+                            &who,
+                            &new_device("x", Scope::Project(project("/p/b"))),
+                        )
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::ScopeNotAllowed));
+                let all = f
+                    .store
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::All))
+                    .unwrap();
+                assert_eq!(all.len(), 0);
+                assert_eq!(f.audit_actions().len(), 0);
+            }
+
+            #[test]
+            fn does_not_reveal_whether_the_id_exists_there() {
+                let mut f = fixture();
+                f.seed(
+                    &caller(Some("/p/b")),
+                    "x",
+                    Scope::Project(project("/p/b")),
+                    "u1",
+                );
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv.create_resource(
+                            tx,
+                            &caller(Some("/p/a")),
+                            &new_device("x", Scope::Project(project("/p/b"))),
+                        )
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::ScopeNotAllowed));
+            }
+        }
+
+        mod on_project_scope_with_no_caller_project {
+            use super::*;
+
+            #[test]
+            fn returns_scope_not_allowed() {
+                let mut f = fixture();
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv.create_resource(
+                            tx,
+                            &caller(None),
+                            &new_device("x", Scope::Project(project("/p/a"))),
+                        )
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::ScopeNotAllowed));
+            }
+        }
+
+        mod on_health_check_not_offered_by_the_type {
+            use super::*;
+
+            #[test]
+            fn returns_invalid_settings_naming_health() {
+                let mut f = fixture();
+                let who = caller(None);
+                let mut n = new_device("a", Scope::User);
+                n.health = Some(HealthSpec {
+                    checks: vec![Check::Builtin(BuiltinCheck::Http)],
+                });
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.create_resource(tx, &who, &n))
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    InventoryError::InvalidSettings { field: "health" }
+                ));
+            }
+
+            #[test]
+            fn persists_nothing() {
+                let mut f = fixture();
+                let who = caller(None);
+                let mut n = new_device("a", Scope::User);
+                n.health = Some(HealthSpec {
+                    checks: vec![Check::Builtin(BuiltinCheck::Http)],
+                });
+                let _ = f.store.tx(|tx| f.inv.create_resource(tx, &who, &n));
+                let all = f
+                    .store
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::All))
+                    .unwrap();
+                assert_eq!(all.len(), 0);
+            }
+        }
+
+        mod on_project_resource_whose_id_equals_a_user_resource_id {
+            use super::*;
+
+            #[test]
+            fn succeeds_with_shadows_user_resource_warning() {
+                let mut f = fixture();
+                let who = caller(Some("/p/a"));
+                f.seed(&who, "esp", Scope::User, "u1");
+                let created = f
+                    .store
+                    .tx(|tx| {
+                        f.inv.create_resource(
+                            tx,
+                            &who,
+                            &new_device("esp", Scope::Project(project("/p/a"))),
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(
+                    created.warnings,
+                    vec![Warning::ShadowsUserResource { id: rid("esp") }]
+                );
+            }
+        }
+
+        mod on_user_resource_whose_id_equals_an_existing_project_resource_id {
+            use super::*;
+
+            #[test]
+            fn succeeds_with_shadowed_by_project_warning() {
+                let mut f = fixture();
+                let who = caller(Some("/p/a"));
+                f.seed(&who, "esp", Scope::Project(project("/p/a")), "u1");
+                let created = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .create_resource(tx, &who, &new_device("esp", Scope::User))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    created.warnings,
+                    vec![Warning::ShadowedByProject {
+                        id: rid("esp"),
+                        project: project("/p/a")
+                    }]
+                );
+            }
+        }
+    }
+
+    mod list_and_get_resource {
+        use super::*;
+
+        fn populated() -> Fixture {
+            let mut f = fixture();
+            f.seed(&caller(None), "user-board", Scope::User, "u1");
+            f.seed(
+                &caller(Some("/p/a")),
+                "a-board",
+                Scope::Project(project("/p/a")),
+                "u1",
+            );
+            f.seed(
+                &caller(Some("/p/b")),
+                "b-board",
+                Scope::Project(project("/p/b")),
+                "u1",
+            );
+            f.seed(&caller(Some("/p/a")), "shared", Scope::User, "user-unit");
+            f.seed(
+                &caller(Some("/p/a")),
+                "shared",
+                Scope::Project(project("/p/a")),
+                "proj-unit",
+            );
+            f
+        }
+
+        fn ids(list: &[Resource]) -> Vec<String> {
+            let mut v: Vec<String> = list.iter().map(|r| r.id.as_str().to_owned()).collect();
+            v.sort();
+            v
+        }
+
+        mod on_caller_in_project_p {
+            use super::*;
+
+            #[test]
+            fn returns_user_and_p_resources_never_other_projects() {
+                let mut f = populated();
+                let who = caller(Some("/p/a"));
+                let list = f
+                    .store
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller))
+                    .unwrap();
+                assert_eq!(ids(&list), ["a-board", "shared", "shared", "user-board"]);
+            }
+
+            #[test]
+            fn marks_p_resources_that_shadow_a_user_resource() {
+                let mut f = populated();
+                let who = caller(Some("/p/a"));
+                let list = f
+                    .store
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller))
+                    .unwrap();
+                let flagged: Vec<(&str, bool)> = list
+                    .iter()
+                    .map(|r| (r.id.as_str(), r.shadows_user))
+                    .collect();
+                assert!(flagged.contains(&("shared", true)));
+                assert!(flagged.contains(&("a-board", false)));
+                assert!(flagged.contains(&("user-board", false)));
+                let user_shared = list
+                    .iter()
+                    .find(|r| r.id.as_str() == "shared" && r.scope == Scope::User);
+                assert!(!user_shared.unwrap().shadows_user);
+            }
+
+            #[test]
+            fn resolves_a_shadowed_id_to_the_project_resource() {
+                let mut f = populated();
+                let who = caller(Some("/p/a"));
+                let got = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("shared")))
+                    .unwrap();
+                assert_eq!(got.scope, Scope::Project(project("/p/a")));
+                assert_eq!(got.units[0].id, uid("proj-unit"));
+            }
+
+            #[test]
+            fn does_not_resolve_other_projects_ids() {
+                let mut f = populated();
+                let who = caller(Some("/p/a"));
+                let got = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("b-board")));
+                assert!(matches!(got, Err(InventoryError::NotFound)));
+            }
+        }
+
+        mod on_caller_with_no_project {
+            use super::*;
+
+            #[test]
+            fn returns_user_scope_resources_only() {
+                let mut f = populated();
+                let who = caller(None);
+                let list = f
+                    .store
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller))
+                    .unwrap();
+                assert_eq!(ids(&list), ["shared", "user-board"]);
+                assert!(list.iter().all(|r| r.scope == Scope::User));
+            }
+        }
+
+        mod on_admin_view_all_scopes {
+            use super::*;
+
+            #[test]
+            fn returns_every_resource_with_its_scope() {
+                let mut f = populated();
+                let who = caller(None);
+                let list = f
+                    .store
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::All))
+                    .unwrap();
+                assert_eq!(
+                    ids(&list),
+                    ["a-board", "b-board", "shared", "shared", "user-board"]
+                );
+                let b = list.iter().find(|r| r.id.as_str() == "b-board").unwrap();
+                assert_eq!(b.scope, Scope::Project(project("/p/b")));
+            }
+        }
+    }
+
+    mod update_resource {
+        use super::*;
+
+        mod on_visible_resource {
+            use super::*;
+
+            #[test]
+            fn applies_change_and_writes_audit_entry() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                let patch = ResourcePatch {
+                    description: Some("new text".into()),
+                    notes: Some("n".into()),
+                    health: Some(Some(HealthSpec {
+                        checks: vec![Check::Builtin(BuiltinCheck::Accessible)],
+                    })),
+                };
+                let updated = f
+                    .store
+                    .tx(|tx| f.inv.update_resource(tx, &who, &rid("a"), patch))
+                    .unwrap();
+                assert_eq!(updated.description, "new text");
+                assert_eq!(updated.notes, "n");
+                assert!(updated.health.is_some());
+                assert_eq!(f.audit_actions().last().unwrap(), "resource_updated");
+            }
+
+            #[test]
+            fn leaves_unpatched_fields_alone() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                let patch = ResourcePatch {
+                    notes: Some("n".into()),
+                    ..ResourcePatch::default()
+                };
+                let updated = f
+                    .store
+                    .tx(|tx| f.inv.update_resource(tx, &who, &rid("a"), patch))
+                    .unwrap();
+                assert_eq!(updated.description, "a board");
+            }
+
+            #[test]
+            fn clears_health_with_some_none() {
+                let mut f = fixture();
+                let who = caller(None);
+                let mut n = new_device("a", Scope::User);
+                n.health = Some(HealthSpec {
+                    checks: vec![Check::Builtin(BuiltinCheck::Exists)],
+                });
+                f.store
+                    .tx(|tx| f.inv.create_resource(tx, &who, &n))
+                    .unwrap();
+                let patch = ResourcePatch {
+                    health: Some(None),
+                    ..ResourcePatch::default()
+                };
+                let updated = f
+                    .store
+                    .tx(|tx| f.inv.update_resource(tx, &who, &rid("a"), patch))
+                    .unwrap();
+                assert_eq!(updated.health, None);
+            }
+
+            #[test]
+            fn rejects_a_health_spec_the_type_does_not_offer() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                let patch = ResourcePatch {
+                    health: Some(Some(HealthSpec {
+                        checks: vec![Check::Builtin(BuiltinCheck::Http)],
+                    })),
+                    ..ResourcePatch::default()
+                };
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.update_resource(tx, &who, &rid("a"), patch))
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    InventoryError::InvalidSettings { field: "health" }
+                ));
+            }
+        }
+
+        mod on_resource_invisible_to_caller {
+            use super::*;
+
+            #[test]
+            fn returns_not_found() {
+                let mut f = fixture();
+                f.seed(
+                    &caller(Some("/p/b")),
+                    "b",
+                    Scope::Project(project("/p/b")),
+                    "u1",
+                );
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv.update_resource(
+                            tx,
+                            &caller(Some("/p/a")),
+                            &rid("b"),
+                            ResourcePatch::default(),
+                        )
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::NotFound));
+            }
+        }
+    }
+
+    mod delete_resource {
+        use super::*;
+
+        mod on_visible_resource {
+            use super::*;
+
+            #[test]
+            fn removes_it_with_its_units_and_writes_audit_entry() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                f.store
+                    .tx(|tx| f.inv.delete_resource(tx, &who, &rid("a")))
+                    .unwrap();
+                let got = f.store.tx(|tx| f.inv.get_resource(tx, &who, &rid("a")));
+                assert!(matches!(got, Err(InventoryError::NotFound)));
+                assert_eq!(f.audit_actions().last().unwrap(), "resource_deleted");
+                let units: i64 = f
+                    .store
+                    .tx(|tx| -> Result<_, leclerk::store::StoreError> {
+                        Ok(tx
+                            .conn()
+                            .query_row("SELECT count(*) FROM units", [], |r| r.get(0))?)
+                    })
+                    .unwrap();
+                assert_eq!(units, 0);
+            }
+        }
+
+        mod on_resource_invisible_to_caller {
+            use super::*;
+
+            #[test]
+            fn returns_not_found() {
+                let mut f = fixture();
+                f.seed(
+                    &caller(Some("/p/b")),
+                    "b",
+                    Scope::Project(project("/p/b")),
+                    "u1",
+                );
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.delete_resource(tx, &caller(None), &rid("b")))
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::NotFound));
+            }
+        }
+
+        mod on_resource_with_held_units {
+            use super::*;
+
+            #[test]
+            fn returns_busy_and_leaves_resource_unchanged() {
+                let mut f = fixture();
+                let who = caller(None);
+                let r = f.seed(&who, "a", Scope::User, "u1");
+                f.store
+                    .tx(|tx| -> Result<(), InventoryError> {
+                        common::insert_lease(tx, &r.units[0], "held");
+                        Ok(())
+                    })
+                    .unwrap();
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.delete_resource(tx, &who, &rid("a")))
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::Busy));
+                let still = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("a")))
+                    .unwrap();
+                assert_eq!(still.units.len(), 1);
+            }
+        }
+
+        mod on_resource_with_queued_requests {
+            use super::*;
+
+            #[test]
+            fn returns_busy() {
+                let mut f = fixture();
+                let who = caller(None);
+                let r = f.seed(&who, "a", Scope::User, "u1");
+                f.store
+                    .tx(|tx| -> Result<(), InventoryError> {
+                        common::insert_queued_request(tx, &r, None);
+                        Ok(())
+                    })
+                    .unwrap();
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.delete_resource(tx, &who, &rid("a")))
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::Busy));
+            }
+        }
+
+        mod on_resource_whose_leases_all_ended {
+            use super::*;
+
+            #[test]
+            fn deletes_it() {
+                let mut f = fixture();
+                let who = caller(None);
+                let r = f.seed(&who, "a", Scope::User, "u1");
+                f.store
+                    .tx(|tx| -> Result<(), InventoryError> {
+                        common::insert_lease(tx, &r.units[0], "ended");
+                        Ok(())
+                    })
+                    .unwrap();
+                f.store
+                    .tx(|tx| f.inv.delete_resource(tx, &who, &rid("a")))
+                    .unwrap();
+            }
+        }
+    }
+
+    mod add_unit {
+        use super::*;
+
+        fn base() -> (Fixture, Caller) {
+            let mut f = fixture();
+            let who = caller(None);
+            f.store
+                .tx(|tx| {
+                    f.inv
+                        .create_resource(tx, &who, &new_device("a", Scope::User))
+                })
+                .unwrap();
+            (f, who)
+        }
+
+        mod on_settings_valid_for_the_resource_type {
+            use super::*;
+
+            #[test]
+            fn persists_unit_and_returns_created_without_warnings() {
+                let (mut f, who) = base();
+                let mut n = new_unit("u1", "/dev/ttyUSB0");
+                n.notes = "left port".into();
+                let created = f
+                    .store
+                    .tx(|tx| f.inv.add_unit(tx, &who, &rid("a"), &n))
+                    .unwrap();
+                assert_eq!(created.warnings.len(), 0);
+                assert_eq!(created.value.settings, device_settings("/dev/ttyUSB0"));
+                let got = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("a")))
+                    .unwrap();
+                assert_eq!(got.units.len(), 1);
+                assert_eq!(got.units[0].id, uid("u1"));
+                assert_eq!(got.units[0].notes, "left port");
+                assert!(!got.units[0].retiring);
+                assert!(got.units[0].dirty.is_none());
+            }
+
+            #[test]
+            fn writes_audit_entry_unit_added() {
+                let (mut f, who) = base();
+                f.store
+                    .tx(|tx| {
+                        f.inv
+                            .add_unit(tx, &who, &rid("a"), &new_unit("u1", "/dev/x"))
+                    })
+                    .unwrap();
+                assert_eq!(f.audit_actions().last().unwrap(), "unit_added");
+            }
+        }
+
+        mod on_unit_id_already_used_in_resource {
+            use super::*;
+
+            #[test]
+            fn returns_already_exists() {
+                let (mut f, who) = base();
+                f.store
+                    .tx(|tx| {
+                        f.inv
+                            .add_unit(tx, &who, &rid("a"), &new_unit("u1", "/dev/x"))
+                    })
+                    .unwrap();
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .add_unit(tx, &who, &rid("a"), &new_unit("u1", "/dev/y"))
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::AlreadyExists));
+            }
+        }
+
+        mod on_settings_invalid_for_type {
+            use super::*;
+
+            #[test]
+            fn names_path_for_an_empty_device_path() {
+                let (mut f, who) = base();
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.add_unit(tx, &who, &rid("a"), &new_unit("u1", "")))
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    InventoryError::InvalidSettings { field: "path" }
+                ));
+            }
+
+            #[test]
+            fn names_settings_for_a_type_mismatch() {
+                let (mut f, who) = base();
+                let n = NewUnit {
+                    id: uid("u1"),
+                    settings: UnitSettings::Generic {
+                        identity_key: "k".into(),
+                    },
+                    notes: String::new(),
+                };
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.add_unit(tx, &who, &rid("a"), &n))
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    InventoryError::InvalidSettings { field: "settings" }
+                ));
+            }
+
+            #[test]
+            fn names_port_for_port_zero() {
+                let mut f = fixture();
+                let who = caller(None);
+                let mut r = new_device("svc", Scope::User);
+                r.ty = ResourceType::Service;
+                f.store
+                    .tx(|tx| f.inv.create_resource(tx, &who, &r))
+                    .unwrap();
+                let n = NewUnit {
+                    id: uid("u1"),
+                    settings: UnitSettings::Service {
+                        mode: leclerk::model::ServiceMode::Connect,
+                        scheme: None,
+                        host: "localhost".into(),
+                        port: 0,
+                        service_id: None,
+                    },
+                    notes: String::new(),
+                };
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.add_unit(tx, &who, &rid("svc"), &n))
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    InventoryError::InvalidSettings { field: "port" }
+                ));
+            }
+        }
+
+        mod on_resource_invisible_to_caller {
+            use super::*;
+
+            #[test]
+            fn returns_not_found() {
+                let (mut f, _) = base();
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .add_unit(tx, &caller(None), &rid("zzz"), &new_unit("u1", "/x"))
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::NotFound));
+            }
+        }
+    }
+
+    mod update_unit {
+        use super::*;
+
+        mod on_valid_settings {
+            use super::*;
+
+            #[test]
+            fn persists_changes_and_writes_audit_entry() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                let patch = UnitPatch {
+                    settings: Some(device_settings("/dev/ttyUSB9")),
+                    notes: Some("moved".into()),
+                };
+                let updated = f
+                    .store
+                    .tx(|tx| f.inv.update_unit(tx, &who, &rid("a"), &uid("u1"), patch))
+                    .unwrap();
+                assert_eq!(updated.warnings.len(), 0);
+                assert_eq!(updated.value.settings, device_settings("/dev/ttyUSB9"));
+                assert_eq!(updated.value.notes, "moved");
+                assert_eq!(f.audit_actions().last().unwrap(), "unit_updated");
+            }
+        }
+
+        mod on_invalid_settings {
+            use super::*;
+
+            #[test]
+            fn returns_invalid_settings_and_keeps_old_value() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                let patch = UnitPatch {
+                    settings: Some(device_settings("")),
+                    notes: None,
+                };
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.update_unit(tx, &who, &rid("a"), &uid("u1"), patch))
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    InventoryError::InvalidSettings { field: "path" }
+                ));
+                let got = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("a")))
+                    .unwrap();
+                assert_eq!(got.units[0].settings, device_settings("/dev/seed-a-u1"));
+            }
+        }
+
+        mod on_unknown_unit {
+            use super::*;
+
+            #[test]
+            fn returns_not_found() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .update_unit(tx, &who, &rid("a"), &uid("nope"), UnitPatch::default())
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::NotFound));
+            }
+        }
+    }
+
+    mod remove_unit {
+        use super::*;
+
+        mod on_free_unit {
+            use super::*;
+
+            #[test]
+            fn deletes_unit_and_its_links() {
+                let mut f = fixture();
+                let who = caller(None);
+                let r = f.seed(&who, "a", Scope::User, "u1");
+                let other = f.seed(&who, "b", Scope::User, "u2");
+                let (a, b) = (r.units[0].row, other.units[0].row);
+                f.store
+                    .tx(|tx| -> Result<_, leclerk::store::StoreError> {
+                        Ok(tx.conn().execute(
+                            "INSERT INTO unit_links (unit_a, unit_b) VALUES (?1, ?2)",
+                            [a, b],
+                        )?)
+                    })
+                    .unwrap();
+                f.store
+                    .tx(|tx| f.inv.remove_unit(tx, &who, &rid("a"), &uid("u1")))
+                    .unwrap();
+                let got = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("a")))
+                    .unwrap();
+                assert_eq!(got.units.len(), 0);
+                let links: i64 = f
+                    .store
+                    .tx(|tx| -> Result<_, leclerk::store::StoreError> {
+                        Ok(tx
+                            .conn()
+                            .query_row("SELECT count(*) FROM unit_links", [], |r| r.get(0))?)
+                    })
+                    .unwrap();
+                assert_eq!(links, 0);
+                assert_eq!(f.audit_actions().last().unwrap(), "unit_removed");
+            }
+        }
+
+        mod on_held_unit {
+            use super::*;
+
+            #[test]
+            fn returns_busy_and_keeps_the_unit() {
+                let mut f = fixture();
+                let who = caller(None);
+                let r = f.seed(&who, "a", Scope::User, "u1");
+                f.store
+                    .tx(|tx| -> Result<(), InventoryError> {
+                        common::insert_lease(tx, &r.units[0], "cleaning");
+                        Ok(())
+                    })
+                    .unwrap();
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.remove_unit(tx, &who, &rid("a"), &uid("u1")))
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::Busy));
+                let got = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("a")))
+                    .unwrap();
+                assert_eq!(got.units.len(), 1);
+            }
+        }
+
+        mod on_queued_unit {
+            use super::*;
+
+            #[test]
+            fn returns_busy() {
+                let mut f = fixture();
+                let who = caller(None);
+                let r = f.seed(&who, "a", Scope::User, "u1");
+                f.store
+                    .tx(|tx| -> Result<(), InventoryError> {
+                        common::insert_queued_request(tx, &r, Some(&r.units[0]));
+                        Ok(())
+                    })
+                    .unwrap();
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.remove_unit(tx, &who, &rid("a"), &uid("u1")))
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::Busy));
+            }
+        }
+    }
+
+    mod retire_unit {
+        use super::*;
+
+        mod on_free_unit {
+            use super::*;
+
+            #[test]
+            fn removes_unit_immediately() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                f.store
+                    .tx(|tx| f.inv.retire_unit(tx, &who, &rid("a"), &uid("u1")))
+                    .unwrap();
+                let got = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("a")))
+                    .unwrap();
+                assert_eq!(got.units.len(), 0);
+                assert_eq!(f.audit_actions().last().unwrap(), "unit_retired");
+            }
+        }
+
+        mod on_held_unit {
+            use super::*;
+
+            #[test]
+            fn marks_retiring_and_keeps_the_unit() {
+                let mut f = fixture();
+                let who = caller(None);
+                let r = f.seed(&who, "a", Scope::User, "u1");
+                f.store
+                    .tx(|tx| -> Result<(), InventoryError> {
+                        common::insert_lease(tx, &r.units[0], "held");
+                        Ok(())
+                    })
+                    .unwrap();
+                f.store
+                    .tx(|tx| f.inv.retire_unit(tx, &who, &rid("a"), &uid("u1")))
+                    .unwrap();
+                let got = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("a")))
+                    .unwrap();
+                assert_eq!(got.units.len(), 1);
+                assert!(got.units[0].retiring);
+                assert_eq!(f.audit_actions().last().unwrap(), "unit_retired");
+            }
+        }
+
+        mod on_unknown_unit {
+            use super::*;
+
+            #[test]
+            fn returns_not_found() {
+                let mut f = fixture();
+                let who = caller(None);
+                f.seed(&who, "a", Scope::User, "u1");
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.retire_unit(tx, &who, &rid("a"), &uid("nope")))
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::NotFound));
+            }
+        }
+    }
+
+    mod clock_use {
+        use super::*;
+
+        #[test]
+        fn audit_timestamps_come_from_the_injected_clock() {
+            let mut f = fixture();
+            let who = caller(None);
+            f.clock.set(777);
+            f.seed(&who, "a", Scope::User, "u1");
+            let entries = f.store.tx(audit::all).unwrap();
+            assert!(entries.iter().all(|e| e.at == 777));
+        }
+    }
+
+    mod cross_project_and_failed_mutations {
+        use super::*;
+
+        fn other_project() -> Fixture {
+            let mut f = fixture();
+            f.seed(
+                &caller(Some("/p/b")),
+                "b",
+                Scope::Project(project("/p/b")),
+                "u1",
+            );
+            f
+        }
+
+        #[test]
+        fn update_unit_on_invisible_resource_returns_not_found() {
+            let mut f = other_project();
+            let err = f
+                .store
+                .tx(|tx| {
+                    f.inv.update_unit(
+                        tx,
+                        &caller(Some("/p/a")),
+                        &rid("b"),
+                        &uid("u1"),
+                        UnitPatch::default(),
+                    )
+                })
+                .unwrap_err();
+            assert!(matches!(err, InventoryError::NotFound));
+        }
+
+        #[test]
+        fn remove_unit_on_invisible_resource_returns_not_found() {
+            let mut f = other_project();
+            let err = f
+                .store
+                .tx(|tx| {
+                    f.inv
+                        .remove_unit(tx, &caller(Some("/p/a")), &rid("b"), &uid("u1"))
+                })
+                .unwrap_err();
+            assert!(matches!(err, InventoryError::NotFound));
+        }
+
+        #[test]
+        fn retire_unit_on_invisible_resource_returns_not_found() {
+            let mut f = other_project();
+            let err = f
+                .store
+                .tx(|tx| f.inv.retire_unit(tx, &caller(None), &rid("b"), &uid("u1")))
+                .unwrap_err();
+            assert!(matches!(err, InventoryError::NotFound));
+        }
+
+        #[test]
+        fn failed_mutations_write_no_audit_row() {
+            let mut f = other_project();
+            let before = f.audit_actions().len();
+            let who = caller(Some("/p/a"));
+            let _ = f.store.tx(|tx| f.inv.delete_resource(tx, &who, &rid("b")));
+            let _ = f
+                .store
+                .tx(|tx| f.inv.remove_unit(tx, &who, &rid("b"), &uid("u1")));
+            let _ = f
+                .store
+                .tx(|tx| f.inv.add_unit(tx, &who, &rid("b"), &new_unit("u2", "/x")));
+            let _ = f.store.tx(|tx| {
+                f.inv
+                    .create_resource(tx, &who, &new_device("b", Scope::Project(project("/p/b"))))
+            });
+            assert_eq!(f.audit_actions().len(), before);
+        }
+    }
+}
+
+fn new_generic(id: &str, scope: Scope) -> NewResource {
+    NewResource {
+        ty: ResourceType::Generic,
+        ..new_device(id, scope)
+    }
+}
+
+fn generic_settings(key: &str) -> UnitSettings {
+    UnitSettings::Generic {
+        identity_key: key.into(),
+    }
+}
+
+fn generic_unit(id: &str, key: &str) -> NewUnit {
+    NewUnit {
+        id: uid(id),
+        settings: generic_settings(key),
+        notes: String::new(),
+    }
+}
+
+fn scope_of(path: Option<&str>) -> Scope {
+    path.map_or(Scope::User, |p| Scope::Project(project(p)))
+}
+
+impl Fixture {
+    /// Create a generic resource in `scope` (as a caller of that scope) with
+    /// one unit keyed `key`; returns the add-unit result.
+    fn seed_generic(
+        &mut self,
+        scope_path: Option<&str>,
+        id: &str,
+        unit: &str,
+        key: &str,
+    ) -> Result<leclerk::inventory::Created<leclerk::model::Unit>, InventoryError> {
+        let who = caller(scope_path);
+        self.store.tx(|tx| {
+            self.inv
+                .create_resource(tx, &who, &new_generic(id, scope_of(scope_path)))?;
+            self.inv
+                .add_unit(tx, &who, &rid(id), &generic_unit(unit, key))
+        })
+    }
+
+    fn row(&mut self, scope_path: Option<&str>, res: &str, unit: &str) -> i64 {
+        let who = caller(scope_path);
+        let r = self
+            .store
+            .tx(|tx| self.inv.get_resource(tx, &who, &rid(res)))
+            .unwrap();
+        r.units.iter().find(|u| u.id == uid(unit)).unwrap().row
+    }
+
+    fn group(&mut self, row: i64) -> Vec<i64> {
+        self.store
+            .tx(|tx| Ok::<_, InventoryError>(Inventory::identity_group(tx, row).unwrap()))
+            .unwrap()
+    }
+
+    fn pending(&mut self) -> Vec<leclerk::inventory::Promotion> {
+        self.store.tx(|tx| self.promos.list(tx)).unwrap()
+    }
+
+    fn identity_text(&mut self, row: i64) -> Option<String> {
+        self.store
+            .tx(|tx| {
+                Ok::<_, InventoryError>(
+                    tx.conn()
+                        .query_row("SELECT identity FROM units WHERE row_id = ?1", [row], |r| {
+                            r.get(0)
+                        })
+                        .unwrap(),
+                )
+            })
+            .unwrap()
+    }
+}
+
+mod duplicate_handling {
+    use super::*;
+
+    mod add_unit {
+        use super::*;
+
+        mod on_match_in_same_scope {
+            use super::*;
+
+            #[test]
+            fn returns_duplicate_in_scope_naming_the_existing_unit() {
+                let mut f = fixture();
+                f.seed_generic(None, "a", "u1", "k").unwrap();
+                let who = caller(None);
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .create_resource(tx, &who, &new_generic("b", Scope::User))?;
+                        f.inv
+                            .add_unit(tx, &who, &rid("b"), &generic_unit("u9", "k"))
+                    })
+                    .unwrap_err();
+                match err {
+                    InventoryError::DuplicateInScope { resource, unit } => {
+                        assert_eq!(resource, rid("a"));
+                        assert_eq!(unit, uid("u1"));
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+
+            #[test]
+            fn persists_nothing_and_writes_no_audit() {
+                let mut f = fixture();
+                f.seed_generic(None, "a", "u1", "k").unwrap();
+                let who = caller(None);
+                f.store
+                    .tx(|tx| {
+                        f.inv
+                            .create_resource(tx, &who, &new_generic("b", Scope::User))
+                    })
+                    .unwrap();
+                let before = f.audit_actions().len();
+                let _ = f.store.tx(|tx| {
+                    f.inv
+                        .add_unit(tx, &who, &rid("b"), &generic_unit("u9", "k"))
+                });
+                let b = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &who, &rid("b")))
+                    .unwrap();
+                assert_eq!(b.units.len(), 0);
+                assert_eq!(f.audit_actions().len(), before);
+            }
+
+            #[test]
+            fn applies_within_one_project_too() {
+                let mut f = fixture();
+                f.seed_generic(Some("/p/a"), "a", "u1", "k").unwrap();
+                let who = caller(Some("/p/a"));
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv.create_resource(
+                            tx,
+                            &who,
+                            &new_generic("b", Scope::Project(project("/p/a"))),
+                        )?;
+                        f.inv
+                            .add_unit(tx, &who, &rid("b"), &generic_unit("u9", "k"))
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::DuplicateInScope { .. }));
+            }
+        }
+
+        mod on_hits_in_the_same_scope_and_another_scope {
+            use super::*;
+
+            /// Counts of (links, promotions, audit rows).
+            fn state(f: &mut Fixture) -> (i64, usize, usize) {
+                let links = f
+                    .store
+                    .tx(|tx| {
+                        Ok::<_, InventoryError>(
+                            tx.conn()
+                                .query_row("SELECT count(*) FROM unit_links", [], |r| r.get(0))
+                                .unwrap(),
+                        )
+                    })
+                    .unwrap();
+                (links, f.pending().len(), f.audit_actions().len())
+            }
+
+            fn rejects_without_trace(other_scope: Option<&str>) {
+                let mut f = fixture();
+                f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+                f.seed_generic(other_scope, "elsewhere", "e1", "k").unwrap();
+                let before = state(&mut f);
+                let who = caller(Some("/p/a"));
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv.create_resource(
+                            tx,
+                            &who,
+                            &new_generic("again", Scope::Project(project("/p/a"))),
+                        )?;
+                        f.inv
+                            .add_unit(tx, &who, &rid("again"), &generic_unit("a1", "k"))
+                    })
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    InventoryError::DuplicateInScope { ref resource, ref unit }
+                        if *resource == rid("mine") && *unit == uid("m1")
+                ));
+                assert_eq!(state(&mut f), before);
+            }
+
+            #[test]
+            fn returns_duplicate_in_scope_without_link_promotion_or_audit_when_other_is_a_project()
+            {
+                rejects_without_trace(Some("/p/b"));
+            }
+
+            #[test]
+            fn returns_duplicate_in_scope_without_link_promotion_or_audit_when_other_is_user() {
+                rejects_without_trace(None);
+            }
+        }
+
+        mod on_no_match {
+            use super::*;
+
+            #[test]
+            fn succeeds_without_warnings_links_or_promotions() {
+                let mut f = fixture();
+                f.seed_generic(None, "a", "u1", "k1").unwrap();
+                let created = f.seed_generic(Some("/p/a"), "b", "u1", "k2").unwrap();
+                assert_eq!(created.warnings.len(), 0);
+                let row = f.row(Some("/p/a"), "b", "u1");
+                assert_eq!(f.group(row), vec![row]);
+                assert_eq!(f.pending().len(), 0);
+            }
+
+            #[test]
+            fn stores_the_extracted_identity() {
+                let mut f = fixture();
+                f.seed_generic(None, "a", "u1", "k1").unwrap();
+                let row = f.row(None, "a", "u1");
+                let text = f.identity_text(row).unwrap();
+                assert!(text.contains("\"generic\""), "{text}");
+                assert!(text.contains("k1"), "{text}");
+            }
+
+            #[test]
+            fn does_not_compare_across_resource_types() {
+                let mut f = fixture();
+                f.seed_generic(None, "a", "u1", "/dev/ttyUSB0").unwrap();
+                let who = caller(None);
+                let created = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .create_resource(tx, &who, &new_device("d", Scope::User))?;
+                        f.inv
+                            .add_unit(tx, &who, &rid("d"), &new_unit("u1", "/dev/ttyUSB0"))
+                    })
+                    .unwrap();
+                assert_eq!(created.warnings.len(), 0);
+            }
+        }
+
+        mod on_project_unit_matching_a_user_unit {
+            use super::*;
+
+            #[test]
+            fn succeeds_with_duplicate_of_user_unit_warning() {
+                let mut f = fixture();
+                f.seed_generic(None, "board", "u1", "k").unwrap();
+                let created = f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+                assert_eq!(
+                    created.warnings,
+                    vec![Warning::DuplicateOfUserUnit {
+                        resource: rid("board"),
+                        unit: uid("u1"),
+                    }]
+                );
+            }
+
+            #[test]
+            fn links_the_two_units_into_one_identity_group() {
+                let mut f = fixture();
+                f.seed_generic(None, "board", "u1", "k").unwrap();
+                f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+                let a = f.row(None, "board", "u1");
+                let b = f.row(Some("/p/a"), "mine", "m1");
+                let mut want = vec![a, b];
+                want.sort_unstable();
+                assert_eq!(f.group(a), want);
+                assert_eq!(f.group(b), want);
+            }
+
+            #[test]
+            fn stores_the_link_once() {
+                let mut f = fixture();
+                f.seed_generic(None, "board", "u1", "k").unwrap();
+                f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+                let n: i64 = f
+                    .store
+                    .tx(|tx| {
+                        Ok::<_, InventoryError>(
+                            tx.conn()
+                                .query_row("SELECT count(*) FROM unit_links", [], |r| r.get(0))
+                                .unwrap(),
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(n, 1);
+            }
+
+            #[test]
+            fn creates_no_promotion() {
+                let mut f = fixture();
+                f.seed_generic(None, "board", "u1", "k").unwrap();
+                f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+                assert_eq!(f.pending().len(), 0);
+            }
+        }
+
+        mod on_match_in_another_projects_scope {
+            use super::*;
+
+            fn two_projects() -> (Fixture, leclerk::inventory::Created<leclerk::model::Unit>) {
+                let mut f = fixture();
+                f.seed_generic(Some("/p/b"), "secret-res", "secret-unit", "k")
+                    .unwrap();
+                let created = f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+                (f, created)
+            }
+
+            #[test]
+            fn succeeds_with_similar_in_other_project_warning() {
+                let (mut f, created) = two_projects();
+                let promos = f.pending();
+                assert_eq!(promos.len(), 1);
+                assert_eq!(
+                    created.warnings,
+                    vec![Warning::SimilarInOtherProject {
+                        project: project("/p/b"),
+                        promotion_id: promos[0].id.clone(),
+                    }]
+                );
+            }
+
+            #[test]
+            fn creates_a_pending_promotion_of_the_other_resource() {
+                let (mut f, _) = two_projects();
+                let promos = f.pending();
+                assert_eq!(promos[0].resource, rid("secret-res"));
+                assert_eq!(promos[0].requester, Some(project("/p/a")));
+                assert_ne!(promos[0].reason, "");
+            }
+
+            #[test]
+            fn links_the_two_units() {
+                let (mut f, _) = two_projects();
+                let a = f.row(Some("/p/a"), "mine", "m1");
+                let b = f.row(Some("/p/b"), "secret-res", "secret-unit");
+                assert!(f.group(a).contains(&b));
+            }
+
+            #[test]
+            fn discloses_only_the_other_projects_path() {
+                let (mut f, created) = two_projects();
+                // Give the other project's side recognisable notes/settings.
+                let b = caller(Some("/p/b"));
+                f.store
+                    .tx(|tx| {
+                        f.inv.update_unit(
+                            tx,
+                            &b,
+                            &rid("secret-res"),
+                            &uid("secret-unit"),
+                            UnitPatch {
+                                settings: None,
+                                notes: Some("hunter2-notes".into()),
+                            },
+                        )
+                    })
+                    .unwrap();
+                let json = serde_json::to_string(&created.warnings).unwrap();
+                assert!(json.contains("/p/b"), "{json}");
+                for leak in ["secret-res", "secret-unit", "hunter2", "\"k\"", "a board"] {
+                    assert!(!json.contains(leak), "{leak} leaked in {json}");
+                }
+            }
+
+            #[test]
+            fn reuses_the_id_when_the_same_project_matches_again_via_update() {
+                let (mut f, first) = two_projects();
+                let a = caller(Some("/p/a"));
+                f.store
+                    .tx(|tx| {
+                        f.inv.update_unit(
+                            tx,
+                            &a,
+                            &rid("mine"),
+                            &uid("m1"),
+                            UnitPatch {
+                                settings: Some(generic_settings("other")),
+                                notes: None,
+                            },
+                        )?;
+                        f.inv.update_unit(
+                            tx,
+                            &a,
+                            &rid("mine"),
+                            &uid("m1"),
+                            UnitPatch {
+                                settings: Some(generic_settings("k")),
+                                notes: None,
+                            },
+                        )
+                    })
+                    .map(|c| {
+                        assert_eq!(c.warnings, first.warnings);
+                    })
+                    .unwrap();
+                assert_eq!(f.pending().len(), 1);
+            }
+        }
+
+        mod on_user_unit_matching_a_project_unit {
+            use super::*;
+
+            #[test]
+            fn warns_duplicate_of_project_unit_when_the_caller_sees_that_project() {
+                let mut f = fixture();
+                f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+                // Caller in /p/a registers at user level.
+                let who = caller(Some("/p/a"));
+                let created = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .create_resource(tx, &who, &new_generic("board", Scope::User))?;
+                        f.inv
+                            .add_unit(tx, &who, &rid("board"), &generic_unit("u1", "k"))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    created.warnings,
+                    vec![Warning::DuplicateOfProjectUnit {
+                        resource: rid("mine"),
+                        unit: uid("m1"),
+                    }]
+                );
+                let a = f.row(None, "board", "u1");
+                let b = f.row(Some("/p/a"), "mine", "m1");
+                assert!(f.group(a).contains(&b));
+            }
+
+            #[test]
+            fn warns_similar_in_other_project_when_the_caller_cannot_see_it() {
+                let mut f = fixture();
+                f.seed_generic(Some("/p/b"), "secret-res", "secret-unit", "k")
+                    .unwrap();
+                let created = f.seed_generic(None, "board", "u1", "k").unwrap();
+                let promos = f.pending();
+                assert_eq!(promos.len(), 1);
+                assert_eq!(
+                    created.warnings,
+                    vec![Warning::SimilarInOtherProject {
+                        project: project("/p/b"),
+                        promotion_id: promos[0].id.clone(),
+                    }]
+                );
+                let a = f.row(None, "board", "u1");
+                let b = f.row(Some("/p/b"), "secret-res", "secret-unit");
+                assert!(f.group(a).contains(&b));
+            }
+        }
+    }
+
+    mod update_unit {
+        use super::*;
+
+        fn patch_key(key: &str) -> UnitPatch {
+            UnitPatch {
+                settings: Some(generic_settings(key)),
+                notes: None,
+            }
+        }
+
+        #[test]
+        fn on_new_settings_matching_same_scope_returns_duplicate_and_changes_nothing() {
+            let mut f = fixture();
+            f.seed_generic(None, "a", "u1", "k1").unwrap();
+            f.seed_generic(None, "b", "u1", "k2").unwrap();
+            let who = caller(None);
+            let before = f.audit_actions().len();
+            let err = f
+                .store
+                .tx(|tx| {
+                    f.inv
+                        .update_unit(tx, &who, &rid("b"), &uid("u1"), patch_key("k1"))
+                })
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                InventoryError::DuplicateInScope { ref resource, ref unit }
+                    if *resource == rid("a") && *unit == uid("u1")
+            ));
+            let b = f
+                .store
+                .tx(|tx| f.inv.get_resource(tx, &who, &rid("b")))
+                .unwrap();
+            assert_eq!(b.units[0].settings, generic_settings("k2"));
+            assert_eq!(f.audit_actions().len(), before);
+        }
+
+        #[test]
+        fn on_unchanged_settings_does_not_collide_with_itself() {
+            let mut f = fixture();
+            f.seed_generic(None, "a", "u1", "k1").unwrap();
+            let who = caller(None);
+            let c = f
+                .store
+                .tx(|tx| {
+                    f.inv
+                        .update_unit(tx, &who, &rid("a"), &uid("u1"), patch_key("k1"))
+                })
+                .unwrap();
+            assert_eq!(c.warnings.len(), 0);
+        }
+
+        #[test]
+        fn on_new_settings_matching_a_user_unit_warns_and_links() {
+            let mut f = fixture();
+            f.seed_generic(None, "board", "u1", "k").unwrap();
+            f.seed_generic(Some("/p/a"), "mine", "m1", "other").unwrap();
+            let who = caller(Some("/p/a"));
+            let c = f
+                .store
+                .tx(|tx| {
+                    f.inv
+                        .update_unit(tx, &who, &rid("mine"), &uid("m1"), patch_key("k"))
+                })
+                .unwrap();
+            assert_eq!(
+                c.warnings,
+                vec![Warning::DuplicateOfUserUnit {
+                    resource: rid("board"),
+                    unit: uid("u1"),
+                }]
+            );
+            let a = f.row(None, "board", "u1");
+            let b = f.row(Some("/p/a"), "mine", "m1");
+            assert!(f.group(a).contains(&b));
+        }
+
+        #[test]
+        fn on_new_settings_matching_another_project_creates_a_promotion() {
+            let mut f = fixture();
+            f.seed_generic(Some("/p/b"), "theirs", "t1", "k").unwrap();
+            f.seed_generic(Some("/p/a"), "mine", "m1", "other").unwrap();
+            let who = caller(Some("/p/a"));
+            let c = f
+                .store
+                .tx(|tx| {
+                    f.inv
+                        .update_unit(tx, &who, &rid("mine"), &uid("m1"), patch_key("k"))
+                })
+                .unwrap();
+            assert!(matches!(
+                c.warnings[0],
+                Warning::SimilarInOtherProject { .. }
+            ));
+            assert_eq!(f.pending().len(), 1);
+        }
+
+        #[test]
+        fn on_settings_moving_away_drops_the_automatic_link() {
+            let mut f = fixture();
+            f.seed_generic(None, "board", "u1", "k").unwrap();
+            f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+            let who = caller(Some("/p/a"));
+            let a = f.row(None, "board", "u1");
+            let b = f.row(Some("/p/a"), "mine", "m1");
+            let c = f
+                .store
+                .tx(|tx| {
+                    f.inv
+                        .update_unit(tx, &who, &rid("mine"), &uid("m1"), patch_key("zzz"))
+                })
+                .unwrap();
+            assert_eq!(c.warnings.len(), 0);
+            assert_eq!(f.group(a), vec![a]);
+            assert_eq!(f.group(b), vec![b]);
+        }
+
+        #[test]
+        fn on_settings_change_keeps_manual_links() {
+            let mut f = fixture();
+            f.seed_generic(None, "board", "u1", "k1").unwrap();
+            f.seed_generic(Some("/p/a"), "mine", "m1", "k2").unwrap();
+            let a = f.row(None, "board", "u1");
+            let b = f.row(Some("/p/a"), "mine", "m1");
+            f.store.tx(|tx| Inventory::link(tx, a, b)).unwrap();
+            let who = caller(Some("/p/a"));
+            f.store
+                .tx(|tx| {
+                    f.inv
+                        .update_unit(tx, &who, &rid("mine"), &uid("m1"), patch_key("k3"))
+                })
+                .unwrap();
+            assert!(f.group(a).contains(&b));
+        }
+
+        #[test]
+        fn on_settings_change_recomputes_the_stored_identity() {
+            let mut f = fixture();
+            f.seed_generic(None, "a", "u1", "k1").unwrap();
+            let who = caller(None);
+            f.store
+                .tx(|tx| {
+                    f.inv
+                        .update_unit(tx, &who, &rid("a"), &uid("u1"), patch_key("k2"))
+                })
+                .unwrap();
+            let row = f.row(None, "a", "u1");
+            assert!(f.identity_text(row).unwrap().contains("k2"));
+        }
+
+        #[test]
+        fn on_notes_only_change_keeps_links_and_returns_no_warnings() {
+            let mut f = fixture();
+            f.seed_generic(None, "board", "u1", "k").unwrap();
+            f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+            let who = caller(Some("/p/a"));
+            let c = f
+                .store
+                .tx(|tx| {
+                    f.inv.update_unit(
+                        tx,
+                        &who,
+                        &rid("mine"),
+                        &uid("m1"),
+                        UnitPatch {
+                            settings: None,
+                            notes: Some("n".into()),
+                        },
+                    )
+                })
+                .unwrap();
+            assert_eq!(c.warnings.len(), 0);
+            let a = f.row(None, "board", "u1");
+            let b = f.row(Some("/p/a"), "mine", "m1");
+            assert!(f.group(a).contains(&b));
+        }
+    }
+
+    mod identity_group {
+        use super::*;
+
+        #[test]
+        fn is_the_transitive_closure_of_links_including_the_unit() {
+            let mut f = fixture();
+            f.seed_generic(None, "x", "u", "k1").unwrap();
+            f.seed_generic(None, "y", "u", "k2").unwrap();
+            f.seed_generic(None, "z", "u", "k3").unwrap();
+            f.seed_generic(None, "w", "u", "k4").unwrap();
+            let (ux, uy, uz, uw) = (
+                f.row(None, "x", "u"),
+                f.row(None, "y", "u"),
+                f.row(None, "z", "u"),
+                f.row(None, "w", "u"),
+            );
+            f.store
+                .tx(|tx| {
+                    Inventory::link(tx, ux, uy)?;
+                    Inventory::link(tx, uz, uy)
+                })
+                .unwrap();
+            let mut want = vec![ux, uy, uz];
+            want.sort_unstable();
+            assert_eq!(f.group(ux), want);
+            assert_eq!(f.group(uz), want);
+            assert_eq!(f.group(uw), vec![uw]);
+        }
+
+        #[test]
+        fn terminates_on_a_cycle_of_links() {
+            let mut f = fixture();
+            f.seed_generic(None, "x", "u", "k1").unwrap();
+            f.seed_generic(None, "y", "u", "k2").unwrap();
+            f.seed_generic(None, "z", "u", "k3").unwrap();
+            let (ux, uy, uz) = (
+                f.row(None, "x", "u"),
+                f.row(None, "y", "u"),
+                f.row(None, "z", "u"),
+            );
+            f.store
+                .tx(|tx| {
+                    Inventory::link(tx, ux, uy)?;
+                    Inventory::link(tx, uy, uz)?;
+                    Inventory::link(tx, uz, ux)
+                })
+                .unwrap();
+            let mut want = vec![ux, uy, uz];
+            want.sort_unstable();
+            assert_eq!(f.group(uy), want);
+        }
+
+        #[test]
+        fn unlink_splits_the_group() {
+            let mut f = fixture();
+            f.seed_generic(None, "x", "u", "k1").unwrap();
+            f.seed_generic(None, "y", "u", "k2").unwrap();
+            let (x, y) = (f.row(None, "x", "u"), f.row(None, "y", "u"));
+            f.store
+                .tx(|tx| {
+                    Inventory::link(tx, x, y)?;
+                    Inventory::unlink(tx, y, x)
+                })
+                .unwrap();
+            assert_eq!(f.group(x), vec![x]);
+        }
+
+        #[test]
+        fn linking_twice_stores_one_link() {
+            let mut f = fixture();
+            f.seed_generic(None, "x", "u", "k1").unwrap();
+            f.seed_generic(None, "y", "u", "k2").unwrap();
+            let (x, y) = (f.row(None, "x", "u"), f.row(None, "y", "u"));
+            f.store
+                .tx(|tx| {
+                    Inventory::link(tx, x, y)?;
+                    Inventory::link(tx, y, x)
+                })
+                .unwrap();
+            let n: i64 = f
+                .store
+                .tx(|tx| {
+                    Ok::<_, InventoryError>(
+                        tx.conn()
+                            .query_row("SELECT count(*) FROM unit_links", [], |r| r.get(0))
+                            .unwrap(),
+                    )
+                })
+                .unwrap();
+            assert_eq!(n, 1);
+        }
+    }
+}
+
+mod update_unit_exclude_self {
+    use super::*;
+
+    // A real USB serial needs a device node (mknod, root). A symlink to the
+    // same file reaches the same code path: the new identity matches the
+    // unit's own old one (canonical path and inode), which must not count
+    // as a duplicate.
+    #[test]
+    fn new_settings_matching_the_units_own_old_identity_do_not_collide() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("tty0");
+        std::fs::write(&real, "").unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let sysfs = dir.path().join("sys");
+        std::fs::create_dir(&sysfs).unwrap();
+
+        let clock = Arc::new(ManualClock::new(1));
+        let inv = Inventory::with_sysfs(clock, sysfs);
+        let mut store = Store::open_in_memory().unwrap();
+        let who = caller(None);
+        let patch = UnitPatch {
+            settings: Some(device_settings(alias.to_str().unwrap())),
+            notes: None,
+        };
+        let created = store
+            .tx(|tx| {
+                inv.create_resource(tx, &who, &new_device("d", Scope::User))?;
+                inv.add_unit(tx, &who, &rid("d"), &new_unit("u1", real.to_str().unwrap()))?;
+                inv.update_unit(tx, &who, &rid("d"), &uid("u1"), patch)
+            })
+            .unwrap();
+        assert_eq!(created.warnings.len(), 0);
+        assert_eq!(
+            created.value.settings,
+            device_settings(alias.to_str().unwrap())
+        );
+    }
+}
+
+mod promotions {
+    use super::*;
+
+    /// Project b has `theirs`; project a registered a match, so a promotion
+    /// of `theirs` is pending.
+    fn pending_promotion() -> (Fixture, leclerk::model::PromotionId) {
+        let mut f = fixture();
+        f.seed_generic(Some("/p/b"), "theirs", "t1", "k").unwrap();
+        f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+        let id = f.pending()[0].id.clone();
+        (f, id)
+    }
+
+    fn admin() -> Caller {
+        Caller {
+            user_requested: Some("share the board".into()),
+            ..caller(None)
+        }
+    }
+
+    mod list {
+        use super::*;
+
+        #[test]
+        fn returns_pending_promotions_with_requester_and_reason() {
+            let (mut f, id) = pending_promotion();
+            let list = f.pending();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].id, id);
+            assert_eq!(list[0].resource, rid("theirs"));
+            assert_eq!(list[0].requester, Some(project("/p/a")));
+            assert!(list[0].reason.contains("/p/a"));
+        }
+    }
+
+    mod approve {
+        use super::*;
+
+        mod on_no_id_clash {
+            use super::*;
+
+            #[test]
+            fn moves_the_resource_to_user_scope_keeping_its_id() {
+                let (mut f, id) = pending_promotion();
+                let r = f
+                    .store
+                    .tx(|tx| f.promos.approve(tx, &admin(), id.clone(), None))
+                    .unwrap();
+                assert_eq!(r.id, rid("theirs"));
+                assert_eq!(r.scope, Scope::User);
+                let seen = f
+                    .store
+                    .tx(|tx| f.inv.get_resource(tx, &caller(None), &rid("theirs")))
+                    .unwrap();
+                assert_eq!(seen.scope, Scope::User);
+            }
+
+            #[test]
+            fn clears_the_promotion() {
+                let (mut f, id) = pending_promotion();
+                f.store
+                    .tx(|tx| f.promos.approve(tx, &admin(), id.clone(), None))
+                    .unwrap();
+                assert_eq!(f.pending().len(), 0);
+                let again = f
+                    .store
+                    .tx(|tx| f.promos.approve(tx, &admin(), id.clone(), None))
+                    .unwrap_err();
+                assert!(matches!(again, PromotionError::NotFound));
+            }
+
+            #[test]
+            fn keeps_existing_links() {
+                let (mut f, id) = pending_promotion();
+                f.store
+                    .tx(|tx| f.promos.approve(tx, &admin(), id, None))
+                    .unwrap();
+                let a = f.row(Some("/p/a"), "mine", "m1");
+                let b = f.row(None, "theirs", "t1");
+                assert!(f.group(a).contains(&b));
+            }
+
+            #[test]
+            fn writes_audit_entry_with_the_user_request() {
+                let (mut f, id) = pending_promotion();
+                f.store
+                    .tx(|tx| f.promos.approve(tx, &admin(), id, None))
+                    .unwrap();
+                let entries = f.store.tx(audit::all).unwrap();
+                let last = entries.last().unwrap();
+                assert_eq!(last.action, "promotion_approved");
+                assert_eq!(last.user_requested.as_deref(), Some("share the board"));
+            }
+        }
+
+        mod on_id_clash_with_a_user_resource_and_no_new_id {
+            use super::*;
+
+            fn clashing() -> (Fixture, leclerk::model::PromotionId) {
+                let (mut f, id) = pending_promotion();
+                f.seed_generic(None, "theirs", "x", "unrelated").unwrap();
+                (f, id)
+            }
+
+            #[test]
+            fn returns_id_clash() {
+                let (mut f, id) = clashing();
+                let err = f
+                    .store
+                    .tx(|tx| f.promos.approve(tx, &admin(), id, None))
+                    .unwrap_err();
+                assert!(matches!(err, PromotionError::IdClash { ref id } if *id == rid("theirs")));
+            }
+
+            #[test]
+            fn leaves_the_promotion_pending_and_the_resource_in_place() {
+                let (mut f, id) = clashing();
+                let _ = f.store.tx(|tx| f.promos.approve(tx, &admin(), id, None));
+                assert_eq!(f.pending().len(), 1);
+                let r = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .get_resource(tx, &caller(Some("/p/b")), &rid("theirs"))
+                    })
+                    .unwrap();
+                assert_eq!(r.scope, Scope::Project(project("/p/b")));
+            }
+        }
+
+        mod on_id_clash_with_new_id_given {
+            use super::*;
+
+            #[test]
+            fn moves_and_renames() {
+                let (mut f, id) = pending_promotion();
+                f.seed_generic(None, "theirs", "x", "unrelated").unwrap();
+                let r = f
+                    .store
+                    .tx(|tx| f.promos.approve(tx, &admin(), id, Some(rid("shared"))))
+                    .unwrap();
+                assert_eq!(r.id, rid("shared"));
+                assert_eq!(r.scope, Scope::User);
+                assert_eq!(r.units[0].id, uid("t1"));
+            }
+
+            #[test]
+            fn still_returns_id_clash_when_the_new_id_is_also_taken() {
+                let (mut f, id) = pending_promotion();
+                f.seed_generic(None, "theirs", "x", "unrelated").unwrap();
+                f.seed_generic(None, "shared", "x", "unrelated2").unwrap();
+                let err = f
+                    .store
+                    .tx(|tx| f.promos.approve(tx, &admin(), id, Some(rid("shared"))))
+                    .unwrap_err();
+                assert!(matches!(err, PromotionError::IdClash { ref id } if *id == rid("shared")));
+            }
+        }
+
+        #[test]
+        fn on_unknown_promotion_returns_not_found() {
+            let mut f = fixture();
+            let err = f
+                .store
+                .tx(|tx| {
+                    f.promos
+                        .approve(tx, &admin(), leclerk::model::PromotionId::new(), None)
+                })
+                .unwrap_err();
+            assert!(matches!(err, PromotionError::NotFound));
+        }
+    }
+}
+
+mod dedup_audit {
+    use super::*;
+
+    fn entries(f: &mut Fixture, action: &str) -> Vec<audit::AuditEntry> {
+        f.store
+            .tx(audit::all)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == action)
+            .collect()
+    }
+
+    mod add_unit {
+        use super::*;
+
+        mod on_a_match_in_another_project {
+            use super::*;
+
+            #[test]
+            fn audits_promotion_requested() {
+                let mut f = fixture();
+                f.seed_generic(Some("/p/b"), "theirs", "t1", "k").unwrap();
+                f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+                let promos = f.pending();
+                let got = entries(&mut f, "promotion_requested");
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0].detail["promotion"], promos[0].id.to_string());
+                assert_eq!(got[0].detail["resource"], "theirs");
+            }
+        }
+
+        mod on_an_automatic_link {
+            use super::*;
+
+            #[test]
+            fn audits_link_created_listing_the_pairs() {
+                let mut f = fixture();
+                f.seed_generic(None, "board", "u1", "k").unwrap();
+                f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
+                let got = entries(&mut f, "link_created");
+                assert_eq!(got.len(), 1);
+                assert_eq!(
+                    got[0].detail["links"],
+                    serde_json::json!([["mine/m1", "board/u1"]])
+                );
+            }
+
+            #[test]
+            fn audits_nothing_without_a_match() {
+                let mut f = fixture();
+                f.seed_generic(None, "board", "u1", "k").unwrap();
+                f.seed_generic(None, "other", "u1", "k2").unwrap();
+                assert_eq!(entries(&mut f, "link_created").len(), 0);
+            }
+        }
+    }
+}
