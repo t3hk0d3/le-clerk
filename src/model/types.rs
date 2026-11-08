@@ -218,7 +218,7 @@ pub struct Caller {
     /// The caller's project, if known.
     pub project: Option<ProjectKey>,
     /// Text of the user request this call serves, if any.
-    pub user_requested: Option<String>,
+    pub override_reason: Option<String>,
 }
 
 /// Lease lifecycle state.

@@ -66,7 +66,7 @@ fn user(tag: &str) -> Caller {
     Caller {
         holder: holder(tag),
         project: None,
-        user_requested: None,
+        override_reason: None,
     }
 }
 
@@ -83,7 +83,7 @@ fn session(id: &str) -> Caller {
             session_id: id.into(),
         },
         project: None,
-        user_requested: None,
+        override_reason: None,
     }
 }
 
@@ -91,14 +91,14 @@ fn cli(pid: u32, start_time: u64) -> Caller {
     Caller {
         holder: HolderRef::CliProcess { pid, start_time },
         project: None,
-        user_requested: None,
+        override_reason: None,
     }
 }
 
 /// The administrator, acting on a user request.
 fn admin() -> Caller {
     Caller {
-        user_requested: Some(REASON.into()),
+        override_reason: Some(REASON.into()),
         ..user("admin")
     }
 }
@@ -201,7 +201,7 @@ async fn assert_admin_audit(h: &EngineHandle, action: &str) {
     let entries = audit_of(h, action).await;
     assert_eq!(entries.len(), 1, "{action}: {entries:?}");
     assert_eq!(entries[0]["actor"], json!({"kind": "user", "tag": "admin"}));
-    assert_eq!(entries[0]["user_requested"], REASON);
+    assert_eq!(entries[0]["override_reason"], REASON);
 }
 
 /// The status entry of `resource`/`unit` in the all-scopes view.
@@ -1718,7 +1718,7 @@ mod admin_ops {
                 ok(&h, "admin_doctor", &admin(), json!({"fix": true})).await;
                 let entries = audit_of(&h, "admin_doctor_fix").await;
                 assert_eq!(entries.len(), 4, "{entries:?}");
-                assert!(entries.iter().all(|e| e["user_requested"] == REASON));
+                assert!(entries.iter().all(|e| e["override_reason"] == REASON));
                 assert_admin_audit(&h, "admin_doctor").await;
             }
         }

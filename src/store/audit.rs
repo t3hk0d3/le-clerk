@@ -15,7 +15,7 @@ pub struct AuditEntry {
     /// Who did it.
     pub actor: HolderRef,
     /// The user request this action served, if any.
-    pub user_requested: Option<String>,
+    pub override_reason: Option<String>,
     /// What happened, e.g. `resource_created`.
     pub action: String,
     /// Action-specific details.
@@ -34,12 +34,12 @@ pub fn record(
     detail: &Value,
 ) -> Result<(), StoreError> {
     tx.conn().execute(
-        "INSERT INTO audit (at, actor, user_requested, action, detail) \
+        "INSERT INTO audit (at, actor, override_reason, action, detail) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
             at_ms,
             serde_json::to_string(&actor.holder)?,
-            actor.user_requested,
+            actor.override_reason,
             action,
             serde_json::to_string(detail)?,
         ],
@@ -101,7 +101,7 @@ pub fn all(tx: &Tx) -> Result<Vec<AuditEntry>, StoreError> {
     decode(rows)
 }
 
-const COLUMNS: &str = "row_id, at, actor, user_requested, action, detail";
+const COLUMNS: &str = "row_id, at, actor, override_reason, action, detail";
 
 type RawRow = (i64, i64, String, Option<String>, String, String);
 
@@ -121,12 +121,12 @@ fn decode(
 ) -> Result<Vec<AuditEntry>, StoreError> {
     let mut out = Vec::new();
     for row in rows {
-        let (id, at, actor, user_requested, action, detail) = row?;
+        let (id, at, actor, override_reason, action, detail) = row?;
         out.push(AuditEntry {
             id,
             at,
             actor: serde_json::from_str(&actor)?,
-            user_requested,
+            override_reason,
             action,
             detail: serde_json::from_str(&detail)?,
         });

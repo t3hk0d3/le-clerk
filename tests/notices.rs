@@ -43,7 +43,7 @@ fn caller_in(tag: &str, path: Option<&str>) -> Caller {
     Caller {
         holder: holder(tag),
         project: path.map(project),
-        user_requested: None,
+        override_reason: None,
     }
 }
 
@@ -456,10 +456,10 @@ mod audit_log {
             }
 
             #[test]
-            fn carries_time_actor_action_detail_and_user_requested() {
+            fn carries_time_actor_action_detail_and_override_reason() {
                 let mut f = fixture();
                 let who = Caller {
-                    user_requested: Some("because".into()),
+                    override_reason: Some("because".into()),
                     ..caller("a")
                 };
                 f.with_tx(|tx| {
@@ -470,7 +470,7 @@ mod audit_log {
                 assert_eq!(e.actor, holder("a"));
                 assert_eq!(e.action, "thing");
                 assert_eq!(e.detail, serde_json::json!({"k": 1}));
-                assert_eq!(e.user_requested.as_deref(), Some("because"));
+                assert_eq!(e.override_reason.as_deref(), Some("because"));
             }
         }
 
@@ -697,7 +697,7 @@ mod audit_log {
             f.seed(&a, "mine", &Scope::Project(project("/a")), "k");
             let id = f.store.tx(|tx| f.promos.list(tx)).unwrap().remove(0).id;
             let admin = Caller {
-                user_requested: Some("share it".into()),
+                override_reason: Some("share it".into()),
                 ..caller("admin")
             };
             f.store
@@ -705,7 +705,7 @@ mod audit_log {
                 .unwrap();
             let got = f.audit_of("promotion_approved");
             assert_eq!(got.len(), 1);
-            assert_eq!(got[0].user_requested.as_deref(), Some("share it"));
+            assert_eq!(got[0].override_reason.as_deref(), Some("share it"));
         }
     }
 }

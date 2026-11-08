@@ -687,7 +687,7 @@ At minimum:
     - Interactive use asks for confirmation. Non-interactive use needs
       `--yes`.
     - Run from an agent session (`CLAUDE_CODE_SESSION_ID` set), every
-      `admin` command also needs `--user-requested "<reason>"`, the same rule
+      `admin` command also needs `--override "<reason>"`, the same rule
       as overrides (§5.6). Agents can therefore help with clean-up when you ask
       them to, and the log shows who did what.
 

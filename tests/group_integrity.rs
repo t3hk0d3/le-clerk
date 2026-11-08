@@ -48,7 +48,7 @@ fn user(tag: &str) -> Caller {
     Caller {
         holder: holder(tag),
         project: None,
-        user_requested: None,
+        override_reason: None,
     }
 }
 
@@ -61,7 +61,7 @@ fn in_project(tag: &str, project: &str) -> Caller {
 
 fn admin() -> Caller {
     Caller {
-        user_requested: Some(REASON.into()),
+        override_reason: Some(REASON.into()),
         ..user("admin")
     }
 }

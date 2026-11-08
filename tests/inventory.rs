@@ -35,7 +35,7 @@ fn caller(project_path: Option<&str>) -> Caller {
             tag: "tester".into(),
         },
         project: project_path.map(project),
-        user_requested: None,
+        override_reason: None,
     }
 }
 
@@ -320,10 +320,10 @@ mod inventory {
             }
 
             #[test]
-            fn records_user_requested_reason_in_audit() {
+            fn records_override_reason_reason_in_audit() {
                 let mut f = fixture();
                 let mut who = caller(None);
-                who.user_requested = Some("user asked".into());
+                who.override_reason = Some("user asked".into());
                 f.store
                     .tx(|tx| {
                         f.inv
@@ -331,7 +331,7 @@ mod inventory {
                     })
                     .unwrap();
                 let entries = f.store.tx(audit::all).unwrap();
-                assert_eq!(entries[0].user_requested.as_deref(), Some("user asked"));
+                assert_eq!(entries[0].override_reason.as_deref(), Some("user asked"));
             }
         }
 
@@ -2152,7 +2152,7 @@ mod promotions {
 
     fn admin() -> Caller {
         Caller {
-            user_requested: Some("share the board".into()),
+            override_reason: Some("share the board".into()),
             ..caller(None)
         }
     }
@@ -2228,7 +2228,7 @@ mod promotions {
                 let entries = f.store.tx(audit::all).unwrap();
                 let last = entries.last().unwrap();
                 assert_eq!(last.action, "promotion_approved");
-                assert_eq!(last.user_requested.as_deref(), Some("share the board"));
+                assert_eq!(last.override_reason.as_deref(), Some("share the board"));
             }
         }
 

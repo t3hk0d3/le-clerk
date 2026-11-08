@@ -39,7 +39,7 @@ fn as_caller(holder: HolderRef) -> Caller {
     Caller {
         holder,
         project: None,
-        user_requested: None,
+        override_reason: None,
     }
 }
 

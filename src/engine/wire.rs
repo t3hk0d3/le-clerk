@@ -246,7 +246,7 @@ pub struct AuditView {
     pub id: i64,
     pub at: i64,
     pub actor: HolderRef,
-    pub user_requested: Option<String>,
+    pub override_reason: Option<String>,
     pub action: String,
     pub detail: Value,
 }
@@ -257,7 +257,7 @@ impl From<AuditEntry> for AuditView {
             id: e.id,
             at: e.at,
             actor: e.actor,
-            user_requested: e.user_requested,
+            override_reason: e.override_reason,
             action: e.action,
             detail: e.detail,
         }

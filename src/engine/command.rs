@@ -34,7 +34,7 @@ pub enum ViewArg {
     #[default]
     Caller,
     /// Every scope. Accepted from any caller at this layer: gating admin
-    /// views (`--user-requested` for agents) is the CLI's job (phase 2).
+    /// views (`--override` for agents) is the CLI's job (phase 2).
     All,
 }
 

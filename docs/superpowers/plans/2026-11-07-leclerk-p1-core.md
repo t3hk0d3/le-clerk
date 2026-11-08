@@ -99,7 +99,7 @@ for phase 2**. They are listed here so the API errors match them.
   - 6: queued, when called with `--no-wait`
   - `clerk run`: the child's exit code
 - **Agent gating:** when `CLAUDE_CODE_SESSION_ID` is set, `clerk admin …`,
-  `clerk approve` and `--override` need `--user-requested "<reason>"`. The
+  `clerk approve` need `--override "<reason>"` (the same flag `acquire` uses). The
   reason is written to the audit log.
 - **Tone:** messages may be playfully bureaucratic, but the first sentence must
   always state plainly what happened and what to do.
@@ -428,7 +428,7 @@ Audit
     record / list
         - every inventory change, grant, handover (cleanup confirmed?), yield
           ask/answer, override (+reason), promotion, admin action is listed
-          with time, actor holder, user_requested reason if any
+          with time, actor holder, override_reason reason if any
 
 Daemon
     ensure_running (client side)
@@ -448,7 +448,7 @@ Daemon
     shutdown (`clerk daemon stop`)
         - stops accepting, finishes current transaction, removes socket
 
-AdminOps (engine operations; all audit "admin_<op>" with actor + user_requested reason)
+AdminOps (engine operations; all audit "admin_<op>" with actor + override_reason reason)
     admin_release(lease)
         - lease Ended now; unit dirty(admin_forced); dispatch
     evict(holder)
@@ -608,7 +608,7 @@ follows it):
     `CLERK_UNIT_PATH`, `CLERK_UNIT_HOST`, `CLERK_UNIT_PORT`, …
 - **Holders and callers:**
   - `enum HolderRef { AgentSession { session_id: String }, CliProcess { pid: u32, start_time: u64 }, User { tag: String } }`
-  - `struct Caller { holder: HolderRef, project: Option<ProjectKey>, user_requested: Option<String> }`
+  - `struct Caller { holder: HolderRef, project: Option<ProjectKey>, override_reason: Option<String> }`
 - **Leases:**
   - `enum LeaseState { Offered, Held, Paused, Cleaning, Ended }`
   - `enum EndCause { Released, Expired, Yielded, Reclaimed, Override, HolderGone, CommandFailed, AdminForced }`
@@ -943,7 +943,7 @@ the target, divided by the unit count. It is `None` if unknown.
 - [ ] **Step 2:** Run `cargo test --test interrupt`. Expected: FAIL.
 - [ ] **Step 3:** Implement. An override reuses `end_lease` with
   `EndCause::Override` after the cleanup window. Agent callers need
-  `user_requested`; that is enforced in the CLI (phase 2), and the scheduler
+  `override_reason`; that is enforced in the CLI (phase 2), and the scheduler
   only records the reason.
 - [ ] **Step 4:** Run `cargo test`. Expected: PASS.
 - [ ] **Step 5:** Commit: `feat: interruptible leases, borrowing, reclaim and override`
@@ -1106,9 +1106,9 @@ the target, divided by the unit count. It is `None` if unknown.
   - **Export format** (the contract):
     `{ "version": 1, "resources": [ { "id", "type", "scope": "user" | {"project": "<path>"}, "description", "notes", "health", "units": [ { "id", "settings", "notes" } ] } ], "links": [ [ ["<scope>","<resource>","<unit>"], [...] ] ] }`
 - The rename must work because leases reference internal row IDs (Task 3).
-  The engine performs no gating; the confirmation and `--user-requested` rules
+  The engine performs no gating; the confirmation and `--override` rules
   are enforced by the CLI in phase 2. The engine only records
-  `caller.user_requested`.
+  `caller.override_reason`.
 
 - [ ] **Step 1:** Write the failing tests for BDD `AdminOps` and
   `rehome_holder`, one module per operation, at engine level.

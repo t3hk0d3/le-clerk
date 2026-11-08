@@ -13,7 +13,7 @@ gated admin tools, for people, scripts and agents calling it through Bash.
   - TTY detection and rendering;
   - the interactive live view (raw-mode keys);
   - `clerk run` process supervision;
-  - the safety gates (confirmation, `--yes`, `--user-requested`).
+  - the safety gates (confirmation, `--yes`, `--override`).
 
 **Tech Stack:** as phase 1, plus `script` (util-linux) in tests to get a PTY.
 
@@ -38,9 +38,11 @@ All of phase 1's Global Constraints apply. The ones this phase implements:
   - 5: daemon unavailable
   - 6: queued, when called with `--no-wait`
   - `clerk run`: the child's exit code
-- **Agent gating:** when `CLAUDE_CODE_SESSION_ID` is set, `clerk admin …`,
-  `clerk approve` and `--override` need `--user-requested "<reason>"`. The
-  reason is passed to the daemon in `Caller.user_requested`.
+- **Agent gating:** when `CLAUDE_CODE_SESSION_ID` is set, `clerk admin …`
+  and `clerk approve` need `--override "<reason>"` (the user told the agent
+  to do it, and why). `clerk acquire --override "<reason>"` is the same flag:
+  it both grabs the resource regardless and records the reason. The reason
+  is passed to the daemon in `Caller.override_reason`.
 - **Keys:** Ctrl+C (`0x03`) cancels or releases; Ctrl+] (`0x1d`) detaches.
 - **Durations:** `--for` accepts `<n>s|m|h|d` with n ≥ 1, up to 30 days.
 - **Tone:** messages may be playfully bureaucratic, but the first sentence must
@@ -119,15 +121,15 @@ CLI
     status / resources / leases / queue / log / promotions / approve
         - read views; invisible holders shown as "held by an agent in another project"
         - approve gated for agents
-    acquire --override
-        On agent caller without --user-requested
-            - refused, exit 4
+    acquire --override "<reason>"
+        On empty reason
+            - refused, exit 2
 admin (all subcommands)
     On TTY
         - asks confirmation naming the effect; "n" aborts with nothing changed
     On non-TTY without --yes
         - refused, exit 4, nothing changed
-    On agent caller without --user-requested
+    On agent caller without --override "<reason>"
         - refused, exit 4
     On success
         - calls the matching phase-1 admin_* method; prints its result
@@ -142,7 +144,7 @@ src/cli/caller.rs     Caller construction (session env, pid/start_time, project)
 src/cli/inventory.rs  resource / unit commands
 src/cli/views.rs      status, resources, leases, queue, log, promotions, approve
 src/cli/lease.rs      acquire, attach, release, extend, run, wait, live view
-src/cli/gate.rs       confirmation / --yes / --user-requested gate
+src/cli/gate.rs       confirmation / --yes / --override gate
 src/cli/admin.rs      admin subcommands
 src/main.rs           (modify) delegate to cli::run
 tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
@@ -161,7 +163,7 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
 - Consumes `Client::ensure_running`, `Client::call` and `DaemonError` (phase 1,
   Task 13), plus the RPC method names from phase 1 Tasks 12 and 14.
 - Produces:
-  - `cli::caller::current(kind: CallerKind, user_requested: Option<String>) -> anyhow::Result<Caller>`,
+  - `cli::caller::current(kind: CallerKind, override_reason: Option<String>) -> anyhow::Result<Caller>`,
     where `enum CallerKind { Interactive, Detached, Run }`:
     - `CLAUDE_CODE_SESSION_ID` gives `AgentSession`;
     - otherwise `CliProcess { pid, start_time }` for `Interactive` and `Run`,
@@ -182,7 +184,7 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
   - Views: `status`, `resources`, `leases`, `queue <resource>`,
     `log [--since --actor --action --limit]`, `promotions`,
     `approve <promotion> [--as <id>]`
-  - Global flags: `--json`, `--user-requested <reason>`
+  - Global flags: `--json`, `--override <reason>`
 
 - [ ] **Step 1:** Write the failing tests for the BDD `CLI` subtrees
   `output mode`, `inventory commands`, `caller identity`,
@@ -198,7 +200,7 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
     (Review Focus 4)
   - `cli::caller::on_cwd_with_spaces_and_unicode::resolves_project`
     (Review Focus 5)
-  - `cli::approve::on_agent_without_user_requested::exits_4`
+  - `cli::approve::on_agent_without_override_reason::exits_4`
 - [ ] **Step 2:** Run `cargo test --test cli 2>&1 | tee /tmp/claude-1000/leclerk-cli.log`.
   Expected: FAIL.
 - [ ] **Step 3:** Implement. Human rendering is plain aligned text, with no
@@ -273,7 +275,7 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
 - Consumes `cli::gate::require` (Task 1) and the phase 1 `admin_*` RPC methods
   and `HolderSpec` (phase 1, Task 14).
 - **Commands:**
-  `clerk admin <release|evict|dequeue|clear-queue|remove-unit|delete-resource|clean|link|unlink|move|rename|edit-lease|doctor|export|import> … [--yes] [--user-requested REASON]`
+  `clerk admin <release|evict|dequeue|clear-queue|remove-unit|delete-resource|clean|link|unlink|move|rename|edit-lease|doctor|export|import> … [--yes] [--override REASON]`
   - `remove-unit` and `delete-resource` call the `_force` variants.
   - `export` writes to stdout or `--out FILE`.
   - `import` reads `--in FILE`, with `--replace`.

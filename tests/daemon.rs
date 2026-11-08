@@ -197,7 +197,7 @@ fn user(tag: &str) -> Caller {
     Caller {
         holder: holder(tag),
         project: None,
-        user_requested: None,
+        override_reason: None,
     }
 }
 

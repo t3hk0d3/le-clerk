@@ -3,9 +3,9 @@
 //! and export/import of the inventory.
 //!
 //! The engine performs no gating: who may run these (and the
-//! `--user-requested` rule for agents) is the CLI's job. Every operation
+//! `--override` rule for agents) is the CLI's job. Every operation
 //! writes one audit entry `admin_<op>` with the caller as actor and the
-//! caller's `user_requested` text.
+//! caller's `override_reason` text.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -1093,7 +1093,7 @@ impl<'a> Admin<'a> {
                     Scope::Project(key) => Some(key.clone()),
                     Scope::User => None,
                 },
-                user_requested: who.user_requested.clone(),
+                override_reason: who.override_reason.clone(),
             };
             self.inventory.create_resource(
                 tx,

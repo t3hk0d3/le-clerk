@@ -75,7 +75,7 @@ fn user(tag: &str) -> Caller {
     Caller {
         holder: holder(tag),
         project: None,
-        user_requested: None,
+        override_reason: None,
     }
 }
 
@@ -307,7 +307,7 @@ mod engine {
                 let gone = Caller {
                     holder: HolderRef::CliProcess { pid, start_time },
                     project: None,
-                    user_requested: None,
+                    override_reason: None,
                 };
                 assert_eq!(acquire(&h, &gone, 60_000).await["outcome"], "granted");
                 let b = user("b");

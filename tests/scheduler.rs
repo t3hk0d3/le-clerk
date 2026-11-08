@@ -43,7 +43,7 @@ fn caller_in(tag: &str, project_path: Option<&str>) -> Caller {
     Caller {
         holder: holder(tag),
         project: project_path.map(project),
-        user_requested: None,
+        override_reason: None,
     }
 }
 

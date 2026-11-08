@@ -58,6 +58,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0006_interruption.sql")),
         M::up(include_str!("migrations/0007_link_suppression.sql")),
         M::up(include_str!("migrations/0008_cleanup_ending.sql")),
+        M::up(include_str!("migrations/0009_override_reason.sql")),
     ])
 }
 
