@@ -1,0 +1,225 @@
+//! The `clerk` command line: argument parsing, dispatch and exit codes.
+//!
+//! Every command prints human text when stdout is a terminal and JSON
+//! otherwise (or with `--json`). Nothing but command output reaches stdout;
+//! logs go to stderr. Stdin is never read unless it is a terminal, except
+//! for `-f -` on the inventory commands.
+
+mod caller;
+mod gate;
+mod input;
+mod inventory;
+mod output;
+mod views;
+
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+use leclerk::client::{self, Client, DaemonError, DaemonInfo};
+use leclerk::config::{Config, Paths};
+use leclerk::daemon;
+use leclerk::model::Caller;
+use serde_json::{Value, json};
+use thiserror::Error;
+
+use self::caller::CallerKind;
+use self::output::{Failure, Mode, Output, View};
+
+/// A command line that parses but does not make sense; exit 2, nothing
+/// reaches the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{0}")]
+pub struct UsageError(pub String);
+
+/// Le Clerk: a local resource-lease broker for AI coding agents.
+#[derive(Parser)]
+#[command(name = "clerk", version = leclerk::VERSION, arg_required_else_help = true)]
+struct Cli {
+    /// Print JSON, even on a terminal.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Why an agent does this for the user (agents need it for `approve`
+    /// and `admin`; the reason is recorded in the audit log).
+    #[arg(long = "override", global = true, value_name = "REASON")]
+    override_reason: Option<String>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the daemon in the foreground, or manage the running one.
+    Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+    },
+    /// Create, change, delete, list or show resources.
+    Resource {
+        #[command(subcommand)]
+        action: inventory::ResourceAction,
+    },
+    /// Add, change, remove or retire units of a resource.
+    Unit {
+        #[command(subcommand)]
+        action: inventory::UnitAction,
+    },
+    /// Units, holders, queues, health and dirty flags.
+    Status,
+    /// List resources, optionally only those carrying every given tag.
+    Resources(views::TagFilter),
+    /// Live leases (or with --mine, this agent session's leases).
+    Leases {
+        /// Only this agent session's leases, each with its brief.
+        #[arg(long)]
+        mine: bool,
+    },
+    /// The requests queued on a resource.
+    Queue {
+        /// The resource id.
+        resource: String,
+    },
+    /// The audit log, newest first.
+    Log(views::LogArgs),
+    /// Pending promotions of project resources to user scope.
+    Promotions,
+    /// Approve a promotion: the resource moves to user scope.
+    Approve {
+        /// The promotion id, from `clerk promotions`.
+        promotion: String,
+        /// Promote under this id instead of the resource's own.
+        #[arg(long = "as", value_name = "ID")]
+        new_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum DaemonAction {
+    /// Show whether the daemon runs, with its pid and version.
+    Status,
+    /// Stop the running daemon.
+    Stop,
+    /// Stop the running daemon and start a fresh one.
+    Restart,
+}
+
+/// What every command handler gets.
+pub struct Ctx {
+    pub paths: Paths,
+    pub out: Output,
+    override_reason: Option<String>,
+}
+
+impl Ctx {
+    /// The caller this process acts as.
+    ///
+    /// # Errors
+    /// As [`caller::current`].
+    pub fn caller(&self, kind: CallerKind) -> anyhow::Result<Caller> {
+        caller::current(kind, self.override_reason.clone())
+    }
+
+    /// A client of the running daemon, started when needed.
+    ///
+    /// # Errors
+    /// [`DaemonError`] when no daemon of this version answers.
+    pub async fn client(&self) -> Result<Client, DaemonError> {
+        Client::ensure_running(&self.paths).await
+    }
+}
+
+/// Parse the command line, run the command and return its exit code.
+pub fn run() -> ExitCode {
+    let cli = Cli::parse();
+    let out = Output::new(Mode::detect(cli.json));
+    if let Command::Daemon { action: None } = cli.command {
+        // The daemon logs to its own file.
+        return match run_daemon() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => out.fail(Failure::from(e)),
+        };
+    }
+    init_logging();
+    match execute(cli, out) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => out.fail(Failure::from(e)),
+    }
+}
+
+fn run_daemon() -> anyhow::Result<()> {
+    let paths = Paths::resolve()?;
+    daemon::run(&paths, Config::load(&paths)?)?;
+    Ok(())
+}
+
+/// Warnings and errors to stderr; stdout stays for command output.
+fn init_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+}
+
+fn execute(cli: Cli, out: Output) -> anyhow::Result<()> {
+    let ctx = Ctx {
+        paths: Paths::resolve()?,
+        out,
+        override_reason: cli.override_reason,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(dispatch(&ctx, cli.command))
+}
+
+async fn dispatch(ctx: &Ctx, command: Command) -> anyhow::Result<()> {
+    match command {
+        Command::Daemon { action: None } => Ok(()),
+        Command::Daemon {
+            action: Some(action),
+        } => manage_daemon(ctx, action).await,
+        Command::Resource { action } => inventory::resource(ctx, action).await,
+        Command::Unit { action } => inventory::unit(ctx, action).await,
+        Command::Status => views::status(ctx).await,
+        Command::Resources(filter) => views::resources(ctx, filter.tags).await,
+        Command::Leases { mine } => views::leases(ctx, mine).await,
+        Command::Queue { resource } => views::queue(ctx, &resource).await,
+        Command::Log(args) => views::log(ctx, args).await,
+        Command::Promotions => views::promotions(ctx).await,
+        Command::Approve { promotion, new_id } => views::approve(ctx, promotion, new_id).await,
+    }
+}
+
+/// `clerk daemon status|stop|restart`.
+async fn manage_daemon(ctx: &Ctx, action: DaemonAction) -> anyhow::Result<()> {
+    let caller = client::cli_caller();
+    let info = match action {
+        // Only "lock free and nothing answers" is not running; an
+        // unresponsive daemon is an error, never "not running".
+        DaemonAction::Status => match Client::probe(&ctx.paths).await {
+            Ok(info) => Some(info),
+            Err(DaemonError::Unavailable) => None,
+            Err(e) => return Err(e.into()),
+        },
+        DaemonAction::Stop => {
+            Client::stop(&ctx.paths, &caller).await?;
+            None
+        }
+        DaemonAction::Restart => Some(Client::restart(&ctx.paths, &caller).await?.daemon().clone()),
+    };
+    ctx.out.emit(&daemon_view(action, info))
+}
+
+fn daemon_view(action: DaemonAction, info: Option<DaemonInfo>) -> View {
+    let value = match &info {
+        Some(d) => json!({"running": true, "pid": d.pid, "version": d.version}),
+        None => json!({"running": false}),
+    };
+    View::new(value, move |_: &Value| match (action, &info) {
+        (DaemonAction::Stop, _) => "The clerk daemon is stopped.".to_owned(),
+        (_, Some(d)) => format!(
+            "The clerk daemon is running (pid {}, version {}).",
+            d.pid, d.version
+        ),
+        (_, None) => "The clerk daemon is not running; any clerk command starts it.".to_owned(),
+    })
+}
