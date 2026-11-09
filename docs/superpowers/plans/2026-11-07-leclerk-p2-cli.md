@@ -28,7 +28,9 @@ All of phase 1's Global Constraints apply. The ones this phase implements:
 
 - **Output:**
   - human-readable when stdout is a TTY; JSON otherwise, or with `--json`;
-  - never prompt or read stdin unless stdin is a TTY;
+  - never prompt or read stdin unless stdin is a TTY, with one exception:
+    `-f -` on the inventory commands reads a YAML document from stdin because
+    the caller asked for it explicitly;
   - errors in JSON mode: `{"error":{"code":"<snake_case>","message":"…"}}`.
 - **Exit codes:**
   - 0: ok
@@ -79,6 +81,28 @@ CLI
             - JSON only on stdout; logs never on stdout
     inventory commands (resource create|update|delete|list|show, unit add|update|remove|retire)
         - map 1:1 to daemon calls, print warnings, exit codes per constraints
+    YAML input (-f PATH | -f -) on resource create|update, unit add|update
+        On a document with the command's fields
+            - sends the same daemon call as the equivalent flags
+            - a multi-line usage block arrives byte-for-byte (trailing newline per YAML rules)
+        On -f - with a heredoc
+            - reads stdin to EOF and proceeds
+        On no -f with stdin a pipe that never closes
+            - never reads stdin (existing non-TTY guarantee)
+        On update with a subset of keys
+            - only those fields are in the patch
+        On a field given both as a flag and in the YAML
+            - exit 2 naming the field; no daemon call
+        On an unknown key
+            - exit 2 naming the key; no daemon call
+        On malformed YAML, a non-mapping document, or more than one document
+            - exit 2 with the parser's line and column; no daemon call
+        On input over 64 KiB
+            - exit 2; no daemon call
+        On a scalar tag that YAML reads as a number or boolean (tags: [esp32, 2024, no])
+            - exit 2 naming the entry and saying to quote it; never coerced silently
+        On -f PATH that does not exist
+            - exit 2 naming the path
     caller identity
         On CLAUDE_CODE_SESSION_ID set
             - holder AgentSession(id); project from cwd
@@ -142,6 +166,7 @@ src/cli/mod.rs        clap command tree, dispatch
 src/cli/output.rs     Mode detection, JSON/human rendering, error → exit code
 src/cli/caller.rs     Caller construction (session env, pid/start_time, project)
 src/cli/inventory.rs  resource / unit commands
+src/cli/input.rs      -f PATH / -f - YAML loading and flag merge
 src/cli/views.rs      status, resources, leases, queue, log, promotions, approve
 src/cli/lease.rs      acquire, attach, release, extend, run, wait, live view
 src/cli/gate.rs       confirmation / --yes / --override gate
@@ -155,7 +180,8 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
 ### Task 1: CLI framework, inventory and view commands
 
 **Files:**
-- Create: `src/cli/{mod,output,caller,inventory,views,gate}.rs`
+- Create: `src/cli/{mod,output,caller,inventory,input,views,gate}.rs`
+- Modify: `Cargo.toml` (add `serde-saphyr = "2"`)
 - Modify: `src/main.rs`
 - Test: `tests/cli.rs`
 
@@ -182,6 +208,18 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
   - `clerk unit add <resource> <unit> (--path P | --host H --port N [--listen] [--scheme S] [--service-id X] | --key K) [--description TEXT]`
   - `resource show` prints the raw usage template; `acquire`/`attach` print both descriptions and the rendered usage on grant (spec §4.7)
   - `unit update|remove|retire`
+  - **YAML input:** `resource create|update` and `unit add|update` take
+    `-f PATH` or `-f -` (stdin, read to EOF only when given). The document is
+    a mapping whose keys are the RPC arg names for that command minus the ID:
+    `type`, `scope`, `description`, `usage`, `tags`, `health` for create;
+    `description`, `usage`, `tags`, `add_tags`, `remove_tags`, `health` for
+    update; the `UnitSettings` fields plus `description` for units. It is
+    parsed with `serde-saphyr` into per-command structs with
+    `deny_unknown_fields`, then merged with the flags; a field present in both
+    is a usage error (exit 2). Input is capped at 64 KiB. String fields reject
+    non-string scalars rather than coercing them.
+    `cli::input::load(spec: &InputSpec) -> Result<Option<T>, InputError>`
+    where `InputSpec` is `None | Stdin | Path(PathBuf)`.
   - Views: `status`, `resources [--tag TAG[,TAG…]]…` (all tags must match; tags shown in both list and status), `leases`, `queue <resource>`,
     `log [--since --actor --action --limit]`, `promotions`,
     `approve <promotion> [--as <id>]`
@@ -202,6 +240,9 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
   - `cli::caller::on_cwd_with_spaces_and_unicode::resolves_project`
     (Review Focus 5)
   - `cli::approve::on_agent_without_override_reason::exits_4`
+  - `cli::yaml_input::on_heredoc_usage_block::matches_flag_equivalent`
+  - `cli::yaml_input::on_flag_and_key_both_set::exits_2_naming_field`
+  - `cli::yaml_input::on_numeric_tag::exits_2_asking_to_quote`
 - [ ] **Step 2:** Run `cargo test --test cli 2>&1 | tee /tmp/claude-1000/leclerk-cli.log`.
   Expected: FAIL.
 - [ ] **Step 3:** Implement. Human rendering is plain aligned text, with no

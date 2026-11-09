@@ -746,7 +746,16 @@ At minimum:
   - `--description` on both, and `--usage <text>` / `--usage-file <path>` on
     resources (§4.7);
   - `--tag` on resource create, `--add-tag` / `--remove-tag` on update
-    (§4.8).
+    (§4.8);
+  - **YAML input** (user decision): `resource create|update` and
+    `unit add|update` take `-f <path>`, or `-f -` for stdin, holding the same
+    fields as the MCP tools, e.g. a multi-line `usage` as a YAML block. The
+    ID stays on the command line. My calls:
+    - stdin is read only with `-f -`, never implicitly, so an agent's Bash
+      call cannot hang on an input stream that never closes;
+    - on update, only the keys present change;
+    - a field set by both a flag and the YAML is refused, not merged;
+    - unknown keys are refused, naming the key.
 
   The same rules apply: duplicate checks, warnings, and retiring a unit that is
   held.
@@ -907,6 +916,7 @@ stops the MVP):
   write-time placeholder checks;
 - the tag format and limits, all-tags matching, exact matching, and
   replace-or-add/remove editing;
+- YAML input through an explicit `-f -`, with flag/YAML conflicts refused;
 - promotion edge cases;
 - fallbacks if verify-first items fail;
 - the testing approach;
