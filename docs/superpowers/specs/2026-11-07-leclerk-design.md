@@ -107,17 +107,21 @@ combination is Le Clerk.
     e.g. `esp32-c6`, `thread-testbed`;
   - a type;
   - a **scope** (§4.2);
-  - a description and free-form notes for agents;
+  - a one-line **description** and a **usage** template: instructions for
+    agents, with unit placeholders (§4.7);
   - an optional **health check** definition (§4.5);
   - creator and timestamps.
 - **Unit:** a concrete instance inside a resource, e.g. the board on
   `/dev/serial/by-id/usb-Espressif_…`. It has:
   - its own ID, unique within its resource;
   - **settings** shaped by the resource's type (device path, address, port…);
-  - free-form notes;
+  - a one-line **description** (e.g. "cracked antenna, hub port 3"), but no
+    usage of its own: the resource's usage template covers all its units
+    (§4.7);
   - a **retiring** flag (§4.6).
 
-  What an agent receives on grant is the unit's ID and settings.
+  What an agent receives on grant is the unit's ID and settings, both
+  descriptions, and the resource's usage rendered for that unit (§4.7).
 
 A lease request names a resource and is satisfied by any eligible unit, or it
 names one specific unit.
@@ -182,16 +186,18 @@ Checks run whenever a unit is created or its settings change. They run against
 **every unit on the machine, in all scopes**, regardless of visibility.
 
 - **Match within the same scope:** refused. The response names the existing
-  resource and unit so the agent can use them.
+  resource and unit, with their descriptions, so the agent can use them.
 - **Project unit matching a user/system unit (user decision: warn).** Both are
   visible to the agent, so it is warned that the physical thing already exists
   at user level, and given that resource and unit so it can use them instead.
-  If it goes ahead, the units are linked as described below.
+  The warning carries the existing resource's and unit's descriptions, so the
+  agent can judge whether they are the same thing. If it goes ahead, the units are linked as described
+  below.
 - **Match with a unit in another project's scope:**
   - Not refused, because it may be fine or may be horribly wrong.
   - The agent is told *that* a similar unit seems to be registered in another
     project, and which project (my call: the project's path or name, not its
-    settings or notes).
+    settings, descriptions or usage).
   - It is offered a **promotion**: move the existing resource to user/system
     scope so both projects share one registration and one queue. The resource
     keeps its ID, so the original project's docs and memories stay valid.
@@ -202,7 +208,7 @@ Checks run whenever a unit is created or its settings change. They run against
     The user can remove the redundant unit. A merge operation is not in the MVP.
 - **Promotion needs the user's confirmation** (my call), because it changes
   what another project sees. An agent can only *request* a promotion. The user
-  approves it with the CLI (§8.4), or by telling an agent so, in which case the
+  approves it with the CLI (§8.4), which shows the resource's description, or by telling an agent so, in which case the
   agent applies it citing the user's request, the same way overrides work
   (§5.6).
 - **If the agent registers the unit anyway**, the clerk records the two units
@@ -248,6 +254,53 @@ Checks run whenever a unit is created or its settings change. They run against
   **retiring**: no new grants, and it is removed when its current lease ends.
   A resource with held units is handled the same way.
 - Every change is recorded in an audit log (§8.5).
+
+### 4.7 Descriptions and usage instructions
+
+Agents working with a resource need context: what it is, how to use it, what
+"clean" means. The clerk stores that context and hands it over on grant
+(user decision).
+
+- **Description** (resource and unit): one line of plain text, at most 200
+  characters. It says what the thing is. Line breaks are refused.
+- **Usage** (resource only, user decision): Markdown instructions for agents,
+  at most 4 KiB, e.g. how to flash or connect, gotchas, how to clean up. Units
+  have no usage of their own; instead the resource's usage is a template that
+  is filled in per unit.
+- **Placeholders** (user decision): `{resource.<key>}` and `{unit.<key>}` in
+  the usage text are replaced on grant. Keys (my call):
+  - every type: `{resource.id}`, `{resource.description}`, `{unit.id}`,
+    `{unit.description}`;
+  - `device`: `{unit.path}`;
+  - `service`: `{unit.mode}`, `{unit.scheme}`, `{unit.host}`, `{unit.port}`,
+    `{unit.service_id}`, and `{unit.address}` (`host:port`, IPv6 hosts in
+    brackets);
+  - `generic`: `{unit.identity_key}`.
+
+  My calls:
+  - Only text of the exact form `{resource.<key>}` or `{unit.<key>}` (key:
+    lowercase letters, digits, `_`) is a placeholder. Anything else in braces,
+    such as shell `${PORT}` or JSON, passes through unchanged, so no escaping
+    is needed.
+  - A resource's settings shape is fixed by its type, so placeholders are
+    checked when usage is written: an unknown key is refused, and the error
+    lists the keys valid for that type.
+  - Optional settings that are unset (`scheme`, `service_id`) render as empty
+    text.
+  - Substituted values are inserted as-is; the usage is instructions for an
+    agent, not something the clerk executes.
+- **Where agents see them:**
+  - on grant (offered or held) and in the agent's own lease status: both
+    descriptions and the rendered usage;
+  - `resource_list` and listings: descriptions only, to keep them short;
+  - `resource_get`: everything, with usage as the raw template so it can be
+    edited.
+- **Who writes them:** agents on create and update (the skill asks them to fill
+  both in when they register something, §8.3); the user through the CLI
+  (`--description`, `--usage`, `--usage-file <path>`, §8.4).
+- Changing them is an inventory change and is audited (§8.5). It does not
+  affect leases already granted: a holder sees the new text the next time it
+  asks for its lease status.
 
 ## 5. Leasing
 
@@ -588,14 +641,16 @@ running and starts it if not. The roles:
 **Inventory:**
 - `type_list`: built-in types and their settings shape.
 - `resource_create`, `resource_update`, `resource_delete`, `resource_list`,
-  `resource_get`. `resource_list` shows only visible scopes, with unit counts
-  and how many are free.
+  `resource_get`. `resource_list` shows only visible scopes, with unit counts,
+  how many are free, and descriptions. Create and update take a description
+  and a usage template (§4.7).
 - `unit_add`, `unit_update`, `unit_remove`, `unit_retire`. Adding or updating a
   unit returns duplicate results (§4.4).
 - `promotion_request`.
 
 **Leasing:**
 - `lease_acquire` (§5.1). Returns a grant at once, or a task / queued result.
+  A grant carries the descriptions and the rendered usage (§4.7).
 - `lease_status`: this session's leases, queue positions, pending notices.
 - `lease_extend`.
 - `lease_release`: starts cleanup.
@@ -632,6 +687,8 @@ A Claude Code skill shipped with the integration package teaches agents:
 - to confirm cleanup;
 - to record resource and unit IDs in project docs or memory after creating
   them;
+- to give every resource and unit a description, and every resource usage
+  instructions with unit placeholders (§4.7), and to read them on grant;
 - to use `override` only when the user said so;
 - never to coordinate resources by messaging other agents.
 
@@ -649,7 +706,9 @@ At minimum:
   tools can (§8.1):
   - `clerk resource create|update|delete|list|show`, with a `--scope` option
     for user or project;
-  - `clerk unit add|update|remove|retire`.
+  - `clerk unit add|update|remove|retire`;
+  - `--description` on both, and `--usage <text>` / `--usage-file <path>` on
+    resources (§4.7).
 
   The same rules apply: duplicate checks, warnings, and retiring a unit that is
   held.
@@ -774,6 +833,8 @@ stops the MVP):
   projects;
 - health checks defined per resource, run per unit, only when granting;
 - types `device`, `service` (including listen addresses), and `generic`;
+- a description per resource and unit, and usage instructions per resource
+  with unit placeholders, handed over on grant;
 - hard expiry even when nobody is waiting, marking the unit dirty and warning
   its next owner;
 - CLI holders for the user, scripts and smoke tests;
@@ -803,6 +864,8 @@ stops the MVP):
 - an "offered" state with a claim window for grants made while the agent waits;
 - the forms of CLI holder: `run` and `acquire`, non-interruptible;
 - the session-ID fallback;
+- the description and usage limits, the placeholder syntax and keys, and
+  write-time placeholder checks;
 - promotion edge cases;
 - fallbacks if verify-first items fail;
 - the testing approach;

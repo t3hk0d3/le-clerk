@@ -177,9 +177,10 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
   - `cli::gate::require(effect: &str, yes: bool, caller: &Caller) -> Result<(), GateRefusal>`.
     It prompts only when stdin is a TTY.
 - **Commands:**
-  - `clerk resource create <id> --type device|service|generic [--scope user|project] [--description] [--notes] [--health CHECK[,CHECK…]] [--health-command SCRIPT]` (CHECK ∈ exists|accessible|not-open|tcp-connect|port-free|http|none; `--health-command` appends a custom check; omit both for the type default)
+  - `clerk resource create <id> --type device|service|generic [--scope user|project] [--description TEXT] [--usage TEXT | --usage-file PATH] [--health CHECK[,CHECK…]] [--health-command SCRIPT]` (CHECK ∈ exists|accessible|not-open|tcp-connect|port-free|http|none; `--health-command` appends a custom check; omit both for the type default)
   - `resource update|delete|list|show`
-  - `clerk unit add <resource> <unit> (--path P | --host H --port N [--listen] [--scheme S] [--service-id X] | --key K) [--notes]`
+  - `clerk unit add <resource> <unit> (--path P | --host H --port N [--listen] [--scheme S] [--service-id X] | --key K) [--description TEXT]`
+  - `resource show` prints the raw usage template; `acquire`/`attach` print both descriptions and the rendered usage on grant (spec §4.7)
   - `unit update|remove|retire`
   - Views: `status`, `resources`, `leases`, `queue <resource>`,
     `log [--since --actor --action --limit]`, `promotions`,
