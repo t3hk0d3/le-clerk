@@ -177,12 +177,12 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
   - `cli::gate::require(effect: &str, yes: bool, caller: &Caller) -> Result<(), GateRefusal>`.
     It prompts only when stdin is a TTY.
 - **Commands:**
-  - `clerk resource create <id> --type device|service|generic [--scope user|project] [--description TEXT] [--usage TEXT | --usage-file PATH] [--health CHECK[,CHECK…]] [--health-command SCRIPT]` (CHECK ∈ exists|accessible|not-open|tcp-connect|port-free|http|none; `--health-command` appends a custom check; omit both for the type default)
-  - `resource update|delete|list|show`
+  - `clerk resource create <id> --type device|service|generic [--scope user|project] [--description TEXT] [--usage TEXT | --usage-file PATH] [--tag TAG[,TAG…]]… [--health CHECK[,CHECK…]] [--health-command SCRIPT]` (CHECK ∈ exists|accessible|not-open|tcp-connect|port-free|http|none; `--health-command` appends a custom check; omit both for the type default)
+  - `resource update|delete|list|show`; `update` takes `--add-tag TAG[,TAG…]` and `--remove-tag TAG[,TAG…]` (repeatable), sent as the atomic `add_tags`/`remove_tags` patch (spec §4.8)
   - `clerk unit add <resource> <unit> (--path P | --host H --port N [--listen] [--scheme S] [--service-id X] | --key K) [--description TEXT]`
   - `resource show` prints the raw usage template; `acquire`/`attach` print both descriptions and the rendered usage on grant (spec §4.7)
   - `unit update|remove|retire`
-  - Views: `status`, `resources`, `leases`, `queue <resource>`,
+  - Views: `status`, `resources [--tag TAG[,TAG…]]…` (all tags must match; tags shown in both list and status), `leases`, `queue <resource>`,
     `log [--since --actor --action --limit]`, `promotions`,
     `approve <promotion> [--as <id>]`
   - Global flags: `--json`, `--override <reason>`

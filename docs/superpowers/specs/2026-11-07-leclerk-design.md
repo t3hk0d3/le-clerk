@@ -109,6 +109,7 @@ combination is Le Clerk.
   - a **scope** (§4.2);
   - a one-line **description** and a **usage** template: instructions for
     agents, with unit placeholders (§4.7);
+  - **tags** that agents search by, e.g. `esp32c6`, `thread` (§4.8);
   - an optional **health check** definition (§4.5);
   - creator and timestamps.
 - **Unit:** a concrete instance inside a resource, e.g. the board on
@@ -121,7 +122,8 @@ combination is Le Clerk.
   - a **retiring** flag (§4.6).
 
   What an agent receives on grant is the unit's ID and settings, both
-  descriptions, and the resource's usage rendered for that unit (§4.7).
+  descriptions, the resource's usage rendered for that unit (§4.7), and the
+  resource's tags.
 
 A lease request names a resource and is satisfied by any eligible unit, or it
 names one specific unit.
@@ -301,6 +303,37 @@ Agents working with a resource need context: what it is, how to use it, what
 - Changing them is an inventory change and is audited (§8.5). It does not
   affect leases already granted: a holder sees the new text the next time it
   asks for its lease status.
+
+### 4.8 Tags
+
+Agents find resources by what they are, e.g. "a Thread devboard", without
+knowing resource IDs (user decision).
+
+- **Tags** (resource only, user decision): short labels such as `esp32`,
+  `esp32c6`, `zigbee`, `thread`, `devboard`. Units have none; a resource's
+  units are interchangeable, so the resource says what they are.
+- **Format** (my calls):
+  - lowercase ASCII letters, digits and `-`; starts with a letter or digit;
+    1 to 32 characters;
+  - at most 16 per resource;
+  - duplicates collapse to one, and tags are stored sorted;
+  - anything else is refused (`invalid_tag`, `too_many_tags`). Uppercase is
+    refused, not lowercased, so agents learn the format.
+- **Search** (user decision: a filter, not a lease): `resource_list` takes
+  tags and returns the visible resources that carry **all** of them (my call:
+  more tags narrow the search). The agent then picks a resource and leases it
+  as usual. The clerk never leases "any resource with tag X".
+  - Only visible scopes are searched; other projects' resources never match
+    (§4.2).
+  - Matching is exact (my call): no prefixes, no fuzzy matching, and
+    descriptions are not searched.
+- **Editing:** create sets the tags; update either replaces the whole set or
+  adds and removes individual tags (my call: both, applied atomically, so the
+  CLI's `--add-tag` cannot lose a concurrent change). Tag changes are
+  inventory changes and are audited (§8.5).
+- **Where they appear:** `resource_list`, `resource_get`, `clerk resources`,
+  `clerk status`, the grant and the agent's lease status. Exports carry them.
+- Duplicate detection ignores tags (§4.3).
 
 ## 5. Leasing
 
@@ -642,15 +675,16 @@ running and starts it if not. The roles:
 - `type_list`: built-in types and their settings shape.
 - `resource_create`, `resource_update`, `resource_delete`, `resource_list`,
   `resource_get`. `resource_list` shows only visible scopes, with unit counts,
-  how many are free, and descriptions. Create and update take a description
-  and a usage template (§4.7).
+  how many are free, descriptions and tags, and filters by tags (§4.8).
+  Create and update take a description, a usage template (§4.7) and tags.
 - `unit_add`, `unit_update`, `unit_remove`, `unit_retire`. Adding or updating a
   unit returns duplicate results (§4.4).
 - `promotion_request`.
 
 **Leasing:**
 - `lease_acquire` (§5.1). Returns a grant at once, or a task / queued result.
-  A grant carries the descriptions and the rendered usage (§4.7).
+  A grant carries the descriptions, the rendered usage (§4.7) and the
+  resource's tags.
 - `lease_status`: this session's leases, queue positions, pending notices.
 - `lease_extend`.
 - `lease_release`: starts cleanup.
@@ -689,6 +723,8 @@ A Claude Code skill shipped with the integration package teaches agents:
   them;
 - to give every resource and unit a description, and every resource usage
   instructions with unit placeholders (§4.7), and to read them on grant;
+- to tag every resource it creates (chip, radio protocols, board kind) and to
+  search by tags before creating a resource that may already exist (§4.8);
 - to use `override` only when the user said so;
 - never to coordinate resources by messaging other agents.
 
@@ -708,12 +744,14 @@ At minimum:
     for user or project;
   - `clerk unit add|update|remove|retire`;
   - `--description` on both, and `--usage <text>` / `--usage-file <path>` on
-    resources (§4.7).
+    resources (§4.7);
+  - `--tag` on resource create, `--add-tag` / `--remove-tag` on update
+    (§4.8).
 
   The same rules apply: duplicate checks, warnings, and retiring a unit that is
   held.
 - `clerk status`: units, holders, queues, last health result, dirty flags.
-- `clerk resources`, `clerk leases`, `clerk queue <resource>`.
+- `clerk resources [--tag <tag>…]`, `clerk leases`, `clerk queue <resource>`.
 - `clerk release --force <lease>`: the operator override.
 - `clerk promotions` and `clerk approve <promotion>`.
 - `clerk log`: the audit log.
@@ -835,6 +873,7 @@ stops the MVP):
 - types `device`, `service` (including listen addresses), and `generic`;
 - a description per resource and unit, and usage instructions per resource
   with unit placeholders, handed over on grant;
+- tags per resource, used by agents to search, never to lease "any match";
 - hard expiry even when nobody is waiting, marking the unit dirty and warning
   its next owner;
 - CLI holders for the user, scripts and smoke tests;
@@ -866,6 +905,8 @@ stops the MVP):
 - the session-ID fallback;
 - the description and usage limits, the placeholder syntax and keys, and
   write-time placeholder checks;
+- the tag format and limits, all-tags matching, exact matching, and
+  replace-or-add/remove editing;
 - promotion edge cases;
 - fallbacks if verify-first items fail;
 - the testing approach;
