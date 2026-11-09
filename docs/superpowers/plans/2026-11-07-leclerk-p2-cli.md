@@ -5,11 +5,15 @@
 **Goal:** Build the `clerk` command-line interface on top of the phase 1 core.
 It covers inventory, views, leasing (interactive and non-interactive) and the
 gated admin tools, for people, scripts and agents calling it through Bash.
-First, Tasks 1–3 add resource tags to the core (spec §4.8), so the CLI ships
-with tag search from the start.
+First, Task 1 fixes how a spawned daemon resolves its paths, and Tasks 2–4
+add resource tags to the core (spec §4.8) and put descriptions and tags in
+the status view, so the CLI ships with them from the start.
 
 **Architecture:**
-- **Tags core (Tasks 1–3):** a pure `src/model/tag.rs` owns the format;
+- **Daemon spawn fix (Task 1):** the launcher hands the spawned daemon
+  absolute path variables, so client and daemon agree on the socket and
+  database whatever the client's working directory.
+- **Tags core (Tasks 2–4):** a pure `src/model/tag.rs` owns the format;
   tags live in their own table keyed by the resource row, so rename, move and
   promotion keep them; the inventory validates them on every write and on the
   `list_resources` filter; the scheduler's `brief` copies them into grants and
@@ -40,14 +44,22 @@ All of phase 1's Global Constraints apply. The ones this phase implements:
   - never prompt or read stdin unless stdin is a TTY, with one exception:
     `-f -` on the inventory commands reads a YAML document from stdin because
     the caller asked for it explicitly;
-  - errors in JSON mode: `{"error":{"code":"<snake_case>","message":"…"}}`.
+  - errors in JSON mode: `{"error":{"code":"<snake_case>","message":"…","details":{…}}}`;
+    `details` is present exactly when the daemon's error carries details
+    (e.g. `unknown_placeholder`, `duplicate_in_scope`, `invalid_tag`), copied
+    unchanged; human mode prints the message, then each detail as
+    `  key: value` lines.
 - **Exit codes:**
   - 0: ok
   - 2: usage error
   - 3: not found
-  - 4: refused or conflict
-  - 5: daemon unavailable
+  - 4: refused or conflict (including `no_units`: the resource has no units;
+    the message says to add one)
+  - 5: daemon unavailable, unresponsive (`daemon_unresponsive`, message names
+    the pid) or a different version (`version_mismatch`)
   - 6: queued, when called with `--no-wait`
+  - 130: an interactive `acquire` or `attach` ended by Ctrl+C (request
+    cancelled, offer withdrawn, or lease released)
   - `clerk run`: the child's exit code
 - **Agent gating:** when `CLAUDE_CODE_SESSION_ID` is set, `clerk admin …`
   and `clerk approve` need `--override "<reason>"` (the user told the agent
@@ -59,7 +71,7 @@ All of phase 1's Global Constraints apply. The ones this phase implements:
 - **Tone:** messages may be playfully bureaucratic, but the first sentence must
   always state plainly what happened and what to do.
 
-**Tags core (spec §4.8; Tasks 1–3):**
+**Tags core (spec §4.8; Tasks 2–4):**
 
 - **Tag format** (spec §4.8):
   - lowercase ASCII letters, digits and `-`;
@@ -106,27 +118,31 @@ All of phase 1's Global Constraints apply. The ones this phase implements:
 
 1. **An agent or script runs `clerk acquire` or an admin command without a
    TTY.** It must never wait for keyboard input or hang on a prompt. → Tests in
-   Tasks 4, 5 and 6.
+   Tasks 5, 6 and 7.
 2. **The interactive view exits abnormally** (an error from the daemon, a
    SIGTERM, a panic). The terminal must come back in cooked mode. → Test in
-   Task 5: kill `clerk acquire` with SIGTERM under `script`, then assert that
+   Task 6: kill `clerk acquire` with SIGTERM under `script`, then assert that
    `stty -a` shows `icanon`.
 3. **Bad durations:** `--for 0`, `-5m`, `abc` or `100000d`. Each must exit 2
    with a message naming the accepted format, and nothing may reach the daemon.
-   → Tests in Task 5.
+   → Tests in Task 6.
 4. **The daemon can't start** (e.g. the state directory isn't writable). The
    command must exit 5 within 6 s with a plain message, never hang. → Test in
-   Task 4.
+   Task 5.
 5. **The working directory has spaces or unicode in its path,** or is outside
-   any repo. The project must resolve and commands must work. → Test in Task 4.
+   any repo. The project must resolve and commands must work. → Test in Task 5.
 6. **An agent guessing the tag format:** `Thread`, `esp32 c6`,
    `zigbee,thread` as one string, `-x`, or a 33-character tag must be refused
    with `invalid_tag` naming the tag, on write and as a search filter, never
-   stored or silently matching nothing. → Tests in Tasks 1 and 2.
+   stored or silently matching nothing. → Tests in Tasks 2 and 3.
 7. **Lost update on add:** `add_tags: ["thread"]` on a resource tagged
-   `esp32, zigbee` must leave all three. → Test in Task 2.
+   `esp32, zigbee` must leave all three. → Test in Task 3.
 8. **Cross-project leak via search:** a project resource tagged `thread` in
-   project B never appears in project A's search. → Test in Task 2.
+   project B never appears in project A's search. → Test in Task 3.
+9. **A relative `CLERK_HOME` or XDG directory:** `CLERK_HOME=state clerk
+   status` run from `/tmp/x` must start a daemon that listens under
+   `/tmp/x/state/run`, and a second call from the same directory must reach
+   it, not spawn another. → Test in Task 1.
 
 ---
 
@@ -172,6 +188,16 @@ CLI
             - holder User(lease-scoped)
     daemon unavailable
         - exit 5 within 6 s with plain message
+        On an unresponsive daemon (lock held, no answer)
+            - exit 5, code daemon_unresponsive, message names the pid
+        On a version mismatch
+            - exit 5, code version_mismatch, message says `clerk daemon restart`
+    error output
+        On a daemon error with details (e.g. unknown_placeholder)
+            - JSON: error.details equals the daemon's details
+            - human: message, then one `key: value` line per detail
+        On a daemon error without details
+            - JSON has no details key
     acquire
         On stdin TTY
             - shows queue position, then grant, then notices live
@@ -183,8 +209,18 @@ CLI
             - with --wait blocks until granted, then prints and exits 0
         On invalid --for
             - exit 2 naming the format; no daemon call
+        On a resource with no units
+            - exit 4, code no_units, message says to add a unit
+        On grant (any mode)
+            - prints resource and unit descriptions, tags and the rendered usage
+        On Ctrl+C after an Offered notice arrived but before the claim answered
+            - calls cancel(request): the offer is withdrawn (lease ends Unclaimed), never release
+            - exits 130 with nothing held
     attach <lease>
+        - calls get_lease first and prints the brief (descriptions, tags, rendered usage)
         - shows live view; Ctrl+C releases; Ctrl+] detaches again
+        On an unknown, ended or someone else's lease
+            - exit 3; nothing changes
     release <lease>
         - starts cleanup and confirms Clean (CLI release is deliberate)
     extend <lease> --for D
@@ -196,7 +232,8 @@ CLI
         On cmd exit 0
             - release with confirm(Clean); exits 0
         On cmd exit non-zero
-            - release; unit dirty(command_failed); exits with cmd's code
+            - release { failed: true }: lease ends now, unit dirty(command_failed),
+              no cleanup window; exits with cmd's code
         On override / admin release of its lease
             - SIGTERM to cmd at cleanup deadline
     wait
@@ -204,6 +241,11 @@ CLI
         - --once returns after the first batch
     status / resources / leases / queue / log / promotions / approve
         - read views; invisible holders shown as "held by an agent in another project"
+        - status shows each resource's description and tags and each unit's description
+          (human mode truncates descriptions to the terminal width; JSON is complete)
+    leases --mine
+        - calls list_my_leases for the caller's holder and prints each lease with its brief
+        - without --mine: all leases from the status view (the user's view)
         - approve gated for agents
     acquire --override "<reason>"
         On empty reason
@@ -315,6 +357,18 @@ admin
         On an imported malformed tag
             - fails with invalid_tag and imports nothing
 
+client::Launcher
+    spawn (via Client::ensure_running)
+        On a relative CLERK_HOME
+            - the daemon's socket, lock and database are under <client cwd>/<CLERK_HOME>
+            - a second client from the same cwd connects to it; no second daemon
+        On relative XDG_STATE_HOME / XDG_CONFIG_HOME / XDG_RUNTIME_DIR (no CLERK_HOME)
+            - the same, per variable
+        On absolute variables
+            - passed through unchanged
+        On the daemon's own working directory
+            - is still /
+
 scheduler
     acquire
         On immediate grant
@@ -324,6 +378,10 @@ scheduler
             - Lease carries resource_tags
         After a tag change
             - get_lease shows the new tags
+    status
+        - each ResourceStatus carries description and tags
+        - each UnitStatus carries description
+        - other projects' holders stay "held by an agent in another project" (unchanged)
 
 engine wire
     create_resource / update_resource
@@ -343,8 +401,9 @@ engine wire
 ## File structure
 
 ```
-src/model/tag.rs      Tag / TagSet format rules (Task 1)
-src/store/migrations/0011_resource_tags.sql  (Task 2)
+src/client.rs         (modify) Launcher::spawn passes absolute paths (Task 1)
+src/model/tag.rs      Tag / TagSet format rules (Task 2)
+src/store/migrations/0011_resource_tags.sql  (Task 3)
 src/cli/mod.rs        clap command tree, dispatch
 src/cli/output.rs     Mode detection, JSON/human rendering, error → exit code
 src/cli/caller.rs     Caller construction (session env, pid/start_time, project)
@@ -360,7 +419,38 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
 
 ---
 
-### Task 1: Tags core: `model::tag`, a pure module for tags
+### Task 1: The spawned daemon gets absolute paths
+
+**Files:**
+- Modify: `src/client.rs` (`Launcher::spawn`)
+- Test: `tests/daemon.rs`
+
+**Interfaces:**
+- Consumes: `config::Paths::from_lookup` (already makes `CLERK_HOME`
+  absolute for the client) and `Launcher`.
+- **The bug:** the client resolves a relative `CLERK_HOME` against its own
+  working directory, but the daemon is spawned with `current_dir("/")` and
+  the raw environment, so it resolves the same value against `/` and listens
+  somewhere else. The client then times out (exit 5) or a later client spawns
+  a second daemon.
+- **The fix:** `spawn` sets each of `CLERK_HOME`, `HOME`, `XDG_STATE_HOME`,
+  `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR` that is set and relative in the
+  child's environment to its absolute form (`std::path::absolute`, against
+  the client's working directory). Empty and absolute values pass through.
+  The daemon keeps `current_dir("/")`.
+- Produces: no API change.
+
+- [ ] **Step 1:** Write the failing tests for the BDD subtree
+  `client::Launcher`. Each runs the real binary from a temporary working
+  directory with the variable relative, then asserts the socket path and
+  that a second `clerk daemon status` from the same directory reports the same
+  pid.
+- [ ] **Step 2:** Run `CARGO_TARGET_DIR=/tmp/claude-1000/leclerk-target cargo test --test daemon 2>&1 | tee <scratch>/p2-t1-red.log`. Expected: FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run the full suite, fmt and clippy until they pass.
+- [ ] **Step 5:** Commit: `fix(client): spawned daemon resolves relative path variables like its client`
+
+### Task 2: Tags core: `model::tag`, a pure module for tags
 
 **Files:**
 - Create: `src/model/tag.rs`
@@ -376,12 +466,12 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
 - Tag validation is a plain character check, no regex dependency.
 
 - [ ] **Step 1:** Write the failing unit tests in `mod tests` of `src/model/tag.rs`, one per effect under `model::tag` in the BDD skeleton.
-- [ ] **Step 2:** Run them and confirm they fail: `CARGO_TARGET_DIR=/tmp/claude-1000/leclerk-target cargo test --lib model::tag 2>&1 | tee <scratch>/p2-t1-red.log`.
+- [ ] **Step 2:** Run them and confirm they fail: `CARGO_TARGET_DIR=/tmp/claude-1000/leclerk-target cargo test --lib model::tag 2>&1 | tee <scratch>/p2-t2-red.log`.
 - [ ] **Step 3:** Implement the module to the Interfaces above.
 - [ ] **Step 4:** Run the tests until they pass, then `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
 - [ ] **Step 5:** Commit: `feat(model): resource tags`.
 
-### Task 2: Tags core: inventory, store, wire and export carry tags; listing filters by them
+### Task 3: Tags core: inventory, store, wire and export carry tags; listing filters by them
 
 **Files:**
 - Create: `src/store/migrations/0011_resource_tags.sql`
@@ -401,37 +491,38 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
 - Tests: `tests/inventory.rs`, `tests/admin_ops.rs`, `tests/engine.rs`; mechanical updates where tests build `NewResource`, `ResourcePatch` or call `list_resources`.
 
 **Interfaces:**
-- Consumes: Task 1's `TagSet::parse`, `TagSet::contains_all`, `TagError`.
+- Consumes: Task 2's `TagSet::parse`, `TagSet::contains_all`, `TagError`.
 - Produces: `Resource.tags: TagSet`, the new `list_resources` signature, and the wire names in the Global Constraints.
 - **Update order:** validate everything (conflict rules, each tag, the resulting set's size) before writing anything. The resulting set is `tags` when given, else `(current ∪ add_tags) \ remove_tags`.
 - **Filtering** may be done in SQL or in Rust after loading the view; either way it happens inside the same transaction and the scope filter is applied first.
-- Rename, move and promotion approval keep the row, so they need no code change; Task 2 only adds tests for them.
+- Rename, move and promotion approval keep the row, so they need no code change; Task 3 only adds tests for them.
 
-- [ ] **Step 1:** Write the failing tests for the BDD subtrees `inventory`, `store`, `admin` and `engine wire` (minus the grant and lease JSON, which Task 3 owns). The migration test migrates a fresh database to version 10 (`Migrations::to_version(10)`), inserts a resource, then migrates to latest.
+- [ ] **Step 1:** Write the failing tests for the BDD subtrees `inventory`, `store`, `admin` and `engine wire` (minus the grant and lease JSON, which Task 4 owns). The migration test migrates a fresh database to version 10 (`Migrations::to_version(10)`), inserts a resource, then migrates to latest.
 - [ ] **Step 2:** Run them and confirm they fail.
 - [ ] **Step 3:** Add the migration, then thread tags through store, model, inventory, command, wire and admin.
 - [ ] **Step 4:** Make existing tests compile (mechanical changes only), then run the full suite, fmt and clippy: `CARGO_TARGET_DIR=/tmp/claude-1000/leclerk-target cargo test 2>&1 | tee <scratch>/p2-t2.log`.
 - [ ] **Step 5:** Commit: `feat(inventory): resource tags with search filter`.
 
-### Task 3: Tags core: grants and leases carry the resource's tags
+### Task 4: Tags core: grants, leases and status carry tags and descriptions
 
 **Files:**
 - Modify:
   - `src/scheduler/mod.rs` (`Grant` and `Lease` gain `resource_tags: TagSet`; `brief` returns a `Brief` struct instead of a tuple, with `resource_description`, `unit_description`, `usage` and `resource_tags`);
-  - `src/engine/wire.rs` (`LeaseView.resource_tags`).
+  - `src/scheduler/mod.rs` also: `ResourceStatus` gains `description: String` and `tags: TagSet`; `UnitStatus` gains `description: String`;
+  - `src/engine/wire.rs` (`LeaseView.resource_tags`; status JSON carries the new fields).
 - Tests: `tests/scheduler.rs`, `tests/engine.rs`.
 
 **Interfaces:**
-- Consumes: Task 2's `Resource.tags`.
+- Consumes: Task 3's `Resource.tags`.
 - Produces: `Grant { …, resource_tags }`, `Lease { …, resource_tags }`, `LeaseView` mirrors `Lease`; private `struct Brief` and `fn brief(resource: &Resource, unit: &Unit) -> Brief`, still the single source for both the immediate grant and `lease_view`.
 
-- [ ] **Step 1:** Write the failing tests for the BDD subtree `scheduler` and the grant/lease JSON effect under `engine wire`.
+- [ ] **Step 1:** Write the failing tests for the BDD subtree `scheduler` (including `status`) and the grant/lease JSON effect under `engine wire`.
 - [ ] **Step 2:** Run them and confirm they fail.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run the full verification: `bash -c 'cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test' 2>&1 | tee <scratch>/p2-t3.log` with the same `CARGO_TARGET_DIR`. Expected: all clean, all PASS.
-- [ ] **Step 5:** Commit: `feat(scheduler): grants and leases carry resource tags`.
+- [ ] **Step 5:** Commit: `feat(scheduler): grants, leases and status carry tags and descriptions`.
 
-### Task 4: CLI framework, inventory and view commands
+### Task 5: CLI framework, inventory and view commands
 
 **Files:**
 - Create: `src/cli/{mod,output,caller,inventory,input,views,gate}.rs`
@@ -474,6 +565,11 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
     non-string scalars rather than coercing them.
     `cli::input::load(spec: &InputSpec) -> Result<Option<T>, InputError>`
     where `InputSpec` is `None | Stdin | Path(PathBuf)`.
+  - `leases [--mine]`: `--mine` calls `list_my_leases` for the caller's holder
+  - Error rendering: `Output::fail` copies `details` from `ApiError` into JSON
+    and prints them as `key: value` lines in human mode; it maps
+    `daemon_unresponsive` and `version_mismatch` to exit 5 and `no_units` to
+    exit 4
   - Views: `status`, `resources [--tag TAG[,TAG…]]…` (all tags must match; tags shown in both list and status), `leases`, `queue <resource>`,
     `log [--since --actor --action --limit]`, `promotions`,
     `approve <promotion> [--as <id>]`
@@ -494,6 +590,9 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
   - `cli::caller::on_cwd_with_spaces_and_unicode::resolves_project`
     (Review Focus 5)
   - `cli::approve::on_agent_without_override_reason::exits_4`
+  - `cli::error_output::on_unknown_placeholder::json_details_carry_valid_keys`
+  - `cli::daemon_unavailable::on_unresponsive_daemon::exits_5_naming_pid`
+  - `cli::status::shows_descriptions_and_tags`
   - `cli::yaml_input::on_heredoc_usage_block::matches_flag_equivalent`
   - `cli::yaml_input::on_flag_and_key_both_set::exits_2_naming_field`
   - `cli::yaml_input::on_numeric_tag::exits_2_asking_to_quote`
@@ -504,7 +603,7 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
 - [ ] **Step 4:** Run `cargo test`. Expected: PASS.
 - [ ] **Step 5:** Commit: `feat(cli): framework, inventory and views`
 
-### Task 5: Leasing commands: acquire, attach, release, extend, run, wait
+### Task 6: Leasing commands: acquire, attach, release, extend, run, wait
 
 **Files:**
 - Create: `src/cli/lease.rs`
@@ -527,9 +626,15 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
     including a panic hook and a SIGTERM/SIGINT handler;
   - the live view loops on `wait_notices` (30 s polls) and keypresses;
   - an `Offered` notice is claimed immediately;
-  - Ctrl+C cancels or releases (confirm Clean);
+  - Ctrl+C while queued cancels; while an offer is pending (notice seen,
+    claim not yet answered) it also calls `cancel`, which withdraws the offer;
+    once held it releases (confirm Clean);
+  - on grant, and on `attach`, prints the brief: both descriptions, the
+    resource's tags and the rendered usage;
   - Ctrl+] calls `rehome_holder` with `User { tag }`, prints the lease ID, and
     exits 0.
+- **`attach <lease>`** calls `get_lease` first; `not_found` (unknown, ended
+  or someone else's lease) exits 3.
 - **Non-interactive mode** never enables raw mode or reads stdin. `--no-wait`
   is the default (exit 6 when queued). With `--wait`, it polls notices and
   claims on `Offered`.
@@ -540,8 +645,9 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
   - forwards SIGINT;
   - on `Overridden` or an admin release notice, sends SIGTERM to the child at
     the notice's deadline;
-  - on child exit, releases with confirm Clean (exit 0), or ends the lease as
-    `command_failed`.
+  - on child exit 0, releases with confirm Clean (exit 0); on any other exit,
+    calls `release` with `failed: true` (lease ends now, unit dirty
+    `command_failed`) and exits with the child's code.
 
 - [ ] **Step 1:** Write the failing tests for the BDD `CLI` subtrees `acquire`,
   `attach`, `release`, `extend`, `run`, `wait` and the `--override` agent gate.
@@ -551,6 +657,10 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
   - `cli::acquire::on_invalid_for::exits_2_for_each_of_0_neg_abc_100000d`
     (Review Focus 3)
   - `cli::run::on_cmd_exit_3::unit_dirty_command_failed_and_exit_3`
+  - `cli::acquire::on_ctrl_c_with_offer_pending::offer_withdrawn_nothing_held` (in `tests/cli_tty.rs`)
+  - `cli::acquire::on_no_units::exits_4_code_no_units`
+  - `cli::attach::on_ended_lease::exits_3`
+  - `cli::acquire::on_grant::prints_brief`
   - `cli::run::on_cmd::receives_clerk_unit_env`
   - `cli::acquire::on_session_env::lease_owned_by_agent_session`
   - `tests/cli_tty.rs` runs `clerk` under `script -qfc` and writes `\x03` and
@@ -561,14 +671,14 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
 - [ ] **Step 4:** Run `cargo test`. Expected: PASS.
 - [ ] **Step 5:** Commit: `feat(cli): leasing commands with interactive view and run`
 
-### Task 6: Admin commands behind the gate
+### Task 7: Admin commands behind the gate
 
 **Files:**
 - Create: `src/cli/admin.rs`
 - Test: `tests/cli_admin.rs`
 
 **Interfaces:**
-- Consumes `cli::gate::require` (Task 4) and the phase 1 `admin_*` RPC methods
+- Consumes `cli::gate::require` (Task 5) and the phase 1 `admin_*` RPC methods
   and `HolderSpec` (phase 1, Task 14).
 - **Commands:**
   `clerk admin <release|evict|dequeue|clear-queue|remove-unit|delete-resource|clean|link|unlink|move|rename|edit-lease|doctor|export|import> … [--yes] [--override REASON]`
@@ -599,10 +709,16 @@ tests/cli.rs, tests/cli_tty.rs, tests/cli_admin.rs
 
 - **Spec coverage:**
   - §7.3 CLI holder forms (`run`, `acquire`, attach/detach, agent-session
-    attribution): Task 5
-  - §8.4 CLI (inventory, views, approve, tag flags, YAML input): Task 4
-  - Admin tools and gates: Task 6
-  - Exit codes and output modes: Task 4
+    attribution): Task 6
+  - §8.4 CLI (inventory, views, approve, tag flags, YAML input): Task 5
+  - Admin tools and gates: Task 7
+  - Exit codes and output modes: Task 5
   - §4.8 tags in the core (model, inventory, store, wire, export, grants):
-    Tasks 1–3
+    Tasks 2–4
+  - §4.7 descriptions and usage in `clerk status`, and the brief on
+    `acquire`/`attach`: Tasks 4, 6
+  - Phase 1 follow-ups: relative path variables for a spawned daemon (Task 1);
+    `release { failed }`, `get_lease`, `list_my_leases`, error `details`,
+    `no_units`, `daemon_unresponsive`, withdrawing an offer on Ctrl+C
+    (Tasks 5, 6)
 - **Deferred:** MCP (phase 3) and the plugin and skills (phase 4).
