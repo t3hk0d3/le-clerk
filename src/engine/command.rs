@@ -464,6 +464,9 @@ commands! {
     /// The `User` holder of a live lease (anything else is `not_found`).
     /// Refused to agent sessions.
     LeaseHolder(LeaseArgs) = "lease_holder", read_only: true;
+    /// The `User` holder of a queued request or pending offer (anything
+    /// else is `not_found`). Refused to agent sessions.
+    RequestHolder(RequestArgs) = "request_holder", read_only: true;
     /// Confirm cleanup (or a yield).
     Confirm(ConfirmArgs) = "confirm", read_only: false;
     /// Use the one cleanup extension.
@@ -564,6 +567,7 @@ impl Command {
             Self::Status(_, a) if a.view == ViewArg::All => Some("view every scope"),
             Self::ListResources(_, a) if a.view == ViewArg::All => Some("list every scope"),
             Self::LeaseHolder(..) => Some("look up the user's lease holders"),
+            Self::RequestHolder(..) => Some("look up the user's request holders"),
             _ => None,
         }
     }
@@ -690,6 +694,9 @@ impl Command {
             }
             Self::LeaseHolder(_, a) => {
                 encode(json!({ "holder": sched.user_holder(tx, &a.lease_id)? }))
+            }
+            Self::RequestHolder(_, a) => {
+                encode(json!({ "holder": sched.user_request_holder(tx, &a.request_id)? }))
             }
             Self::ListMyLeases(who, NoArgs {}) => {
                 encode(MyLeasesView::from(sched.my_leases(tx, &who)?))

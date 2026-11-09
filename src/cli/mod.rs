@@ -90,10 +90,16 @@ enum Command {
     /// request and exit 6 (or with --wait, wait for the grant).
     Acquire(lease::AcquireArgs),
     /// Re-attach the live view to a lease (Ctrl+C releases, Ctrl+]
-    /// detaches again); without a terminal, print its brief.
+    /// detaches again); without a terminal, print its brief. An offered
+    /// lease is claimed first.
     Attach {
         /// The lease id.
         lease: String,
+    },
+    /// Withdraw a queued request, or the offer it is waiting to claim.
+    Cancel {
+        /// The request id.
+        request: String,
     },
     /// Give a lease back: its cleanup is confirmed at once.
     Release {
@@ -244,6 +250,7 @@ async fn dispatch(ctx: &Ctx, command: Command) -> anyhow::Result<()> {
         Command::Approve { promotion, new_id } => views::approve(ctx, promotion, new_id).await,
         Command::Acquire(args) => lease::acquire(ctx, args).await,
         Command::Attach { lease } => lease::attach(ctx, lease).await,
+        Command::Cancel { request } => lease::cancel_request(ctx, request).await,
         Command::Release { lease } => lease::release(ctx, lease).await,
         Command::Extend(args) => lease::extend(ctx, args).await,
         Command::Run(args) => lease::run(ctx, args).await,

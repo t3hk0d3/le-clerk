@@ -1977,11 +1977,76 @@ mod cli {
         (paused, lease_of(&body))
     }
 
+    /// The user's CLI queues a detached request for board behind user
+    /// `x`'s lease; returns (x's lease, the request id).
+    fn queue_detached(env: &Env) -> (String, String) {
+        seed(env, "board", "k1");
+        let theirs = hold(env, "x");
+        let out = env
+            .cmd()
+            .args(["acquire", "board", "--for", "10m"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(6), "{out:?}");
+        let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+        (theirs, body["request_id"].as_str().unwrap().to_owned())
+    }
+
+    /// [`queue_detached`], then x gives its lease back so the request is
+    /// offered the unit; returns (the request id, the offered lease id).
+    fn offer_detached(env: &Env) -> (String, String) {
+        let (theirs, request) = queue_detached(env);
+        free(env, "x", &theirs);
+        let occupancy = unit_status(env)["occupancy"].clone();
+        assert_eq!(occupancy["state"], "offered", "{occupancy}");
+        (request, lease_of(&occupancy))
+    }
+
     mod acquire {
         use super::*;
 
         mod on_stdin_not_tty {
             use super::*;
+
+            mod on_queued {
+                use super::*;
+
+                #[test]
+                fn json_names_the_request_and_how_to_claim_or_cancel() {
+                    let env = Env::new();
+                    seed(&env, "board", "k1");
+                    hold(&env, "x");
+                    let out = env
+                        .cmd()
+                        .args(["acquire", "board", "--for", "10m"])
+                        .output()
+                        .unwrap();
+                    assert_eq!(out.status.code(), Some(6), "{out:?}");
+                    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                    let request = body["request_id"].as_str().unwrap();
+                    let next = body["next"].as_str().unwrap();
+                    assert!(next.contains("clerk attach"), "{next}");
+                    assert!(next.contains(&format!("clerk cancel {request}")), "{next}");
+                }
+
+                #[test]
+                fn human_text_names_the_request_and_how_to_claim_or_cancel() {
+                    let env = Env::new();
+                    seed(&env, "board", "k1");
+                    hold(&env, "x");
+                    let shown = env.tty(r#""$CLERK" acquire board --for 10m < /dev/null"#);
+                    let request = env.ok(&["queue", "board"])[0]["queue"][0]["request_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    assert!(shown.contains(&format!("request {request}")), "{shown}");
+                    assert!(shown.contains("clerk attach"), "{shown}");
+                    assert!(
+                        shown.contains(&format!("clerk cancel {request}")),
+                        "{shown}"
+                    );
+                }
+            }
 
             #[test]
             fn prints_queued_and_exits_6_without_reading_stdin() {
@@ -2051,6 +2116,78 @@ mod cli {
                     free(&env, "x", &theirs);
                     assert_eq!(code_of(&mut child), 0);
                     assert!(session_has_notice_for(&env, "sess-1", &dir, &other));
+                }
+            }
+
+            mod on_concurrent_user_wait {
+                use super::*;
+
+                #[test]
+                fn still_gets_its_grant() {
+                    let env = Env::new();
+                    seed(&env, "board", "k1");
+                    // An agent holds the unit, so the only user holder
+                    // `clerk wait` could follow is the waiting request's.
+                    let dir = env.dir("alpha");
+                    let theirs = lease_of(&json_of(
+                        env.agent("sess-1", &dir)
+                            .args(["acquire", "board", "--for", "10m"]),
+                    ));
+                    let mut child =
+                        spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
+                    let deadline = Instant::now() + PATIENCE;
+                    while env.ok(&["queue", "board"])[0]["queue"] == json!([]) {
+                        assert!(Instant::now() < deadline, "never queued");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    let _waiter = spawn(&env, &["wait"], None);
+                    std::thread::sleep(Duration::from_millis(1500));
+                    json_of(env.agent("sess-1", &dir).args(["release", &theirs]));
+                    assert_eq!(code_of(&mut child), 0);
+                    let body: Value = serde_json::from_str(&stdout_of(&mut child)).unwrap();
+                    assert_eq!(body["state"], "held", "{body}");
+                }
+            }
+
+            mod on_grant {
+                use super::*;
+
+                #[test]
+                fn lease_moves_to_a_user_holder() {
+                    let env = Env::new();
+                    seed(&env, "board", "k1");
+                    let theirs = hold(&env, "x");
+                    let mut child =
+                        spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
+                    std::thread::sleep(Duration::from_millis(500));
+                    free(&env, "x", &theirs);
+                    assert_eq!(code_of(&mut child), 0);
+                    let occupancy = unit_status(&env)["occupancy"].clone();
+                    assert_eq!(occupancy["holder"]["kind"], "user", "{occupancy}");
+                    assert_eq!(occupancy["state"], "held", "{occupancy}");
+                }
+            }
+
+            mod while_waiting {
+                use super::*;
+
+                #[test]
+                fn request_is_held_by_this_cli_process() {
+                    let env = Env::new();
+                    seed(&env, "board", "k1");
+                    hold(&env, "x");
+                    let child = spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
+                    let deadline = Instant::now() + PATIENCE;
+                    let queue = loop {
+                        let queue = env.ok(&["queue", "board"])[0]["queue"].clone();
+                        if queue != json!([]) {
+                            break queue;
+                        }
+                        assert!(Instant::now() < deadline, "never queued");
+                        std::thread::sleep(Duration::from_millis(50));
+                    };
+                    assert_eq!(queue[0]["holder"]["kind"], "cli_process", "{queue}");
+                    assert_eq!(queue[0]["holder"]["pid"], child.id(), "{queue}");
                 }
             }
 
@@ -2216,6 +2353,30 @@ mod cli {
             assert_eq!(body["usage"], "Flash with key k1");
         }
 
+        mod on_offered_lease_without_tty {
+            use super::*;
+
+            #[test]
+            fn claims_it_and_prints_the_grant() {
+                let env = Env::new();
+                let (_, lease) = offer_detached(&env);
+                let body = env.ok(&["attach", &lease]);
+                assert_eq!(lease_of(&body), lease);
+                assert_eq!(body["state"], "held", "{body}");
+                assert_eq!(body["resource_description"], "A test board");
+            }
+
+            #[test]
+            fn lease_is_held_afterwards() {
+                let env = Env::new();
+                let (_, lease) = offer_detached(&env);
+                env.ok(&["attach", &lease]);
+                let occupancy = unit_status(&env)["occupancy"].clone();
+                assert_eq!(lease_of(&occupancy), lease);
+                assert_eq!(occupancy["state"], "held", "{occupancy}");
+            }
+        }
+
         mod on_ended_lease {
             use super::*;
 
@@ -2259,6 +2420,105 @@ mod cli {
                 let error = error_of(env.cmd().args(["attach", &lease]), 3);
                 assert_eq!(error["code"], "not_found");
                 assert_eq!(unit_status(&env), before);
+            }
+        }
+    }
+
+    mod cancel {
+        use super::*;
+
+        mod on_queued_request {
+            use super::*;
+
+            #[test]
+            fn withdraws_it_and_exits_0() {
+                let env = Env::new();
+                let (_, request) = queue_detached(&env);
+                let body = env.ok(&["cancel", &request]);
+                assert_eq!(body["cancelled"], request.as_str());
+                assert_eq!(env.ok(&["queue", "board"])[0]["queue"], json!([]));
+            }
+        }
+
+        mod on_pending_offer {
+            use super::*;
+
+            #[test]
+            fn withdraws_the_offer_unclaimed() {
+                let env = Env::new();
+                let (request, lease) = offer_detached(&env);
+                env.ok(&["cancel", &request]);
+                let ended = &audit(&env, "lease_ended")[0]["detail"];
+                assert_eq!(ended["lease"], lease.as_str());
+                assert_eq!(ended["cause"], "unclaimed", "{ended}");
+            }
+
+            #[test]
+            fn leaves_the_unit_free() {
+                let env = Env::new();
+                let (request, _) = offer_detached(&env);
+                env.ok(&["cancel", &request]);
+                assert_eq!(unit_status(&env)["occupancy"]["kind"], "free");
+            }
+        }
+
+        mod on_unknown_request {
+            use super::*;
+
+            #[test]
+            fn exits_3() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let ghost = leclerk::model::RequestId::new();
+                let error = error_of(env.cmd().args(["cancel", ghost.as_str()]), 3);
+                assert_eq!(error["code"], "not_found");
+            }
+        }
+
+        mod on_agent_sessions_request {
+            use super::*;
+
+            #[test]
+            fn exits_3_and_nothing_changes() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                hold(&env, "x");
+                let dir = env.dir("alpha");
+                let out = env
+                    .agent("sess-1", &dir)
+                    .args(["acquire", "board", "--for", "10m"])
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.code(), Some(6), "{out:?}");
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                let request = body["request_id"].as_str().unwrap();
+                let error = error_of(env.cmd().args(["cancel", request]), 3);
+                assert_eq!(error["code"], "not_found");
+                assert_eq!(
+                    env.ok(&["queue", "board"])[0]["queue"][0]["request_id"],
+                    request
+                );
+            }
+        }
+
+        mod on_agent_session {
+            use super::*;
+
+            #[test]
+            fn withdraws_its_own_request() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                hold(&env, "x");
+                let dir = env.dir("alpha");
+                let out = env
+                    .agent("sess-1", &dir)
+                    .args(["acquire", "board", "--for", "10m"])
+                    .output()
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                let request = body["request_id"].as_str().unwrap();
+                json_of(env.agent("sess-1", &dir).args(["cancel", request]));
+                assert_eq!(env.ok(&["queue", "board"])[0]["queue"], json!([]));
             }
         }
     }

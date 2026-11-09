@@ -1,10 +1,11 @@
-//! Leasing commands: `acquire`, `attach`, `release`, `extend`, `run` and
-//! `wait`.
+//! Leasing commands: `acquire`, `attach`, `cancel`, `release`, `extend`,
+//! `run` and `wait`.
 //!
 //! `acquire` and `attach` show the live view (see `live`) only when stdin
 //! is a terminal. Otherwise nothing reads stdin or touches the terminal:
 //! `acquire` prints the grant, or the queued request and exits 6 (with
-//! `--wait`, it waits for the offer and claims it).
+//! `--wait`, it waits for the offer and claims it); `attach` claims an
+//! offered lease and prints it, and `cancel` withdraws a queued request.
 //!
 //! Leases of the user's CLI (no agent session) belong to lease-scoped
 //! `User` holders. `attach`, `release` and `extend` act as the holder the
@@ -28,6 +29,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::Instant;
+use ulid::Ulid;
 
 use super::caller::{self, CallerKind};
 use super::live::{self, Phase, RawMode, Screen};
@@ -40,7 +42,7 @@ pub const POLL_SECS: u64 = 30;
 /// The longest `--for`.
 const MAX_FOR: Duration = Duration::from_hours(30 * 24);
 /// Pause after a failed notice poll, so a sick daemon is not hammered.
-const POLL_RETRY: Duration = Duration::from_secs(1);
+pub const POLL_RETRY: Duration = Duration::from_secs(1);
 /// Longest default purpose of `clerk run`, in characters.
 const PURPOSE_MAX: usize = 80;
 
@@ -184,7 +186,10 @@ pub struct WaitArgs {
 pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
     let target = target_arg(&args.target)?;
     let interactive = std::io::stdin().is_terminal();
-    let kind = if interactive {
+    // `--wait` holds the request as this process while it waits, so its
+    // offer goes to no one else's `clerk wait` and a killed script leaves
+    // nothing queued; the lease moves to a user holder once claimed.
+    let kind = if interactive || args.wait {
         CallerKind::Interactive
     } else {
         CallerKind::Detached
@@ -220,13 +225,51 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
         return ctx.out.emit(&View::new(outcome, outcome_text));
     }
     if !args.wait {
-        ctx.out.emit(&View::new(outcome, outcome_text))?;
+        let mut outcome = outcome;
+        outcome["next"] = Value::String(queued_next(&outcome));
+        ctx.out.emit(&View::new(outcome, |v| {
+            format!("{}\n{}", outcome_text(v), text(&v["next"]))
+        }))?;
         return Err(Exit(EXIT_QUEUED).into());
     }
     let request = id(&outcome, "request_id")?;
     note(&outcome_text(&outcome));
     let lease = await_offer(ctx, &client, &caller, &request).await?;
+    let lease = detach_from_process(&client, &caller, lease).await?;
     ctx.out.emit(&View::new(lease, granted_text))
+}
+
+/// What to do about a request left queued: how to claim its offer, and how
+/// to withdraw it.
+fn queued_next(outcome: &Value) -> String {
+    let request = text(&outcome["request_id"]);
+    format!(
+        "When it is offered (`clerk wait` shows the offer with its lease id), `clerk attach \
+         <lease>` claims it; `clerk cancel {request}` withdraws the request."
+    )
+}
+
+/// Hand a lease this process holds to a fresh user holder, so it outlives
+/// the process; other holders keep it. Returns the lease as it is now.
+async fn detach_from_process(
+    client: &Client,
+    caller: &Caller,
+    lease: Value,
+) -> anyhow::Result<Value> {
+    if !matches!(caller.holder, HolderRef::CliProcess { .. }) {
+        return Ok(lease);
+    }
+    let holder = HolderRef::User {
+        tag: Ulid::new().to_string(),
+    };
+    let lease_id = id(&lease, "lease_id")?;
+    Ok(client
+        .call(
+            "rehome_holder",
+            caller,
+            json!({"lease_id": lease_id, "new_holder": holder}),
+        )
+        .await?)
 }
 
 pub async fn attach(ctx: &Ctx, lease: String) -> anyhow::Result<()> {
@@ -239,6 +282,12 @@ pub async fn attach(ctx: &Ctx, lease: String) -> anyhow::Result<()> {
         return Err(no_live_lease(&lease).into());
     }
     if !std::io::stdin().is_terminal() {
+        // An offer waiting to be claimed is claimed now.
+        let view = if view["state"] == "offered" {
+            claim(&client, &caller, &lease).await?
+        } else {
+            view
+        };
         return ctx.out.emit(&View::new(view, granted_text));
     }
     let _raw = RawMode::enable()?;
@@ -262,6 +311,26 @@ pub async fn attach(ctx: &Ctx, lease: String) -> anyhow::Result<()> {
         Phase::Held { lease }
     };
     live::run(&client, &caller, &screen, phase).await
+}
+
+pub async fn cancel_request(ctx: &Ctx, request: String) -> anyhow::Result<()> {
+    let client = ctx.client().await?;
+    let caller = request_caller(ctx, &client, &request).await?;
+    match cancel(&client, &caller, &request).await {
+        Ok(()) => {}
+        // The daemon names only the caller's own requests.
+        Err(e) if e.code == "not_found" || e.code == "not_holder" => {
+            return Err(no_open_request(&request).into());
+        }
+        Err(e) => return Err(e.into()),
+    }
+    ctx.out
+        .emit(&View::new(json!({ "cancelled": request }), |v| {
+            format!(
+                "Cancelled: request {} is withdrawn, with any offer it had; nothing is held.",
+                text(&v["cancelled"])
+            )
+        }))
 }
 
 pub async fn release(ctx: &Ctx, lease: String) -> anyhow::Result<()> {
@@ -721,6 +790,41 @@ async fn lease_caller(ctx: &Ctx, client: &Client, lease: &str) -> anyhow::Result
     };
     let holder: HolderRef = serde_json::from_value(answer["holder"].clone())?;
     Ok(Caller { holder, ..caller })
+}
+
+/// Who acts on `request`: an agent session acts as itself; the user acts
+/// as the request's `User` holder, which the daemon names while the request
+/// is queued or its offer pending.
+///
+/// # Errors
+/// `not_found` when the user has no such open request.
+async fn request_caller(ctx: &Ctx, client: &Client, request: &str) -> anyhow::Result<Caller> {
+    let caller = ctx.caller(CallerKind::Detached)?;
+    if caller::is_agent(&caller) {
+        return Ok(caller);
+    }
+    let answer = match client
+        .call("request_holder", &caller, json!({ "request_id": request }))
+        .await
+    {
+        Ok(answer) => answer,
+        Err(e) if e.code == "not_found" => return Err(no_open_request(request).into()),
+        Err(e) => return Err(e.into()),
+    };
+    let holder: HolderRef = serde_json::from_value(answer["holder"].clone())?;
+    Ok(Caller { holder, ..caller })
+}
+
+fn no_open_request(request: &str) -> ApiError {
+    ApiError {
+        code: "not_found".to_owned(),
+        message: format!(
+            "No open request {request} of yours: it is unknown, was granted, claimed or \
+             dropped, or belongs to an agent session or another running clerk. `clerk leases` \
+             lists the queued ones."
+        ),
+        details: None,
+    }
 }
 
 fn no_live_lease(lease: &str) -> ApiError {

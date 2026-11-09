@@ -7,7 +7,7 @@
 //! the view (cancelling or releasing what it holds) before the process
 //! exits. In raw mode Ctrl+C (`0x03`) and Ctrl+] (`0x1d`) arrive as bytes.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io::{self, IsTerminal, Read, Write};
 use std::pin::Pin;
@@ -32,6 +32,10 @@ const CTRL_C: u8 = 0x03;
 const CTRL_BRACKET: u8 = 0x1d;
 /// The longest the view spends cancelling or releasing after a signal.
 const SIGNAL_CLEANUP: Duration = Duration::from_secs(5);
+/// The longest pause between notice polls that keep failing.
+const POLL_RETRY_MAX: Duration = Duration::from_secs(8);
+/// Failed notice polls in a row after which the view gives up.
+const POLL_GIVE_UP: u32 = 8;
 
 /// Raw mode on the terminal while alive; cooked mode again when dropped.
 pub struct RawMode(());
@@ -186,6 +190,7 @@ pub async fn run(
         caller,
         screen,
         phase: RefCell::new(phase),
+        done: Cell::new(false),
     };
     let number = tokio::select! {
         result = view.session() => return result,
@@ -207,6 +212,8 @@ struct View<'a> {
     caller: &'a Caller,
     screen: &'a Screen,
     phase: RefCell<Phase>,
+    /// Set when the view ended while waiting out a failed poll.
+    done: Cell<bool>,
 }
 
 impl View<'_> {
@@ -227,6 +234,7 @@ impl View<'_> {
             return Ok(());
         }
         let mut notices = poll(self.client, &self.caller.holder, &self.phase());
+        let mut failures = 0u32;
         loop {
             tokio::select! {
                 key = keys.recv(), if typing => match key {
@@ -240,7 +248,30 @@ impl View<'_> {
                     None => typing = false,
                 },
                 batch = &mut notices => {
-                    for n in batch? {
+                    let batch = match batch {
+                        Ok(batch) => {
+                            if failures > 0 {
+                                failures = 0;
+                                self.screen.say(
+                                    &json!({"daemon": "reachable"}),
+                                    "The clerk daemon answers again.",
+                                );
+                            }
+                            batch
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            if failures >= POLL_GIVE_UP {
+                                return self.give_up(e).await;
+                            }
+                            self.lost_contact(&e, failures, &mut keys).await?;
+                            if self.done.get() {
+                                return Ok(());
+                            }
+                            Vec::new()
+                        }
+                    };
+                    for n in batch {
                         if self.on_notice(&n, &mut keys).await? {
                             return Ok(());
                         }
@@ -251,6 +282,64 @@ impl View<'_> {
                 }
             }
         }
+    }
+
+    /// A notice poll failed (`failures` in a row): say so, then pause
+    /// before the next one, backing off. Keys still work while it waits;
+    /// a Ctrl+] that detached sets `done`.
+    async fn lost_contact(
+        &self,
+        e: &ApiError,
+        failures: u32,
+        keys: &mut mpsc::UnboundedReceiver<u8>,
+    ) -> anyhow::Result<()> {
+        let pause = retry_pause(failures);
+        tracing::debug!(error = %e, failures, "notice poll failed");
+        self.screen.say(
+            &json!({"daemon": "unreachable", "error": e.to_string(), "retry_in_ms": pause.as_millis()}),
+            &format!(
+                "Cannot reach the clerk daemon ({e}); retrying in {}s. What you hold is kept.",
+                pause.as_secs()
+            ),
+        );
+        let sleep = tokio::time::sleep(pause);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                () = &mut sleep => return Ok(()),
+                key = keys.recv() => match key {
+                    Some(CTRL_C) => return self.interrupt().await,
+                    Some(CTRL_BRACKET) => {
+                        if self.detach().await? {
+                            self.done.set(true);
+                            return Ok(());
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        sleep.as_mut().await;
+                        return Ok(());
+                    }
+                },
+            }
+        }
+    }
+
+    /// Notice polls kept failing: leave nothing behind (best effort,
+    /// bounded) and end the view with the last failure.
+    async fn give_up(&self, e: ApiError) -> anyhow::Result<()> {
+        self.screen.say(
+            &json!({"daemon": "unreachable", "giving_up": true, "error": e.to_string()}),
+            "The clerk daemon stays unreachable; giving up and giving back what this view holds.",
+        );
+        match tokio::time::timeout(SIGNAL_CLEANUP, self.abandon()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(cleanup)) => {
+                tracing::warn!(error = %cleanup, "cannot give back after giving up");
+            }
+            Err(_) => tracing::warn!("gave up cancelling or releasing after losing the daemon"),
+        }
+        Err(e.into())
     }
 
     /// Show `n` and act on it; true when the view is done.
@@ -417,6 +506,29 @@ impl View<'_> {
     }
 }
 
+/// The pause after `failures` failed notice polls in a row (1 or more):
+/// [`lease::POLL_RETRY`], doubling each time, up to [`POLL_RETRY_MAX`].
+fn retry_pause(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    (lease::POLL_RETRY * 2u32.pow(doublings)).min(POLL_RETRY_MAX)
+}
+
 fn released_text(lease: &str) -> String {
     format!("Released: lease {lease} has ended and its cleanup is confirmed.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_pause_doubles_from_the_poll_retry_up_to_the_cap() {
+        let pauses: Vec<u64> = (1..=6).map(|n| retry_pause(n).as_secs()).collect();
+        assert_eq!(pauses, [1, 2, 4, 8, 8, 8]);
+    }
+
+    #[test]
+    fn retry_pause_stays_capped_for_any_count() {
+        assert_eq!(retry_pause(u32::MAX), POLL_RETRY_MAX);
+    }
 }

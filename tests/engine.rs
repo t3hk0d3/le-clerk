@@ -627,6 +627,124 @@ mod engine {
         }
     }
 
+    mod request_holder {
+        use super::*;
+
+        fn agent(session: &str) -> Caller {
+            Caller {
+                holder: HolderRef::AgentSession {
+                    session_id: session.into(),
+                },
+                project: None,
+                override_reason: None,
+            }
+        }
+
+        /// Board `u1` held by `user("x")`, and `waiter` queued for it;
+        /// returns (x's lease, the queued request).
+        async fn queued(h: &EngineHandle, waiter: &Caller) -> (Value, Value) {
+            seed_board(h, &["u1"]).await;
+            let theirs = acquire(h, &user("x"), 60_000).await["lease_id"].clone();
+            let request = acquire(h, waiter, 60_000).await["request_id"].clone();
+            (theirs, request)
+        }
+
+        mod on_queued_user_request {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_its_user_holder() {
+                let (h, _clock) = spawn();
+                let (_, request) = queued(&h, &user("w")).await;
+                let got = ok(
+                    &h,
+                    "request_holder",
+                    &user("y"),
+                    json!({"request_id": request}),
+                )
+                .await;
+                assert_eq!(got, json!({"holder": {"kind": "user", "tag": "w"}}));
+            }
+        }
+
+        mod on_pending_offer {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_its_user_holder() {
+                let (h, _clock) = spawn();
+                let (theirs, request) = queued(&h, &user("w")).await;
+                ok(&h, "release", &user("x"), json!({"lease_id": theirs})).await;
+                ok(&h, "confirm", &user("x"), json!({"lease_id": theirs})).await;
+                let got = ok(
+                    &h,
+                    "request_holder",
+                    &user("y"),
+                    json!({"request_id": request}),
+                )
+                .await;
+                assert_eq!(got, json!({"holder": {"kind": "user", "tag": "w"}}));
+            }
+        }
+
+        mod on_agent_request {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_not_found() {
+                let (h, _clock) = spawn();
+                let (_, request) = queued(&h, &agent("s1")).await;
+                let err = rpc(
+                    &h,
+                    "request_holder",
+                    &user("y"),
+                    json!({"request_id": request}),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.code, "not_found");
+            }
+        }
+
+        mod on_unknown_request {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_not_found() {
+                let (h, _clock) = spawn();
+                let ghost = leclerk::model::RequestId::new();
+                let err = rpc(
+                    &h,
+                    "request_holder",
+                    &user("y"),
+                    json!({"request_id": ghost.as_str()}),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.code, "not_found");
+            }
+        }
+
+        mod on_agent_session_caller {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_refused_scope_not_allowed() {
+                let (h, _clock) = spawn();
+                let (_, request) = queued(&h, &user("w")).await;
+                let err = rpc(
+                    &h,
+                    "request_holder",
+                    &agent("s1"),
+                    json!({"request_id": request}),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.code, "scope_not_allowed");
+            }
+        }
+    }
+
     /// Daemon-side guard: agent sessions never get a view of every scope.
     mod agent_session_guard {
         use super::*;

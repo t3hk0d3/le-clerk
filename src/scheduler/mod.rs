@@ -1057,6 +1057,33 @@ impl Scheduler {
         }
     }
 
+    /// The holder of request `id` while it is queued or its offer is
+    /// pending, only when it is a `User` holder: the user's CLI acts as
+    /// that holder to claim or cancel it. Any other holder is not
+    /// disclosed.
+    ///
+    /// # Errors
+    /// [`SchedulerError::NotFound`] for an unknown request, one that is
+    /// neither queued nor offered, or one of anything but a `User` holder.
+    pub fn user_request_holder(
+        &self,
+        tx: &Tx,
+        id: &RequestId,
+    ) -> Result<HolderRef, SchedulerError> {
+        let holder = match leases::find_request(tx, id)? {
+            Some(request) => request.holder,
+            None => {
+                leases::offer_for_request(tx, id)?
+                    .ok_or(SchedulerError::NotFound)?
+                    .holder
+            }
+        };
+        match holder {
+            HolderRef::User { .. } => Ok(holder),
+            _ => Err(SchedulerError::NotFound),
+        }
+    }
+
     /// The caller's live leases (oldest first) and queued requests (in
     /// queue order, with positions).
     ///

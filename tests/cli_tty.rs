@@ -218,6 +218,52 @@ mod cli {
                 assert!(after_grant.contains(lease), "{shown}");
             }
 
+            mod on_daemon_restart_mid_view {
+                use super::*;
+
+                /// A held live view whose daemon was just restarted;
+                /// returns the view and its lease.
+                fn restarted(env: &Env) -> (Tty, String) {
+                    seed(env);
+                    let tty = Tty::spawn(env, ACQUIRE);
+                    tty.expect("Granted");
+                    let lease = unit_status(env)["occupancy"]["lease_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    env.ok(&["daemon", "restart"]);
+                    (tty, lease)
+                }
+
+                #[test]
+                fn keeps_the_lease() {
+                    let env = Env::new();
+                    let (_tty, lease) = restarted(&env);
+                    // Past the new daemon's first liveness probes.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let occupancy = unit_status(&env)["occupancy"].clone();
+                    assert_eq!(occupancy["lease_id"], lease.as_str(), "{occupancy}");
+                    assert_eq!(occupancy["state"], "held", "{occupancy}");
+                    assert_eq!(occupancy["holder"]["kind"], "cli_process", "{occupancy}");
+                }
+
+                #[test]
+                fn says_it_lost_contact() {
+                    let env = Env::new();
+                    let (tty, _) = restarted(&env);
+                    tty.expect("Cannot reach the clerk daemon");
+                }
+
+                #[test]
+                fn still_shows_notices() {
+                    let env = Env::new();
+                    let (tty, _) = restarted(&env);
+                    tty.expect("Cannot reach the clerk daemon");
+                    override_board(&env);
+                    tty.expect("overridden");
+                }
+            }
+
             #[test]
             fn terminal_restored_to_cooked_mode_on_sigterm() {
                 let env = Env::new();
