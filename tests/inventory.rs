@@ -3478,6 +3478,51 @@ mod resource_tags {
             }
         }
 
+        mod on_add_tags_that_push_the_result_over_the_limit {
+            use super::*;
+
+            #[test]
+            fn returns_too_many_tags_counting_the_resulting_set_and_changes_nothing() {
+                let (mut f, who) = seeded();
+                create(
+                    &mut f,
+                    &who,
+                    &tagged("b", Scope::User, &["a1", "a2", "a3", "a4", "a5"]),
+                )
+                .unwrap();
+                let news: Vec<String> = (0..17).map(|i| format!("n{i:02}")).collect();
+                let p = ResourcePatch {
+                    add_tags: news,
+                    ..patch()
+                };
+                let err = update(&mut f, &who, "b", p).unwrap_err();
+                assert_eq!(err.code(), "too_many_tags");
+                assert_eq!(err.details(), Some(json!({"max": 16, "count": 22})));
+                assert_eq!(
+                    names(&get(&mut f, &who, "b")),
+                    ["a1", "a2", "a3", "a4", "a5"]
+                );
+            }
+        }
+
+        mod on_the_same_malformed_tag_added_and_removed {
+            use super::*;
+
+            #[test]
+            fn returns_invalid_tag_not_a_conflict() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    add_tags: strings(&["Thread"]),
+                    remove_tags: strings(&["Thread"]),
+                    ..patch()
+                };
+                let err = update(&mut f, &who, "a", p).unwrap_err();
+                assert_eq!(err.code(), "invalid_tag");
+                assert_eq!(err.details(), Some(json!({"tag": "Thread"})));
+                assert_eq!(names(&get(&mut f, &who, "a")), ["esp32", "zigbee"]);
+            }
+        }
+
         mod on_a_malformed_tag {
             use super::*;
 
@@ -3700,33 +3745,49 @@ mod resource_tags {
     }
 
     mod duplicate_warnings {
+        use leclerk::inventory::Created;
+        use leclerk::model::Unit;
+
         use super::*;
 
-        mod on_add_unit_and_update_unit_duplicate_payloads {
-            use super::*;
+        type Added = Result<Created<Unit>, InventoryError>;
 
-            fn tagged_with_unit(
-                f: &mut Fixture,
-                who: &Caller,
-                id: &str,
-                scope: Scope,
-                key: &str,
-            ) -> Result<leclerk::inventory::Created<leclerk::model::Unit>, InventoryError>
-            {
-                create(f, who, &tagged(id, scope, &["secret-tag"]))?;
-                f.store.tx(|tx| {
-                    f.inv.add_unit(
-                        tx,
-                        who,
-                        &rid(id),
-                        &NewUnit {
-                            id: uid("u1"),
-                            settings: generic_settings(key),
-                            description: String::new(),
-                        },
-                    )
-                })
-            }
+        fn tagged_with_unit(
+            f: &mut Fixture,
+            who: &Caller,
+            id: &str,
+            scope: Scope,
+            key: &str,
+        ) -> Added {
+            create(f, who, &tagged(id, scope, &["secret-tag"]))?;
+            f.store.tx(|tx| {
+                f.inv.add_unit(
+                    tx,
+                    who,
+                    &rid(id),
+                    &NewUnit {
+                        id: uid("u1"),
+                        settings: generic_settings(key),
+                        description: String::new(),
+                    },
+                )
+            })
+        }
+
+        fn assert_untagged(text: &str) {
+            assert!(!text.contains("secret-tag"), "{text}");
+            assert!(!text.contains("tags"), "{text}");
+        }
+
+        fn warnings_of(added: Added) -> Vec<Warning> {
+            let warnings = added.unwrap().warnings;
+            assert_untagged(&serde_json::to_string(&warnings).unwrap());
+            assert_untagged(&format!("{warnings:?}"));
+            warnings
+        }
+
+        mod add_unit {
+            use super::*;
 
             #[test]
             fn duplicate_in_scope_carries_no_tags() {
@@ -3735,30 +3796,53 @@ mod resource_tags {
                 tagged_with_unit(&mut f, &who, "a", Scope::User, "k").unwrap();
                 let err = tagged_with_unit(&mut f, &who, "b", Scope::User, "k").unwrap_err();
                 assert!(matches!(err, InventoryError::DuplicateInScope { .. }));
-                assert!(!format!("{err:?} {:?}", err.details()).contains("secret-tag"));
+                assert_untagged(&format!("{err:?} {:?}", err.details()));
             }
 
             #[test]
-            fn warnings_for_other_scopes_carry_no_tags() {
+            fn duplicate_of_user_unit_carries_no_tags() {
+                let mut f = fixture();
+                tagged_with_unit(&mut f, &caller(None), "u", Scope::User, "k").unwrap();
+                let a = caller(Some("/p/a"));
+                let added = tagged_with_unit(&mut f, &a, "m", Scope::Project(project("/p/a")), "k");
+                let warnings = warnings_of(added);
+                assert!(matches!(
+                    warnings.as_slice(),
+                    [Warning::DuplicateOfUserUnit { .. }]
+                ));
+            }
+
+            #[test]
+            fn duplicate_of_project_unit_carries_no_tags() {
+                let mut f = fixture();
+                let a = caller(Some("/p/a"));
+                tagged_with_unit(&mut f, &a, "m", Scope::Project(project("/p/a")), "k").unwrap();
+                let warnings = warnings_of(tagged_with_unit(&mut f, &a, "u", Scope::User, "k"));
+                assert!(matches!(
+                    warnings.as_slice(),
+                    [Warning::DuplicateOfProjectUnit { .. }]
+                ));
+            }
+
+            #[test]
+            fn similar_in_other_project_carries_no_tags() {
                 let mut f = fixture();
                 let (a, b) = (caller(Some("/p/a")), caller(Some("/p/b")));
-                tagged_with_unit(&mut f, &caller(None), "u", Scope::User, "k").unwrap();
-                let in_a =
-                    tagged_with_unit(&mut f, &a, "mine", Scope::Project(project("/p/a")), "k")
-                        .unwrap();
-                let in_b =
-                    tagged_with_unit(&mut f, &b, "theirs", Scope::Project(project("/p/b")), "k")
-                        .unwrap();
-                for warnings in [in_a.warnings, in_b.warnings] {
-                    assert_ne!(warnings.len(), 0);
-                    let text =
-                        format!("{warnings:?} {}", serde_json::to_string(&warnings).unwrap());
-                    assert!(!text.contains("secret-tag"), "{text}");
-                }
+                tagged_with_unit(&mut f, &a, "m", Scope::Project(project("/p/a")), "k").unwrap();
+                let added = tagged_with_unit(&mut f, &b, "t", Scope::Project(project("/p/b")), "k");
+                let warnings = warnings_of(added);
+                assert!(matches!(
+                    warnings.as_slice(),
+                    [Warning::SimilarInOtherProject { .. }]
+                ));
             }
+        }
+
+        mod update_unit {
+            use super::*;
 
             #[test]
-            fn update_unit_duplicate_errors_carry_no_tags() {
+            fn duplicate_in_scope_carries_no_tags() {
                 let mut f = fixture();
                 let who = caller(None);
                 tagged_with_unit(&mut f, &who, "a", Scope::User, "k1").unwrap();
@@ -3779,7 +3863,7 @@ mod resource_tags {
                     })
                     .unwrap_err();
                 assert!(matches!(err, InventoryError::DuplicateInScope { .. }));
-                assert!(!format!("{err:?} {:?}", err.details()).contains("secret-tag"));
+                assert_untagged(&format!("{err:?} {:?}", err.details()));
             }
         }
     }

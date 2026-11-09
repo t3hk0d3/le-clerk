@@ -1650,20 +1650,36 @@ mod wire_tags {
         mod on_create_with_tags {
             use super::*;
 
-            #[tokio::test]
-            async fn the_result_get_and_list_show_the_tags_sorted() {
-                let (h, _clock) = spawn();
-                let created = create(
-                    &h,
+            async fn board_with_tags(h: &EngineHandle) -> Value {
+                create(
+                    h,
                     &user("a"),
                     "board",
                     json!("user"),
                     json!(["zigbee", "esp32"]),
                 )
-                .await;
+                .await
+            }
+
+            #[tokio::test]
+            async fn the_create_result_shows_the_tags_sorted() {
+                let (h, _clock) = spawn();
+                let created = board_with_tags(&h).await;
                 assert_eq!(created["resource"]["tags"], json!(["esp32", "zigbee"]));
+            }
+
+            #[tokio::test]
+            async fn get_resource_shows_the_tags_sorted() {
+                let (h, _clock) = spawn();
+                board_with_tags(&h).await;
                 let got = ok(&h, "get_resource", &user("a"), json!({"id": "board"})).await;
                 assert_eq!(got["tags"], json!(["esp32", "zigbee"]));
+            }
+
+            #[tokio::test]
+            async fn list_resources_shows_the_tags_sorted() {
+                let (h, _clock) = spawn();
+                board_with_tags(&h).await;
                 let list = ok(&h, "list_resources", &user("a"), json!({})).await;
                 assert_eq!(list[0]["tags"], json!(["esp32", "zigbee"]));
             }
@@ -1688,35 +1704,49 @@ mod wire_tags {
         mod on_tags_add_tags_and_remove_tags {
             use super::*;
 
-            #[tokio::test]
-            async fn replaces_adds_and_removes_over_the_wire() {
+            async fn board() -> EngineHandle {
                 let (h, _clock) = spawn();
                 create(&h, &user("a"), "board", json!("user"), json!(["esp32"])).await;
-                let who = user("a");
-                let added = ok(
+                h
+            }
+
+            #[tokio::test]
+            async fn add_tags_and_remove_tags_edit_the_set() {
+                let h = board().await;
+                let got = ok(
                     &h,
                     "update_resource",
-                    &who,
+                    &user("a"),
                     json!({"id": "board", "add_tags": ["thread"], "remove_tags": ["esp32"]}),
                 )
                 .await;
-                assert_eq!(added["tags"], json!(["thread"]));
-                let replaced = ok(
+                assert_eq!(got["tags"], json!(["thread"]));
+            }
+
+            #[tokio::test]
+            async fn tags_replaces_the_set() {
+                let h = board().await;
+                let got = ok(
                     &h,
                     "update_resource",
-                    &who,
+                    &user("a"),
                     json!({"id": "board", "tags": ["c6", "zigbee"]}),
                 )
                 .await;
-                assert_eq!(replaced["tags"], json!(["c6", "zigbee"]));
-                let cleared = ok(
+                assert_eq!(got["tags"], json!(["c6", "zigbee"]));
+            }
+
+            #[tokio::test]
+            async fn an_empty_tags_array_clears_the_set() {
+                let h = board().await;
+                let got = ok(
                     &h,
                     "update_resource",
-                    &who,
+                    &user("a"),
                     json!({"id": "board", "tags": []}),
                 )
                 .await;
-                assert_eq!(cleared["tags"], json!([]));
+                assert_eq!(got["tags"], json!([]));
             }
         }
 
@@ -1812,20 +1842,39 @@ mod wire_tags {
             use super::*;
 
             #[tokio::test]
-            async fn returns_the_resources_carrying_all_of_them() {
+            async fn one_tag_returns_the_resources_carrying_it() {
                 let (h, _clock) = spawn();
                 seeded(&h).await;
-                let who = user("a");
-                let both = ok(&h, "list_resources", &who, json!({"tags": ["esp32"]})).await;
-                assert_eq!(ids(&both), ["one", "two"]);
-                let one = ok(
+                let got = ok(&h, "list_resources", &user("a"), json!({"tags": ["esp32"]})).await;
+                assert_eq!(ids(&got), ["one", "two"]);
+            }
+
+            #[tokio::test]
+            async fn several_tags_return_the_resources_carrying_all_of_them() {
+                let (h, _clock) = spawn();
+                seeded(&h).await;
+                let got = ok(
                     &h,
                     "list_resources",
-                    &who,
-                    json!({"tags": ["esp32", "thread"], "view": "all"}),
+                    &user("a"),
+                    json!({"tags": ["esp32", "thread"]}),
                 )
                 .await;
-                assert_eq!(ids(&one), ["one"]);
+                assert_eq!(ids(&got), ["one"]);
+            }
+
+            #[tokio::test]
+            async fn view_all_filters_too() {
+                let (h, _clock) = spawn();
+                seeded(&h).await;
+                let got = ok(
+                    &h,
+                    "list_resources",
+                    &user("a"),
+                    json!({"tags": ["thread"], "view": "all"}),
+                )
+                .await;
+                assert_eq!(ids(&got), ["one"]);
             }
         }
 
@@ -1833,7 +1882,7 @@ mod wire_tags {
             use super::*;
 
             #[tokio::test]
-            async fn is_not_returned() {
+            async fn the_other_projects_resource_is_not_returned() {
                 let (h, _clock) = spawn();
                 let (a, b) = (in_project("a", "/p/a"), in_project("b", "/p/b"));
                 create(
@@ -1844,8 +1893,16 @@ mod wire_tags {
                     json!(["thread"]),
                 )
                 .await;
+                create(
+                    &h,
+                    &a,
+                    "mine",
+                    json!({"project": "/p/a"}),
+                    json!(["thread"]),
+                )
+                .await;
                 let list = ok(&h, "list_resources", &a, json!({"tags": ["thread"]})).await;
-                assert_eq!(list, json!([]));
+                assert_eq!(ids(&list), ["mine"]);
             }
         }
 

@@ -772,22 +772,22 @@ impl Inventory {
         if !editing {
             return Ok(None);
         }
-        if let Some(tag) = patch
+        let added = patch
             .add_tags
             .iter()
-            .find(|t| patch.remove_tags.contains(t))
-        {
-            return Err(InventoryError::ConflictingTagEdit {
-                reason: "added_and_removed",
-                tag: Some(tag.clone()),
-            });
-        }
-        let added = TagSet::parse(&patch.add_tags)?;
+            .map(|t| Tag::parse(t))
+            .collect::<Result<Vec<_>, _>>()?;
         let removed = patch
             .remove_tags
             .iter()
             .map(|t| Tag::parse(t))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(tag) = added.iter().find(|t| removed.contains(t)) {
+            return Err(InventoryError::ConflictingTagEdit {
+                reason: "added_and_removed",
+                tag: Some(tag.as_str().to_owned()),
+            });
+        }
         let kept = current
             .iter()
             .chain(added.iter())

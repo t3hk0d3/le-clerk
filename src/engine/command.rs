@@ -92,7 +92,8 @@ pub struct CreateResourceArgs {
 }
 
 /// `update_resource`. Absent fields are left alone; `"health": null`
-/// resets the health checks to the type default.
+/// resets the health checks to the type default. Tags: `tags` replaces the
+/// set (`[]` clears it), or `add_tags` / `remove_tags` edit it; not both.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateResourceArgs {
@@ -427,7 +428,7 @@ macro_rules! commands {
 commands! {
     /// Create a resource.
     CreateResource(CreateResourceArgs) = "create_resource", read_only: false;
-    /// Change a resource's description, usage or health checks.
+    /// Change a resource's description, usage, health checks or tags.
     UpdateResource(UpdateResourceArgs) = "update_resource", read_only: false;
     /// Delete a free resource.
     DeleteResource(ResourceArgs) = "delete_resource", read_only: false;
