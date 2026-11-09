@@ -134,6 +134,15 @@ pub struct DaemonInfo {
     pub pid: u32,
 }
 
+/// Environment variables that locate clerk's files.
+const PATH_VARS: [&str; 5] = [
+    "CLERK_HOME",
+    "HOME",
+    "XDG_STATE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_RUNTIME_DIR",
+];
+
 /// How to start a daemon: `<program> daemon` with `env` added to the
 /// inherited environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +166,30 @@ impl Launcher {
         })
     }
 
+    /// The path variables the child would see as relative, in absolute form
+    /// (against this process's working directory): the child runs in `/`
+    /// and would otherwise resolve them somewhere else than its clients do.
+    /// `env` overrides the inherited value; empty values are left alone.
+    fn absolute_path_vars(&self) -> io::Result<Vec<(&'static str, PathBuf)>> {
+        let mut fixed = Vec::new();
+        for key in PATH_VARS {
+            let value = self
+                .env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var_os(key));
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                let path = PathBuf::from(value);
+                if path.is_relative() {
+                    fixed.push((key, std::path::absolute(&path)?));
+                }
+            }
+        }
+        Ok(fixed)
+    }
+
     /// Start `<program> daemon` in its own session, stdin closed and
     /// stdout/stderr appended to the daemon log.
     fn spawn(&self, paths: &Paths) -> io::Result<Child> {
@@ -170,6 +203,7 @@ impl Launcher {
         let mut cmd = std::process::Command::new(&self.program);
         cmd.arg("daemon")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .envs(self.absolute_path_vars()?)
             .current_dir("/")
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)

@@ -21,6 +21,7 @@ use leclerk::scheduler::{AcquireOutcome, AcquireRequest, Confirm, HealthProbe, S
 use leclerk::store::notices::{Notice, NoticeKind};
 use leclerk::store::{Store, StoreError, Tx, audit};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 
 use common::TestEnv;
 
@@ -949,6 +950,126 @@ mod daemon {
                     got.iter()
                         .any(|n| n.kind == NoticeKind::CleanupWindowStarted)
                 );
+            }
+        }
+    }
+
+    mod launcher {
+        use super::*;
+
+        /// A working directory and one path variable set to a relative value
+        /// (the others unset), running real `clerk` commands from there.
+        /// Stops the daemon it started when dropped.
+        struct Relative {
+            cwd: TempDir,
+            vars: Vec<(&'static str, PathBuf)>,
+        }
+
+        impl Relative {
+            fn new(var: &'static str, value: &'static str) -> Self {
+                Self {
+                    cwd: TempDir::new().unwrap(),
+                    vars: vec![(var, PathBuf::from(value))],
+                }
+            }
+
+            /// Also set `var` to an absolute directory inside the working
+            /// directory, so the paths still resolve.
+            fn and_absolute(mut self, var: &'static str, dir: &str) -> Self {
+                let abs = self.cwd.path().join(dir);
+                self.vars.push((var, abs));
+                self
+            }
+
+            fn daemon(&self, action: &str) -> std::process::Output {
+                let mut cmd = assert_cmd::Command::cargo_bin("clerk").unwrap();
+                for var in [
+                    "CLERK_HOME",
+                    "HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_CONFIG_HOME",
+                    "XDG_RUNTIME_DIR",
+                ] {
+                    cmd.env_remove(var);
+                }
+                cmd.envs(self.vars.iter().map(|(k, v)| (k, v)))
+                    .current_dir(self.cwd.path())
+                    .args(["daemon", action])
+                    .timeout(PATIENCE)
+                    .output()
+                    .unwrap()
+            }
+
+            fn pid(&self) -> u64 {
+                let out = self.daemon("status");
+                assert!(out.status.success(), "{out:?}");
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(body["running"], json!(true), "{body}");
+                body["pid"].as_u64().unwrap()
+            }
+        }
+
+        impl Drop for Relative {
+            fn drop(&mut self) {
+                let _ = self.daemon("stop");
+            }
+        }
+
+        /// Start the daemon from the working directory, then check that its
+        /// socket is at `socket` (below the working directory) and that a
+        /// second client from there finds the same daemon.
+        fn assert_listens_at(r: &Relative, socket: &str) {
+            let out = r.daemon("restart");
+            assert!(out.status.success(), "{out:?}");
+            assert!(r.cwd.path().join(socket).exists(), "no socket at {socket}");
+            assert_eq!(r.pid(), r.pid());
+        }
+
+        mod spawn {
+            use super::*;
+
+            mod on_relative_clerk_home {
+                use super::*;
+
+                #[test]
+                fn daemon_listens_where_the_client_looks() {
+                    let r = Relative::new("CLERK_HOME", "rel-home");
+                    assert_listens_at(&r, "rel-home/run/clerk.sock");
+                }
+            }
+
+            mod on_relative_home {
+                use super::*;
+
+                #[test]
+                fn daemon_listens_where_the_client_looks() {
+                    let r = Relative::new("HOME", "rel-user");
+                    assert_listens_at(&r, "rel-user/.local/state/clerk/clerk.sock");
+                }
+            }
+
+            mod on_relative_xdg_state_home {
+                use super::*;
+
+                #[test]
+                fn daemon_listens_where_the_client_looks() {
+                    let r = Relative::new("XDG_STATE_HOME", "rel-state")
+                        .and_absolute("XDG_CONFIG_HOME", "cfg");
+                    // No runtime dir: the state dir decides.
+                    assert_listens_at(&r, "rel-state/clerk/clerk.sock");
+                }
+            }
+
+            mod on_relative_xdg_runtime_dir {
+                use super::*;
+
+                #[test]
+                fn daemon_listens_where_the_client_looks() {
+                    let r = Relative::new("XDG_RUNTIME_DIR", "rel-run")
+                        .and_absolute("XDG_STATE_HOME", "st")
+                        .and_absolute("XDG_CONFIG_HOME", "cfg");
+                    assert_listens_at(&r, "rel-run/clerk/clerk.sock");
+                }
             }
         }
     }
