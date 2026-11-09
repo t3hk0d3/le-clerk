@@ -1760,14 +1760,14 @@ mod admin_ops {
                     "create_resource",
                     &user("o"),
                     json!({"id": "board", "type": "generic", "scope": "user",
-                           "description": "boards", "notes": "n", "health": [{"builtin": "none"}]}),
+                           "description": "boards", "usage": "n", "health": [{"builtin": "none"}]}),
                 )
                 .await;
                 ok(
                     &h,
                     "add_unit",
                     &user("o"),
-                    json!({"resource": "board", "id": "u1", "notes": "blue",
+                    json!({"resource": "board", "id": "u1", "description": "blue",
                            "settings": {"type": "generic", "identity_key": "k1"}}),
                 )
                 .await;
@@ -1784,12 +1784,12 @@ mod admin_ops {
                                 "type": "generic",
                                 "scope": "user",
                                 "description": "boards",
-                                "notes": "n",
+                                "usage": "n",
                                 "health": [{"builtin": "none"}],
                                 "units": [{
                                     "id": "u1",
                                     "settings": {"type": "generic", "identity_key": "k1"},
-                                    "notes": "blue",
+                                    "description": "blue",
                                 }],
                             },
                             {
@@ -1797,12 +1797,12 @@ mod admin_ops {
                                 "type": "generic",
                                 "scope": {"project": "/p"},
                                 "description": "",
-                                "notes": "",
+                                "usage": "",
                                 "health": null,
                                 "units": [{
                                     "id": "m1",
                                     "settings": {"type": "generic", "identity_key": "k1"},
-                                    "notes": "",
+                                    "description": "",
                                 }],
                             },
                         ],
@@ -1846,7 +1846,7 @@ mod admin_ops {
             }
         }
 
-        fn doc(resource_notes: &str) -> Value {
+        fn doc(resource_usage: &str) -> Value {
             json!({
                 "version": 1,
                 "resources": [{
@@ -1854,12 +1854,12 @@ mod admin_ops {
                     "type": "generic",
                     "scope": "user",
                     "description": "",
-                    "notes": resource_notes,
+                    "usage": resource_usage,
                     "health": null,
                     "units": [{
                         "id": "u1",
                         "settings": {"type": "generic", "identity_key": "k1"},
-                        "notes": "",
+                        "description": "",
                     }],
                 }],
                 "links": [],
@@ -1916,7 +1916,7 @@ mod admin_ops {
                 )
                 .await;
                 let got = ok(&h, "get_resource", &user("x"), json!({"id": "board"})).await;
-                assert_eq!(got["notes"], "new");
+                assert_eq!(got["usage"], "new");
                 let units: Vec<&Value> = got["units"].as_array().unwrap().iter().collect();
                 assert_eq!(units.len(), 1);
                 assert_eq!(units[0]["id"], "u1");
@@ -1998,14 +1998,14 @@ mod admin_ops {
             use super::*;
 
             #[tokio::test]
-            async fn keeps_ids_scopes_settings_notes_health_and_links() {
+            async fn keeps_ids_scopes_settings_text_health_and_links() {
                 let (h, _clock) = spawn();
                 ok(
                     &h,
                     "create_resource",
                     &user("o"),
                     json!({"id": "board", "type": "generic", "scope": "user",
-                           "description": "d", "notes": "n", "health": [{"builtin": "none"}]}),
+                           "description": "d", "usage": "n", "health": [{"builtin": "none"}]}),
                 )
                 .await;
                 for (u, k) in [("u1", "k1"), ("u2", "k2")] {
@@ -2013,7 +2013,7 @@ mod admin_ops {
                         &h,
                         "add_unit",
                         &user("o"),
-                        json!({"resource": "board", "id": u, "notes": format!("note-{u}"),
+                        json!({"resource": "board", "id": u, "description": format!("note-{u}"),
                                "settings": {"type": "generic", "identity_key": k}}),
                     )
                     .await;
@@ -2164,6 +2164,122 @@ mod rehome_holder {
             )
             .await;
             assert_eq!(e.code, "not_holder");
+        }
+    }
+}
+
+mod export_text {
+    use super::*;
+
+    fn legacy_doc() -> Value {
+        json!({
+            "version": 1,
+            "resources": [{
+                "id": "board",
+                "type": "device",
+                "scope": "user",
+                "description": "boards",
+                "notes": "flash {unit.path}",
+                "units": [{
+                    "id": "u1",
+                    "settings": {"type": "device", "path": "/dev/ttyUSB0"},
+                    "notes": "left port",
+                }],
+            }],
+        })
+    }
+
+    mod admin_import {
+        use super::*;
+
+        mod on_an_older_export_with_notes_fields {
+            use super::*;
+
+            #[tokio::test]
+            async fn imports_resource_notes_as_usage() {
+                let (h, _clock) = spawn();
+                ok(&h, "admin_import", &admin(), json!({"doc": legacy_doc()})).await;
+                let got = ok(&h, "get_resource", &user("x"), json!({"id": "board"})).await;
+                assert_eq!(got["usage"], "flash {unit.path}");
+            }
+
+            #[tokio::test]
+            async fn imports_unit_notes_as_description() {
+                let (h, _clock) = spawn();
+                ok(&h, "admin_import", &admin(), json!({"doc": legacy_doc()})).await;
+                let got = ok(&h, "get_resource", &user("x"), json!({"id": "board"})).await;
+                assert_eq!(got["units"][0]["description"], "left port");
+            }
+
+            #[tokio::test]
+            async fn re_exports_under_the_new_names() {
+                let (h, _clock) = spawn();
+                ok(&h, "admin_import", &admin(), json!({"doc": legacy_doc()})).await;
+                let out = export(&h).await;
+                assert_eq!(out["resources"][0]["usage"], "flash {unit.path}");
+                assert!(out["resources"][0].get("notes").is_none());
+                assert_eq!(out["resources"][0]["units"][0]["description"], "left port");
+            }
+        }
+
+        mod on_an_imported_usage_with_an_unknown_placeholder {
+            use super::*;
+
+            fn bad_doc() -> Value {
+                let mut doc = legacy_doc();
+                doc["resources"][0]["notes"] = json!("flash {unit.pth}");
+                doc
+            }
+
+            #[tokio::test]
+            async fn fails_with_unknown_placeholder() {
+                let (h, _clock) = spawn();
+                let e = err(&h, "admin_import", &admin(), json!({"doc": bad_doc()})).await;
+                assert_eq!(e.code, "unknown_placeholder");
+            }
+
+            #[tokio::test]
+            async fn imports_nothing() {
+                let (h, _clock) = spawn();
+                seed(&h, &user("o"), "other", json!("user"), &[("x1", "kx")]).await;
+                let before = export(&h).await;
+                let _ = err(&h, "admin_import", &admin(), json!({"doc": bad_doc()})).await;
+                assert_eq!(export(&h).await, before);
+            }
+        }
+
+        mod on_an_imported_description_that_is_multiline {
+            use super::*;
+
+            #[tokio::test]
+            async fn fails_with_description_multiline() {
+                let (h, _clock) = spawn();
+                let mut doc = legacy_doc();
+                doc["resources"][0]["units"][0]["notes"] = json!("a\nb");
+                let e = err(&h, "admin_import", &admin(), json!({"doc": doc})).await;
+                assert_eq!(e.code, "description_multiline");
+            }
+        }
+    }
+
+    mod admin_export {
+        use super::*;
+
+        mod on_resources_with_text {
+            use super::*;
+
+            #[tokio::test]
+            async fn writes_usage_for_resources_and_description_for_units() {
+                let (h, _clock) = spawn();
+                ok(&h, "admin_import", &admin(), json!({"doc": legacy_doc()})).await;
+                let out = export(&h).await;
+                let resource = out["resources"][0].as_object().unwrap();
+                assert!(resource.contains_key("usage"));
+                assert!(!resource.contains_key("notes"));
+                let unit = resource["units"][0].as_object().unwrap();
+                assert!(unit.contains_key("description"));
+                assert!(!unit.contains_key("notes"));
+            }
         }
     }
 }

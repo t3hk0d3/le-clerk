@@ -28,7 +28,7 @@ pub struct NewResourceRow<'a> {
     pub ty: ResourceType,
     pub scope: &'a Scope,
     pub description: &'a str,
-    pub notes: &'a str,
+    pub usage: &'a str,
     pub health: Option<&'a HealthSpec>,
     pub created_at: i64,
 }
@@ -39,7 +39,7 @@ pub struct NewUnitRow<'a> {
     pub resource_row: i64,
     pub id: &'a UnitId,
     pub settings: &'a UnitSettings,
-    pub notes: &'a str,
+    pub description: &'a str,
     pub created_at: i64,
 }
 
@@ -59,7 +59,7 @@ fn scope_from_columns(kind: &str, key: String) -> Result<Scope, StoreError> {
 }
 
 const RESOURCE_COLUMNS: &str = "r.row_id, r.id, r.scope_kind, r.project_key, r.type, \
-     r.description, r.notes, r.health, r.created_at, \
+     r.description, r.usage, r.health, r.created_at, \
      (r.scope_kind = 'project' AND EXISTS (SELECT 1 FROM resources u \
         WHERE u.scope_kind = 'user' AND u.id = r.id))";
 
@@ -70,7 +70,7 @@ struct RawResource {
     project_key: String,
     ty: String,
     description: String,
-    notes: String,
+    usage: String,
     health: Option<String>,
     created_at: i64,
     shadows_user: bool,
@@ -84,7 +84,7 @@ fn raw_resource(r: &Row<'_>) -> rusqlite::Result<RawResource> {
         project_key: r.get(3)?,
         ty: r.get(4)?,
         description: r.get(5)?,
-        notes: r.get(6)?,
+        usage: r.get(6)?,
         health: r.get(7)?,
         created_at: r.get(8)?,
         shadows_user: r.get(9)?,
@@ -99,7 +99,7 @@ fn build_resource(tx: &Tx, raw: RawResource) -> Result<Resource, StoreError> {
         ty: parse_enum(&raw.ty, "resources.type")?,
         scope,
         description: raw.description,
-        notes: raw.notes,
+        usage: raw.usage,
         health: raw.health.map(|h| serde_json::from_str(&h)).transpose()?,
         created_at: raw.created_at,
         shadows_user: raw.shadows_user,
@@ -115,7 +115,7 @@ pub fn insert_resource(tx: &Tx, new: &NewResourceRow<'_>) -> Result<i64, StoreEr
     let (kind, key) = scope_columns(new.scope);
     tx.conn().execute(
         "INSERT INTO resources \
-         (id, scope_kind, project_key, type, description, notes, health, created_at) \
+         (id, scope_kind, project_key, type, description, usage, health, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             new.id.as_str(),
@@ -123,7 +123,7 @@ pub fn insert_resource(tx: &Tx, new: &NewResourceRow<'_>) -> Result<i64, StoreEr
             key,
             enum_text(&new.ty)?,
             new.description,
-            new.notes,
+            new.usage,
             new.health.map(serde_json::to_string).transpose()?,
             new.created_at,
         ],
@@ -214,15 +214,15 @@ pub fn update_resource(
     tx: &Tx,
     row: i64,
     description: &str,
-    notes: &str,
+    usage: &str,
     health: Option<&HealthSpec>,
 ) -> Result<(), StoreError> {
     tx.conn().execute(
-        "UPDATE resources SET description = ?2, notes = ?3, health = ?4 WHERE row_id = ?1",
+        "UPDATE resources SET description = ?2, usage = ?3, health = ?4 WHERE row_id = ?1",
         rusqlite::params![
             row,
             description,
-            notes,
+            usage,
             health.map(serde_json::to_string).transpose()?
         ],
     )?;
@@ -277,7 +277,7 @@ pub fn unit_busy(tx: &Tx, unit_row: i64) -> Result<bool, StoreError> {
     )?)
 }
 
-const UNIT_COLUMNS: &str = "row_id, resource_row, id, settings, notes, dirty_reason, dirty_at, \
+const UNIT_COLUMNS: &str = "row_id, resource_row, id, settings, description, dirty_reason, dirty_at, \
      dirty_prev_holder, retiring, last_health, last_health_at, created_at";
 
 fn unit_from_row(r: &Row<'_>) -> rusqlite::Result<Result<Unit, StoreError>> {
@@ -285,7 +285,7 @@ fn unit_from_row(r: &Row<'_>) -> rusqlite::Result<Result<Unit, StoreError>> {
     let resource_row: i64 = r.get(1)?;
     let id: String = r.get(2)?;
     let settings: String = r.get(3)?;
-    let notes: String = r.get(4)?;
+    let description: String = r.get(4)?;
     let dirty_reason: Option<String> = r.get(5)?;
     let dirty_at: Option<i64> = r.get(6)?;
     let dirty_prev: Option<String> = r.get(7)?;
@@ -307,7 +307,7 @@ fn unit_from_row(r: &Row<'_>) -> rusqlite::Result<Result<Unit, StoreError>> {
             resource_row,
             id: UnitId::parse(&id).map_err(|_| StoreError::Corrupt("units.id"))?,
             settings: serde_json::from_str(&settings)?,
-            notes,
+            description,
             dirty,
             retiring,
             last_health,
@@ -348,13 +348,13 @@ pub fn find_unit(tx: &Tx, resource_row: i64, id: &UnitId) -> Result<Option<Unit>
 /// [`StoreError`] on SQL failure.
 pub fn insert_unit(tx: &Tx, new: &NewUnitRow<'_>) -> Result<i64, StoreError> {
     tx.conn().execute(
-        "INSERT INTO units (resource_row, id, settings, notes, created_at) \
+        "INSERT INTO units (resource_row, id, settings, description, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
             new.resource_row,
             new.id.as_str(),
             serde_json::to_string(new.settings)?,
-            new.notes,
+            new.description,
             new.created_at,
         ],
     )?;
@@ -369,11 +369,11 @@ pub fn update_unit(
     tx: &Tx,
     row: i64,
     settings: &UnitSettings,
-    notes: &str,
+    description: &str,
 ) -> Result<(), StoreError> {
     tx.conn().execute(
-        "UPDATE units SET settings = ?2, notes = ?3 WHERE row_id = ?1",
-        rusqlite::params![row, serde_json::to_string(settings)?, notes],
+        "UPDATE units SET settings = ?2, description = ?3 WHERE row_id = ?1",
+        rusqlite::params![row, serde_json::to_string(settings)?, description],
     )?;
     Ok(())
 }
@@ -472,6 +472,8 @@ pub struct Candidate {
     pub resource_id: ResourceId,
     pub scope: Scope,
     pub identity: Identity,
+    pub resource_description: String,
+    pub unit_description: String,
 }
 
 /// Every unit of resources of type `ty`, in any scope, that has an identity,
@@ -485,7 +487,8 @@ pub fn candidates(
     exclude: Option<i64>,
 ) -> Result<Vec<Candidate>, StoreError> {
     let mut stmt = tx.conn().prepare(
-        "SELECT u.row_id, u.id, r.row_id, r.id, r.scope_kind, r.project_key, u.identity \
+        "SELECT u.row_id, u.id, r.row_id, r.id, r.scope_kind, r.project_key, u.identity, \
+         r.description, u.description \
          FROM units u JOIN resources r ON r.row_id = u.resource_row \
          WHERE r.type = ?1 AND u.identity IS NOT NULL AND u.row_id != ?2 \
          ORDER BY u.row_id",
@@ -502,22 +505,38 @@ pub fn candidates(
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
                 ))
             },
         )?
         .collect::<Result<Vec<_>, _>>()?;
     raws.into_iter()
-        .map(|(unit_row, uid, resource_row, rid, kind, key, identity)| {
-            Ok(Candidate {
+        .map(
+            |(
                 unit_row,
-                unit_id: UnitId::parse(&uid).map_err(|_| StoreError::Corrupt("units.id"))?,
+                uid,
                 resource_row,
-                resource_id: ResourceId::parse(&rid)
-                    .map_err(|_| StoreError::Corrupt("resources.id"))?,
-                scope: scope_from_columns(&kind, key)?,
-                identity: serde_json::from_str(&identity)?,
-            })
-        })
+                rid,
+                kind,
+                key,
+                identity,
+                resource_description,
+                unit_description,
+            )| {
+                Ok(Candidate {
+                    unit_row,
+                    unit_id: UnitId::parse(&uid).map_err(|_| StoreError::Corrupt("units.id"))?,
+                    resource_row,
+                    resource_id: ResourceId::parse(&rid)
+                        .map_err(|_| StoreError::Corrupt("resources.id"))?,
+                    scope: scope_from_columns(&kind, key)?,
+                    identity: serde_json::from_str(&identity)?,
+                    resource_description,
+                    unit_description,
+                })
+            },
+        )
         .collect()
 }
 
@@ -608,6 +627,8 @@ pub struct PromotionRow {
     pub id: PromotionId,
     pub resource_row: i64,
     pub resource_id: ResourceId,
+    /// The resource's description now.
+    pub resource_description: String,
     pub requester: Option<ProjectKey>,
     pub reason: String,
     pub created_at: i64,
@@ -618,7 +639,7 @@ fn requester_text(requester: Option<&ProjectKey>) -> String {
 }
 
 const PROMOTION_SELECT: &str = "SELECT p.row_id, p.promotion_id, p.resource_row, r.id, \
-     p.requester, p.reason, p.created_at \
+     p.requester, p.reason, p.created_at, r.description \
      FROM promotions p JOIN resources r ON r.row_id = p.resource_row \
      WHERE p.state = 'pending'";
 
@@ -630,6 +651,7 @@ fn promotion_from_row(r: &Row<'_>) -> rusqlite::Result<Result<PromotionRow, Stor
     let requester: String = r.get(4)?;
     let reason: String = r.get(5)?;
     let created_at: i64 = r.get(6)?;
+    let resource_description: String = r.get(7)?;
     Ok((|| {
         Ok(PromotionRow {
             row,
@@ -637,6 +659,7 @@ fn promotion_from_row(r: &Row<'_>) -> rusqlite::Result<Result<PromotionRow, Stor
             resource_row,
             resource_id: ResourceId::parse(&resource_id)
                 .map_err(|_| StoreError::Corrupt("resources.id"))?,
+            resource_description,
             requester: (!requester.is_empty()).then(|| ProjectKey(PathBuf::from(requester))),
             reason,
             created_at,

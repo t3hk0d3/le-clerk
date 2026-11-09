@@ -111,7 +111,7 @@ impl Fixture {
                         ty: ResourceType::Generic,
                         scope: Scope::User,
                         description: String::new(),
-                        notes: String::new(),
+                        usage: String::new(),
                         health: None,
                     },
                 )?;
@@ -125,7 +125,7 @@ impl Fixture {
                             settings: UnitSettings::Generic {
                                 identity_key: format!("{id}-{u}"),
                             },
-                            notes: String::new(),
+                            description: String::new(),
                         },
                     )?;
                 }

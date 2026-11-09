@@ -51,7 +51,7 @@ fn new_device(id: &str, scope: Scope) -> NewResource {
         ty: ResourceType::Device,
         scope,
         description: "a board".into(),
-        notes: String::new(),
+        usage: String::new(),
         health: None,
     }
 }
@@ -60,7 +60,7 @@ fn new_unit(id: &str, path: &str) -> NewUnit {
     NewUnit {
         id: uid(id),
         settings: device_settings(path),
-        notes: String::new(),
+        description: String::new(),
     }
 }
 
@@ -273,7 +273,7 @@ mod inventory {
                 f.store
                     .tx(|tx| {
                         let mut n = new_device("esp32", Scope::Project(project("/p/a")));
-                        n.notes = "bench 2".into();
+                        n.usage = "bench 2".into();
                         n.health = Some(health);
                         f.inv.create_resource(tx, &who, &n).map(|c| c.value)
                     })
@@ -292,7 +292,7 @@ mod inventory {
                 assert_eq!(got.ty, ResourceType::Device);
                 assert_eq!(got.scope, Scope::Project(project("/p/a")));
                 assert_eq!(got.description, "a board");
-                assert_eq!(got.notes, "bench 2");
+                assert_eq!(got.usage, "bench 2");
                 assert_eq!(
                     got.health,
                     Some(HealthSpec {
@@ -654,7 +654,7 @@ mod inventory {
                 f.seed(&who, "a", Scope::User, "u1");
                 let patch = ResourcePatch {
                     description: Some("new text".into()),
-                    notes: Some("n".into()),
+                    usage: Some("n".into()),
                     health: Some(Some(HealthSpec {
                         checks: vec![Check::Builtin(BuiltinCheck::Accessible)],
                     })),
@@ -664,7 +664,7 @@ mod inventory {
                     .tx(|tx| f.inv.update_resource(tx, &who, &rid("a"), patch))
                     .unwrap();
                 assert_eq!(updated.description, "new text");
-                assert_eq!(updated.notes, "n");
+                assert_eq!(updated.usage, "n");
                 assert!(updated.health.is_some());
                 assert_eq!(f.audit_actions().last().unwrap(), "resource_updated");
             }
@@ -675,7 +675,7 @@ mod inventory {
                 let who = caller(None);
                 f.seed(&who, "a", Scope::User, "u1");
                 let patch = ResourcePatch {
-                    notes: Some("n".into()),
+                    usage: Some("n".into()),
                     ..ResourcePatch::default()
                 };
                 let updated = f
@@ -898,7 +898,7 @@ mod inventory {
             fn persists_unit_and_returns_created_without_warnings() {
                 let (mut f, who) = base();
                 let mut n = new_unit("u1", "/dev/ttyUSB0");
-                n.notes = "left port".into();
+                n.description = "left port".into();
                 let created = f
                     .store
                     .tx(|tx| f.inv.add_unit(tx, &who, &rid("a"), &n))
@@ -911,7 +911,7 @@ mod inventory {
                     .unwrap();
                 assert_eq!(got.units.len(), 1);
                 assert_eq!(got.units[0].id, uid("u1"));
-                assert_eq!(got.units[0].notes, "left port");
+                assert_eq!(got.units[0].description, "left port");
                 assert!(!got.units[0].retiring);
                 assert!(got.units[0].dirty.is_none());
             }
@@ -976,7 +976,7 @@ mod inventory {
                     settings: UnitSettings::Generic {
                         identity_key: "k".into(),
                     },
-                    notes: String::new(),
+                    description: String::new(),
                 };
                 let err = f
                     .store
@@ -1006,7 +1006,7 @@ mod inventory {
                         port: 0,
                         service_id: None,
                     },
-                    notes: String::new(),
+                    description: String::new(),
                 };
                 let err = f
                     .store
@@ -1050,7 +1050,7 @@ mod inventory {
                 f.seed(&who, "a", Scope::User, "u1");
                 let patch = UnitPatch {
                     settings: Some(device_settings("/dev/ttyUSB9")),
-                    notes: Some("moved".into()),
+                    description: Some("moved".into()),
                 };
                 let updated = f
                     .store
@@ -1058,7 +1058,7 @@ mod inventory {
                     .unwrap();
                 assert_eq!(updated.warnings.len(), 0);
                 assert_eq!(updated.value.settings, device_settings("/dev/ttyUSB9"));
-                assert_eq!(updated.value.notes, "moved");
+                assert_eq!(updated.value.description, "moved");
                 assert_eq!(f.audit_actions().last().unwrap(), "unit_updated");
             }
         }
@@ -1073,7 +1073,7 @@ mod inventory {
                 f.seed(&who, "a", Scope::User, "u1");
                 let patch = UnitPatch {
                     settings: Some(device_settings("")),
-                    notes: None,
+                    description: None,
                 };
                 let err = f
                     .store
@@ -1377,7 +1377,7 @@ fn generic_unit(id: &str, key: &str) -> NewUnit {
     NewUnit {
         id: uid(id),
         settings: generic_settings(key),
-        notes: String::new(),
+        description: String::new(),
     }
 }
 
@@ -1462,7 +1462,7 @@ mod duplicate_handling {
                     })
                     .unwrap_err();
                 match err {
-                    InventoryError::DuplicateInScope { resource, unit } => {
+                    InventoryError::DuplicateInScope { resource, unit, .. } => {
                         assert_eq!(resource, rid("a"));
                         assert_eq!(unit, uid("u1"));
                     }
@@ -1553,7 +1553,7 @@ mod duplicate_handling {
                     .unwrap_err();
                 assert!(matches!(
                     err,
-                    InventoryError::DuplicateInScope { ref resource, ref unit }
+                    InventoryError::DuplicateInScope { ref resource, ref unit, .. }
                         if *resource == rid("mine") && *unit == uid("m1")
                 ));
                 assert_eq!(state(&mut f), before);
@@ -1626,6 +1626,8 @@ mod duplicate_handling {
                     vec![Warning::DuplicateOfUserUnit {
                         resource: rid("board"),
                         unit: uid("u1"),
+                        resource_description: "a board".into(),
+                        unit_description: String::new(),
                     }]
                 );
             }
@@ -1715,7 +1717,7 @@ mod duplicate_handling {
             #[test]
             fn discloses_only_the_other_projects_path() {
                 let (mut f, created) = two_projects();
-                // Give the other project's side recognisable notes/settings.
+                // Give the other project's side recognisable description/settings.
                 let b = caller(Some("/p/b"));
                 f.store
                     .tx(|tx| {
@@ -1726,7 +1728,7 @@ mod duplicate_handling {
                             &uid("secret-unit"),
                             UnitPatch {
                                 settings: None,
-                                notes: Some("hunter2-notes".into()),
+                                description: Some("hunter2-notes".into()),
                             },
                         )
                     })
@@ -1751,7 +1753,7 @@ mod duplicate_handling {
                             &uid("m1"),
                             UnitPatch {
                                 settings: Some(generic_settings("other")),
-                                notes: None,
+                                description: None,
                             },
                         )?;
                         f.inv.update_unit(
@@ -1761,7 +1763,7 @@ mod duplicate_handling {
                             &uid("m1"),
                             UnitPatch {
                                 settings: Some(generic_settings("k")),
-                                notes: None,
+                                description: None,
                             },
                         )
                     })
@@ -1796,6 +1798,8 @@ mod duplicate_handling {
                     vec![Warning::DuplicateOfProjectUnit {
                         resource: rid("mine"),
                         unit: uid("m1"),
+                        resource_description: "a board".into(),
+                        unit_description: String::new(),
                     }]
                 );
                 let a = f.row(None, "board", "u1");
@@ -1831,7 +1835,7 @@ mod duplicate_handling {
         fn patch_key(key: &str) -> UnitPatch {
             UnitPatch {
                 settings: Some(generic_settings(key)),
-                notes: None,
+                description: None,
             }
         }
 
@@ -1851,7 +1855,7 @@ mod duplicate_handling {
                 .unwrap_err();
             assert!(matches!(
                 err,
-                InventoryError::DuplicateInScope { ref resource, ref unit }
+                InventoryError::DuplicateInScope { ref resource, ref unit, .. }
                     if *resource == rid("a") && *unit == uid("u1")
             ));
             let b = f
@@ -1895,6 +1899,8 @@ mod duplicate_handling {
                 vec![Warning::DuplicateOfUserUnit {
                     resource: rid("board"),
                     unit: uid("u1"),
+                    resource_description: "a board".into(),
+                    unit_description: String::new(),
                 }]
             );
             let a = f.row(None, "board", "u1");
@@ -1976,7 +1982,7 @@ mod duplicate_handling {
         }
 
         #[test]
-        fn on_notes_only_change_keeps_links_and_returns_no_warnings() {
+        fn on_description_only_change_keeps_links_and_returns_no_warnings() {
             let mut f = fixture();
             f.seed_generic(None, "board", "u1", "k").unwrap();
             f.seed_generic(Some("/p/a"), "mine", "m1", "k").unwrap();
@@ -1991,7 +1997,7 @@ mod duplicate_handling {
                         &uid("m1"),
                         UnitPatch {
                             settings: None,
-                            notes: Some("n".into()),
+                            description: Some("n".into()),
                         },
                     )
                 })
@@ -2120,7 +2126,7 @@ mod update_unit_exclude_self {
         let who = caller(None);
         let patch = UnitPatch {
             settings: Some(device_settings(alias.to_str().unwrap())),
-            notes: None,
+            description: None,
         };
         let created = store
             .tx(|tx| {
@@ -2365,6 +2371,718 @@ mod dedup_audit {
                 f.seed_generic(None, "other", "u1", "k2").unwrap();
                 assert_eq!(entries(&mut f, "link_created").len(), 0);
             }
+        }
+    }
+}
+
+mod text_fields {
+    use leclerk::error::ErrorCode;
+    use leclerk::model::TextError;
+
+    use super::*;
+
+    fn long_description() -> String {
+        "x".repeat(201)
+    }
+
+    fn long_usage() -> String {
+        "u".repeat(4097)
+    }
+
+    fn resource_count(f: &mut Fixture) -> usize {
+        let who = caller(None);
+        f.store
+            .tx(|tx| f.inv.list_resources(tx, &who, View::All))
+            .unwrap()
+            .len()
+    }
+
+    fn get(f: &mut Fixture, who: &Caller, id: &str) -> Resource {
+        f.store
+            .tx(|tx| f.inv.get_resource(tx, who, &rid(id)))
+            .unwrap()
+    }
+
+    mod create_resource {
+        use super::*;
+
+        mod on_valid_description_and_usage {
+            use super::*;
+
+            fn create(f: &mut Fixture) -> Resource {
+                let who = caller(None);
+                let mut n = new_device("board", Scope::User);
+                n.description = "a dev board".into();
+                n.usage = "Flash with `esptool --port {unit.path}` ${PORT} {}".into();
+                f.store
+                    .tx(|tx| f.inv.create_resource(tx, &who, &n))
+                    .unwrap();
+                get(f, &who, "board")
+            }
+
+            #[test]
+            fn stores_the_description() {
+                let mut f = fixture();
+                assert_eq!(create(&mut f).description, "a dev board");
+            }
+
+            #[test]
+            fn get_returns_the_raw_template() {
+                let mut f = fixture();
+                assert_eq!(
+                    create(&mut f).usage,
+                    "Flash with `esptool --port {unit.path}` ${PORT} {}"
+                );
+            }
+        }
+
+        mod on_invalid_description_or_usage {
+            use super::*;
+
+            fn refused(f: &mut Fixture, tweak: impl FnOnce(&mut NewResource)) -> InventoryError {
+                let who = caller(None);
+                let mut n = new_device("board", Scope::User);
+                tweak(&mut n);
+                f.store
+                    .tx(|tx| f.inv.create_resource(tx, &who, &n))
+                    .unwrap_err()
+            }
+
+            #[test]
+            fn returns_invalid_text_for_a_too_long_description() {
+                let mut f = fixture();
+                let e = refused(&mut f, |n| n.description = long_description());
+                assert!(matches!(
+                    e,
+                    InventoryError::InvalidText(TextError::DescriptionTooLong { max: 200 })
+                ));
+                assert_eq!(e.code(), "description_too_long");
+            }
+
+            #[test]
+            fn returns_invalid_text_for_a_multiline_description() {
+                let mut f = fixture();
+                let e = refused(&mut f, |n| n.description = "a\nb".into());
+                assert!(matches!(
+                    e,
+                    InventoryError::InvalidText(TextError::DescriptionMultiline)
+                ));
+                assert_eq!(e.code(), "description_multiline");
+            }
+
+            #[test]
+            fn returns_invalid_text_for_a_too_long_usage() {
+                let mut f = fixture();
+                let e = refused(&mut f, |n| n.usage = long_usage());
+                assert!(matches!(
+                    e,
+                    InventoryError::InvalidText(TextError::UsageTooLong { max: 4096 })
+                ));
+                assert_eq!(e.code(), "usage_too_long");
+            }
+
+            #[test]
+            fn stores_nothing() {
+                let mut f = fixture();
+                refused(&mut f, |n| n.usage = long_usage());
+                assert_eq!(resource_count(&mut f), 0);
+            }
+
+            #[test]
+            fn writes_no_audit_entry() {
+                let mut f = fixture();
+                refused(&mut f, |n| n.description = "a\nb".into());
+                assert_eq!(f.audit_actions(), Vec::<String>::new());
+            }
+        }
+
+        mod on_unknown_placeholder {
+            use super::*;
+
+            fn refused(f: &mut Fixture) -> InventoryError {
+                let who = caller(None);
+                let mut n = new_device("board", Scope::User);
+                n.usage = "open {unit.pth}".into();
+                f.store
+                    .tx(|tx| f.inv.create_resource(tx, &who, &n))
+                    .unwrap_err()
+            }
+
+            #[test]
+            fn is_refused_with_code_unknown_placeholder() {
+                let mut f = fixture();
+                assert_eq!(refused(&mut f).code(), "unknown_placeholder");
+            }
+
+            #[test]
+            fn details_name_the_placeholder_and_the_valid_keys() {
+                let mut f = fixture();
+                let details = refused(&mut f).details().unwrap();
+                assert_eq!(details["placeholder"], "unit.pth");
+                assert!(
+                    details["valid"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::json!("unit.path"))
+                );
+            }
+
+            #[test]
+            fn refuses_a_key_of_another_type() {
+                let mut f = fixture();
+                let who = caller(None);
+                let mut n = new_device("board", Scope::User);
+                n.usage = "{unit.port}".into();
+                let e = f
+                    .store
+                    .tx(|tx| f.inv.create_resource(tx, &who, &n))
+                    .unwrap_err();
+                assert_eq!(e.code(), "unknown_placeholder");
+            }
+        }
+    }
+
+    mod update_resource {
+        use super::*;
+
+        fn seeded() -> (Fixture, Caller) {
+            let mut f = fixture();
+            let who = caller(None);
+            let mut n = new_device("board", Scope::User);
+            n.usage = "old {unit.path}".into();
+            f.store
+                .tx(|tx| f.inv.create_resource(tx, &who, &n))
+                .unwrap();
+            (f, who)
+        }
+
+        fn patch(
+            f: &mut Fixture,
+            who: &Caller,
+            p: ResourcePatch,
+        ) -> Result<Resource, InventoryError> {
+            f.store
+                .tx(|tx| f.inv.update_resource(tx, who, &rid("board"), p))
+        }
+
+        mod on_usage_patch {
+            use super::*;
+
+            #[test]
+            fn stores_a_template_valid_for_the_stored_type() {
+                let (mut f, who) = seeded();
+                let updated = patch(
+                    &mut f,
+                    &who,
+                    ResourcePatch {
+                        usage: Some("new {unit.path} {resource.id}".into()),
+                        ..ResourcePatch::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(updated.usage, "new {unit.path} {resource.id}");
+            }
+
+            #[test]
+            fn refuses_a_key_invalid_for_the_stored_type() {
+                let (mut f, who) = seeded();
+                let e = patch(
+                    &mut f,
+                    &who,
+                    ResourcePatch {
+                        usage: Some("{unit.port}".into()),
+                        ..ResourcePatch::default()
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(e.code(), "unknown_placeholder");
+            }
+
+            #[test]
+            fn keeps_the_old_usage_when_refused() {
+                let (mut f, who) = seeded();
+                let _ = patch(
+                    &mut f,
+                    &who,
+                    ResourcePatch {
+                        usage: Some(long_usage()),
+                        ..ResourcePatch::default()
+                    },
+                );
+                assert_eq!(get(&mut f, &who, "board").usage, "old {unit.path}");
+            }
+        }
+
+        mod on_description_patch_only {
+            use super::*;
+
+            #[test]
+            fn leaves_usage_unchanged() {
+                let (mut f, who) = seeded();
+                let updated = patch(
+                    &mut f,
+                    &who,
+                    ResourcePatch {
+                        description: Some("new".into()),
+                        ..ResourcePatch::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(updated.description, "new");
+                assert_eq!(updated.usage, "old {unit.path}");
+            }
+
+            #[test]
+            fn refuses_a_multiline_description() {
+                let (mut f, who) = seeded();
+                let e = patch(
+                    &mut f,
+                    &who,
+                    ResourcePatch {
+                        description: Some("a\r\nb".into()),
+                        ..ResourcePatch::default()
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(e.code(), "description_multiline");
+            }
+        }
+
+        mod on_any_text_change {
+            use super::*;
+
+            #[test]
+            fn records_an_audit_entry() {
+                let (mut f, who) = seeded();
+                patch(
+                    &mut f,
+                    &who,
+                    ResourcePatch {
+                        usage: Some("x".into()),
+                        ..ResourcePatch::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(f.audit_actions().last().unwrap(), "resource_updated");
+            }
+        }
+    }
+
+    mod add_unit {
+        use super::*;
+
+        fn base() -> (Fixture, Caller) {
+            let mut f = fixture();
+            let who = caller(None);
+            f.store
+                .tx(|tx| {
+                    f.inv
+                        .create_resource(tx, &who, &new_device("a", Scope::User))
+                })
+                .unwrap();
+            (f, who)
+        }
+
+        fn unit_with(description: &str) -> NewUnit {
+            NewUnit {
+                description: description.into(),
+                ..new_unit("u1", "/dev/ttyUSB0")
+            }
+        }
+
+        mod on_valid_description {
+            use super::*;
+
+            #[test]
+            fn stores_it() {
+                let (mut f, who) = base();
+                let created = f
+                    .store
+                    .tx(|tx| f.inv.add_unit(tx, &who, &rid("a"), &unit_with("left port")))
+                    .unwrap();
+                assert_eq!(created.value.description, "left port");
+                assert_eq!(get(&mut f, &who, "a").units[0].description, "left port");
+            }
+        }
+
+        mod on_too_long_or_multiline_description {
+            use super::*;
+
+            #[test]
+            fn returns_invalid_text_for_too_long() {
+                let (mut f, who) = base();
+                let e = f
+                    .store
+                    .tx(|tx| {
+                        f.inv
+                            .add_unit(tx, &who, &rid("a"), &unit_with(&long_description()))
+                    })
+                    .unwrap_err();
+                assert!(matches!(
+                    e,
+                    InventoryError::InvalidText(TextError::DescriptionTooLong { .. })
+                ));
+            }
+
+            #[test]
+            fn returns_invalid_text_for_multiline() {
+                let (mut f, who) = base();
+                let e = f
+                    .store
+                    .tx(|tx| f.inv.add_unit(tx, &who, &rid("a"), &unit_with("a\nb")))
+                    .unwrap_err();
+                assert!(matches!(
+                    e,
+                    InventoryError::InvalidText(TextError::DescriptionMultiline)
+                ));
+            }
+
+            #[test]
+            fn stores_nothing() {
+                let (mut f, who) = base();
+                let _ = f
+                    .store
+                    .tx(|tx| f.inv.add_unit(tx, &who, &rid("a"), &unit_with("a\nb")));
+                assert_eq!(get(&mut f, &who, "a").units.len(), 0);
+            }
+        }
+    }
+
+    mod update_unit {
+        use super::*;
+
+        fn seeded() -> (Fixture, Caller) {
+            let mut f = fixture();
+            let who = caller(None);
+            f.seed(&who, "a", Scope::User, "u1");
+            (f, who)
+        }
+
+        fn patch(
+            f: &mut Fixture,
+            who: &Caller,
+            description: &str,
+        ) -> Result<leclerk::inventory::Created<leclerk::model::Unit>, InventoryError> {
+            f.store.tx(|tx| {
+                f.inv.update_unit(
+                    tx,
+                    who,
+                    &rid("a"),
+                    &uid("u1"),
+                    UnitPatch {
+                        settings: None,
+                        description: Some(description.into()),
+                    },
+                )
+            })
+        }
+
+        mod on_valid_description {
+            use super::*;
+
+            #[test]
+            fn stores_it() {
+                let (mut f, who) = seeded();
+                let updated = patch(&mut f, &who, "moved").unwrap();
+                assert_eq!(updated.value.description, "moved");
+            }
+        }
+
+        mod on_too_long_or_multiline_description {
+            use super::*;
+
+            #[test]
+            fn returns_invalid_text() {
+                let (mut f, who) = seeded();
+                let e = patch(&mut f, &who, "a\nb").unwrap_err();
+                assert!(matches!(e, InventoryError::InvalidText(_)));
+            }
+
+            #[test]
+            fn returns_invalid_text_for_too_long() {
+                let (mut f, who) = seeded();
+                let e = patch(&mut f, &who, &long_description()).unwrap_err();
+                assert_eq!(e.code(), "description_too_long");
+            }
+
+            #[test]
+            fn keeps_the_old_description() {
+                let (mut f, who) = seeded();
+                patch(&mut f, &who, "kept").unwrap();
+                let _ = patch(&mut f, &who, "a\nb");
+                assert_eq!(get(&mut f, &who, "a").units[0].description, "kept");
+            }
+        }
+    }
+
+    /// A generic unit with a recognisable description.
+    fn described_unit(id: &str, key: &str, description: &str) -> NewUnit {
+        NewUnit {
+            description: description.into(),
+            ..generic_unit(id, key)
+        }
+    }
+
+    /// A generic resource with a recognisable description and usage.
+    fn described_resource(id: &str, scope: Scope, description: &str) -> NewResource {
+        NewResource {
+            description: description.into(),
+            usage: "secret usage".into(),
+            ..new_generic(id, scope)
+        }
+    }
+
+    impl Fixture {
+        /// Create a described generic resource and unit as a caller of `scope_path`.
+        fn seed_described(
+            &mut self,
+            scope_path: Option<&str>,
+            id: &str,
+            (resource_text, unit_text): (&str, &str),
+            key: &str,
+        ) -> Result<leclerk::inventory::Created<leclerk::model::Unit>, InventoryError> {
+            let who = caller(scope_path);
+            self.store.tx(|tx| {
+                self.inv.create_resource(
+                    tx,
+                    &who,
+                    &described_resource(id, scope_of(scope_path), resource_text),
+                )?;
+                self.inv
+                    .add_unit(tx, &who, &rid(id), &described_unit("u1", key, unit_text))
+            })
+        }
+    }
+
+    mod add_unit_duplicates {
+        use super::*;
+
+        mod on_match_in_same_scope {
+            use super::*;
+
+            fn refused() -> InventoryError {
+                let mut f = fixture();
+                f.seed_described(None, "first", ("first board", "first port"), "k")
+                    .unwrap();
+                f.seed_described(None, "second", ("second board", "second port"), "k")
+                    .unwrap_err()
+            }
+
+            #[test]
+            fn duplicate_in_scope_carries_the_existing_descriptions() {
+                assert!(matches!(
+                    refused(),
+                    InventoryError::DuplicateInScope {
+                        ref resource_description,
+                        ref unit_description,
+                        ..
+                    } if resource_description == "first board" && unit_description == "first port"
+                ));
+            }
+
+            #[test]
+            fn details_include_both_descriptions() {
+                let details = refused().details().unwrap();
+                assert_eq!(details["resource"], "first");
+                assert_eq!(details["unit"], "u1");
+                assert_eq!(details["resource_description"], "first board");
+                assert_eq!(details["unit_description"], "first port");
+            }
+        }
+
+        mod on_match_with_a_user_scope_unit {
+            use super::*;
+
+            #[test]
+            fn warns_with_resource_and_unit_description() {
+                let mut f = fixture();
+                f.seed_described(None, "shared", ("shared board", "shared port"), "k")
+                    .unwrap();
+                let created = f
+                    .seed_described(Some("/p/a"), "mine", ("my board", "my port"), "k")
+                    .unwrap();
+                assert_eq!(
+                    created.warnings,
+                    vec![Warning::DuplicateOfUserUnit {
+                        resource: rid("shared"),
+                        unit: uid("u1"),
+                        resource_description: "shared board".into(),
+                        unit_description: "shared port".into(),
+                    }]
+                );
+            }
+        }
+
+        mod on_match_with_own_project_unit_from_user_scope {
+            use super::*;
+
+            #[test]
+            fn warns_with_resource_and_unit_description() {
+                let mut f = fixture();
+                f.seed_described(Some("/p/a"), "mine", ("my board", "my port"), "k")
+                    .unwrap();
+                let who = caller(Some("/p/a"));
+                let created = f
+                    .store
+                    .tx(|tx| {
+                        f.inv.create_resource(
+                            tx,
+                            &who,
+                            &described_resource("board", Scope::User, "user board"),
+                        )?;
+                        f.inv
+                            .add_unit(tx, &who, &rid("board"), &described_unit("u1", "k", "x"))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    created.warnings,
+                    vec![Warning::DuplicateOfProjectUnit {
+                        resource: rid("mine"),
+                        unit: uid("u1"),
+                        resource_description: "my board".into(),
+                        unit_description: "my port".into(),
+                    }]
+                );
+            }
+        }
+
+        mod on_match_in_other_project {
+            use super::*;
+
+            fn warnings() -> String {
+                let mut f = fixture();
+                f.seed_described(Some("/p/b"), "theirs", ("their board", "their port"), "k")
+                    .unwrap();
+                let created = f
+                    .seed_described(Some("/p/a"), "mine", ("my board", "my port"), "k")
+                    .unwrap();
+                serde_json::to_string(&created.warnings).unwrap()
+            }
+
+            #[test]
+            fn carries_no_description_or_usage_fields() {
+                let json = warnings();
+                for leak in [
+                    "description",
+                    "usage",
+                    "their board",
+                    "their port",
+                    "secret usage",
+                ] {
+                    assert!(!json.contains(leak), "{leak} leaked in {json}");
+                }
+            }
+
+            #[test]
+            fn is_still_similar_in_other_project() {
+                assert!(warnings().contains("similar_in_other_project"));
+            }
+        }
+    }
+
+    mod list_promotions {
+        use super::*;
+
+        mod on_a_pending_promotion {
+            use super::*;
+
+            #[test]
+            fn carries_the_resources_description() {
+                let mut f = fixture();
+                f.seed_described(Some("/p/b"), "theirs", ("their board", "t"), "k")
+                    .unwrap();
+                f.seed_described(Some("/p/a"), "mine", ("my board", "m"), "k")
+                    .unwrap();
+                let list = f.pending();
+                assert_eq!(list[0].description, "their board");
+            }
+
+            #[test]
+            fn reads_the_current_description_at_list_time() {
+                let mut f = fixture();
+                f.seed_described(Some("/p/b"), "theirs", ("their board", "t"), "k")
+                    .unwrap();
+                f.seed_described(Some("/p/a"), "mine", ("my board", "m"), "k")
+                    .unwrap();
+                let b = caller(Some("/p/b"));
+                f.store
+                    .tx(|tx| {
+                        f.inv.update_resource(
+                            tx,
+                            &b,
+                            &rid("theirs"),
+                            ResourcePatch {
+                                description: Some("renamed".into()),
+                                ..ResourcePatch::default()
+                            },
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(f.pending()[0].description, "renamed");
+            }
+        }
+    }
+}
+
+mod store_migration_0010 {
+    use leclerk::store::migrations;
+    use rusqlite::Connection;
+
+    mod on_a_database_at_version_9_with_notes_data {
+        use super::*;
+
+        fn migrated() -> Connection {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            migrations().to_version(&mut conn, 9).unwrap();
+            conn.execute(
+                "INSERT INTO resources (id, scope_kind, type, description, notes, created_at) \
+                 VALUES ('board', 'user', 'generic', 'boards', 'resource notes', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO units (resource_row, id, settings, notes, created_at) \
+                 VALUES (1, 'u1', '{}', 'unit notes', 1)",
+                [],
+            )
+            .unwrap();
+            migrations().to_latest(&mut conn).unwrap();
+            conn
+        }
+
+        #[test]
+        fn resources_usage_holds_the_former_resources_notes() {
+            let conn = migrated();
+            let usage: String = conn
+                .query_row("SELECT usage FROM resources", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(usage, "resource notes");
+        }
+
+        #[test]
+        fn units_description_holds_the_former_units_notes() {
+            let conn = migrated();
+            let description: String = conn
+                .query_row("SELECT description FROM units", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(description, "unit notes");
+        }
+
+        #[test]
+        fn resources_description_is_untouched() {
+            let conn = migrated();
+            let description: String = conn
+                .query_row("SELECT description FROM resources", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(description, "boards");
+        }
+
+        #[test]
+        fn the_notes_columns_are_gone() {
+            let conn = migrated();
+            assert!(conn.prepare("SELECT notes FROM resources").is_err());
+            assert!(conn.prepare("SELECT notes FROM units").is_err());
         }
     }
 }

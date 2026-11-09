@@ -162,9 +162,9 @@ impl From<InventoryError> for ApiError {
             | InventoryError::DuplicateInScope { .. }
             | InventoryError::AmbiguousDuplicate { .. }
             | InventoryError::LinkConflict { .. } => ErrorKind::Conflict,
-            InventoryError::InvalidId(_) | InventoryError::InvalidSettings { .. } => {
-                ErrorKind::Invalid
-            }
+            InventoryError::InvalidId(_)
+            | InventoryError::InvalidSettings { .. }
+            | InventoryError::InvalidText(_) => ErrorKind::Invalid,
             InventoryError::Store(_) => ErrorKind::Internal,
         };
         Self::domain(kind, &e)

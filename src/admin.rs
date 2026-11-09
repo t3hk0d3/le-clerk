@@ -322,8 +322,9 @@ pub struct ExportResource {
     pub scope: Scope,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
-    pub notes: String,
+    /// Called `notes` in exports made before descriptions and usage existed.
+    #[serde(default, alias = "notes")]
+    pub usage: String,
     /// `null` means the type default.
     #[serde(default)]
     pub health: Option<HealthSpec>,
@@ -337,8 +338,9 @@ pub struct ExportResource {
 pub struct ExportUnit {
     pub id: UnitId,
     pub settings: UnitSettings,
-    #[serde(default)]
-    pub notes: String,
+    /// Called `notes` in exports made before descriptions existed.
+    #[serde(default, alias = "notes")]
+    pub description: String,
 }
 
 /// What an import did.
@@ -963,7 +965,7 @@ impl<'a> Admin<'a> {
                     ty: r.ty,
                     scope: r.scope,
                     description: r.description,
-                    notes: r.notes,
+                    usage: r.usage,
                     health: r.health,
                     units: r
                         .units
@@ -971,7 +973,7 @@ impl<'a> Admin<'a> {
                         .map(|u| ExportUnit {
                             id: u.id,
                             settings: u.settings,
-                            notes: u.notes,
+                            description: u.description,
                         })
                         .collect(),
                 })
@@ -1103,7 +1105,7 @@ impl<'a> Admin<'a> {
                     ty: r.ty,
                     scope: r.scope.clone(),
                     description: r.description.clone(),
-                    notes: r.notes.clone(),
+                    usage: r.usage.clone(),
                     health: r.health.clone(),
                 },
             )?;
@@ -1115,7 +1117,7 @@ impl<'a> Admin<'a> {
                     &NewUnit {
                         id: u.id.clone(),
                         settings: u.settings.clone(),
-                        notes: u.notes.clone(),
+                        description: u.description.clone(),
                     },
                 )?;
                 for w in added.warnings {

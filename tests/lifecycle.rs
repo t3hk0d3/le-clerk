@@ -110,7 +110,7 @@ impl Fixture {
                         ty: ResourceType::Generic,
                         scope: scope.clone(),
                         description: String::new(),
-                        notes: String::new(),
+                        usage: String::new(),
                         health: None,
                     },
                 )?;
@@ -124,7 +124,7 @@ impl Fixture {
                             settings: UnitSettings::Generic {
                                 identity_key: format!("{key}-{u}"),
                             },
-                            notes: String::new(),
+                            description: String::new(),
                         },
                     )?;
                 }

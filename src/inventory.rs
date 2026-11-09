@@ -16,8 +16,9 @@ use crate::clock::Clock;
 use crate::dedup::{self, DEFAULT_SYSFS, Identity, Match};
 use crate::error::ErrorCode;
 use crate::model::{
-    Caller, HealthSpec, IdError, InvalidSettings, LeaseId, ProjectKey, PromotionId, Resource,
-    ResourceId, ResourceType, Scope, Unit, UnitId, UnitSettings,
+    Caller, Description, HealthSpec, IdError, InvalidSettings, LeaseId, ProjectKey, PromotionId,
+    Resource, ResourceId, ResourceType, Scope, TextError, Unit, UnitId, UnitSettings,
+    UsageTemplate,
 };
 use crate::store::inventory::{
     self as sql, Candidate, LinkOrigin, NewResourceRow, NewUnitRow, ScopeFilter,
@@ -40,7 +41,8 @@ pub struct NewResource {
     pub ty: ResourceType,
     pub scope: Scope,
     pub description: String,
-    pub notes: String,
+    /// Usage template; checked against `ty`.
+    pub usage: String,
     /// `None` means the type default.
     pub health: Option<HealthSpec>,
 }
@@ -49,7 +51,8 @@ pub struct NewResource {
 #[derive(Debug, Clone, Default)]
 pub struct ResourcePatch {
     pub description: Option<String>,
-    pub notes: Option<String>,
+    /// Checked against the resource's type.
+    pub usage: Option<String>,
     /// `Some(None)` clears the spec back to the type default.
     pub health: Option<Option<HealthSpec>>,
 }
@@ -59,21 +62,21 @@ pub struct ResourcePatch {
 pub struct NewUnit {
     pub id: UnitId,
     pub settings: UnitSettings,
-    pub notes: String,
+    pub description: String,
 }
 
 /// Changes to a unit. `None` leaves a field alone.
 #[derive(Debug, Clone, Default)]
 pub struct UnitPatch {
     pub settings: Option<UnitSettings>,
-    pub notes: Option<String>,
+    pub description: Option<String>,
 }
 
 /// Something worth telling the caller about a successful change.
 ///
 /// `SimilarInOtherProject` deliberately carries only the other project's path
 /// and the promotion that lets the user share the thing: never its resource,
-/// unit, settings or notes.
+/// unit, settings, description or usage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Warning {
@@ -82,9 +85,19 @@ pub enum Warning {
     /// A new user resource is hidden, inside `project`, by a project resource.
     ShadowedByProject { id: ResourceId, project: ProjectKey },
     /// A project unit looks like a user-scope unit.
-    DuplicateOfUserUnit { resource: ResourceId, unit: UnitId },
+    DuplicateOfUserUnit {
+        resource: ResourceId,
+        unit: UnitId,
+        resource_description: String,
+        unit_description: String,
+    },
     /// A new user-scope unit looks like a unit of the caller's own project.
-    DuplicateOfProjectUnit { resource: ResourceId, unit: UnitId },
+    DuplicateOfProjectUnit {
+        resource: ResourceId,
+        unit: UnitId,
+        resource_description: String,
+        unit_description: String,
+    },
     /// A unit in another project looks like this one.
     SimilarInOtherProject {
         project: ProjectKey,
@@ -114,6 +127,9 @@ pub enum InventoryError {
     /// A field is invalid; `field` names it.
     #[error("invalid value for {field}")]
     InvalidSettings { field: &'static str },
+    /// A description or usage template breaks its rules.
+    #[error(transparent)]
+    InvalidText(#[from] TextError),
     /// The caller may not create in that scope.
     #[error("you may only create resources in user scope or your own project")]
     ScopeNotAllowed,
@@ -126,7 +142,12 @@ pub enum InventoryError {
     Busy,
     /// The unit duplicates one in the same scope.
     #[error("unit duplicates {unit} of {resource}")]
-    DuplicateInScope { resource: ResourceId, unit: UnitId },
+    DuplicateInScope {
+        resource: ResourceId,
+        unit: UnitId,
+        resource_description: String,
+        unit_description: String,
+    },
     /// The unit matches units that must stay apart: they are held by
     /// different holders, or an administrator declared them different
     /// things. Joining them would make one physical thing of them.
@@ -165,6 +186,7 @@ impl ErrorCode for InventoryError {
             InventoryError::NotFound => "not_found",
             InventoryError::AlreadyExists => "already_exists",
             InventoryError::InvalidSettings { .. } => "invalid_settings",
+            InventoryError::InvalidText(e) => e.code(),
             InventoryError::ScopeNotAllowed => "scope_not_allowed",
             InventoryError::Busy => "busy",
             InventoryError::DuplicateInScope { .. } => "duplicate_in_scope",
@@ -176,9 +198,18 @@ impl ErrorCode for InventoryError {
 
     fn details(&self) -> Option<serde_json::Value> {
         match self {
-            InventoryError::DuplicateInScope { resource, unit } => {
-                Some(json!({ "resource": resource, "unit": unit }))
-            }
+            InventoryError::DuplicateInScope {
+                resource,
+                unit,
+                resource_description,
+                unit_description,
+            } => Some(json!({
+                "resource": resource,
+                "unit": unit,
+                "resource_description": resource_description,
+                "unit_description": unit_description,
+            })),
+            InventoryError::InvalidText(e) => e.details(),
             InventoryError::AmbiguousDuplicate { units } => Some(json!({ "units": units })),
             InventoryError::LinkConflict { leases, .. } => Some(json!({ "leases": leases })),
             _ => None,
@@ -420,6 +451,8 @@ impl Inventory {
             return Err(InventoryError::DuplicateInScope {
                 resource: c.resource_id.clone(),
                 unit: c.unit_id.clone(),
+                resource_description: c.resource_description.clone(),
+                unit_description: c.unit_description.clone(),
             });
         }
         Ok(hits)
@@ -467,6 +500,8 @@ impl Inventory {
                 (Scope::Project(_), Scope::User) => Warning::DuplicateOfUserUnit {
                     resource: hit.resource_id.clone(),
                     unit: hit.unit_id.clone(),
+                    resource_description: hit.resource_description.clone(),
+                    unit_description: hit.unit_description.clone(),
                 },
                 (_, Scope::Project(other))
                     if scope == &Scope::User && who.project.as_ref() == Some(other) =>
@@ -474,6 +509,8 @@ impl Inventory {
                     Warning::DuplicateOfProjectUnit {
                         resource: hit.resource_id.clone(),
                         unit: hit.unit_id.clone(),
+                        resource_description: hit.resource_description.clone(),
+                        unit_description: hit.unit_description.clone(),
                     }
                 }
                 (_, Scope::Project(other)) => {
@@ -562,7 +599,8 @@ impl Inventory {
     /// # Errors
     /// [`InventoryError::ScopeNotAllowed`] for a project scope other than the
     /// caller's, [`InventoryError::InvalidSettings`] (field `health`) when the health
-    /// spec does not fit the type, [`InventoryError::AlreadyExists`] when the
+    /// spec does not fit the type, [`InventoryError::InvalidText`] for a bad
+    /// description or usage template, [`InventoryError::AlreadyExists`] when the
     /// id is taken in that scope.
     pub fn create_resource(
         &self,
@@ -581,6 +619,8 @@ impl Inventory {
                 .validate(new.ty)
                 .map_err(|_| InventoryError::InvalidSettings { field: "health" })?;
         }
+        Description::parse(&new.description)?;
+        UsageTemplate::parse(&new.usage, new.ty)?;
         if sql::find_in_scope(tx, &new.scope, &new.id)?.is_some() {
             return Err(InventoryError::AlreadyExists);
         }
@@ -591,7 +631,7 @@ impl Inventory {
                 ty: new.ty,
                 scope: &new.scope,
                 description: &new.description,
-                notes: &new.notes,
+                usage: &new.usage,
                 health: new.health.as_ref(),
                 created_at: self.clock.now_ms(),
             },
@@ -633,7 +673,9 @@ impl Inventory {
     ///
     /// # Errors
     /// [`InventoryError::NotFound`] when invisible;
-    /// [`InventoryError::InvalidSettings`] (field `health`) on a bad spec.
+    /// [`InventoryError::InvalidSettings`] (field `health`) on a bad spec;
+    /// [`InventoryError::InvalidText`] for a bad description, or a usage
+    /// template that breaks the rules of the resource's type.
     pub fn update_resource(
         &self,
         tx: &Tx,
@@ -651,9 +693,15 @@ impl Inventory {
             h.validate(current.ty)
                 .map_err(|_| InventoryError::InvalidSettings { field: "health" })?;
         }
+        if let Some(text) = &patch.description {
+            Description::parse(text)?;
+        }
+        if let Some(text) = &patch.usage {
+            UsageTemplate::parse(text, current.ty)?;
+        }
         let description = patch.description.unwrap_or(current.description);
-        let notes = patch.notes.unwrap_or(current.notes);
-        sql::update_resource(tx, row, &description, &notes, health.as_ref())?;
+        let usage = patch.usage.unwrap_or(current.usage);
+        sql::update_resource(tx, row, &description, &usage, health.as_ref())?;
         self.audit(
             tx,
             who,
@@ -723,7 +771,8 @@ impl Inventory {
     ///
     /// # Errors
     /// [`InventoryError::NotFound`], [`InventoryError::AlreadyExists`] for a
-    /// repeated unit id, [`InventoryError::InvalidSettings`] naming the field.
+    /// repeated unit id, [`InventoryError::InvalidSettings`] naming the field,
+    /// [`InventoryError::InvalidText`] for a bad description.
     pub fn add_unit(
         &self,
         tx: &Tx,
@@ -738,6 +787,7 @@ impl Inventory {
             .map_err(|e| InventoryError::InvalidSettings {
                 field: settings_field(&e),
             })?;
+        Description::parse(&new.description)?;
         if sql::find_unit(tx, row, &new.id)?.is_some() {
             return Err(InventoryError::AlreadyExists);
         }
@@ -750,7 +800,7 @@ impl Inventory {
                 resource_row: row,
                 id: &new.id,
                 settings: &new.settings,
-                notes: &new.notes,
+                description: &new.description,
                 created_at: self.clock.now_ms(),
             },
         )?;
@@ -771,6 +821,7 @@ impl Inventory {
     /// # Errors
     /// [`InventoryError::NotFound`] for an unknown resource or unit;
     /// [`InventoryError::InvalidSettings`] naming the field;
+    /// [`InventoryError::InvalidText`] for a bad description;
     /// [`InventoryError::Busy`] when the unit's identity group has a live
     /// lease and the new settings would split it (nothing is written).
     pub fn update_unit(
@@ -794,7 +845,10 @@ impl Inventory {
             .map_err(|e| InventoryError::InvalidSettings {
                 field: settings_field(&e),
             })?;
-        let notes = patch.notes.unwrap_or(existing.notes);
+        if let Some(text) = &patch.description {
+            Description::parse(text)?;
+        }
+        let description = patch.description.unwrap_or(existing.description);
         // Check before writing anything, so a rejected change leaves no trace.
         let recomputed = if changed {
             let identity = Identity::from_settings(&settings, &self.sysfs);
@@ -812,7 +866,7 @@ impl Inventory {
         } else {
             None
         };
-        sql::update_unit(tx, existing.row, &settings, &notes)?;
+        sql::update_unit(tx, existing.row, &settings, &description)?;
         let warnings = match recomputed {
             Some((identity, hits)) => {
                 sql::set_identity(tx, existing.row, &identity)?;
@@ -893,6 +947,8 @@ pub struct Promotion {
     pub id: PromotionId,
     /// The resource that would be promoted.
     pub resource: ResourceId,
+    /// The promoted resource's description, as it is now.
+    pub description: String,
     /// The project whose registration raised it, if any.
     pub requester: Option<ProjectKey>,
     pub reason: String,
@@ -945,6 +1001,7 @@ impl Promotions {
             .map(|p| Promotion {
                 id: p.id,
                 resource: p.resource_id,
+                description: p.resource_description,
                 requester: p.requester,
                 reason: p.reason,
                 created_at: p.created_at,

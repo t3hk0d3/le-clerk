@@ -31,7 +31,7 @@ pub struct ResourceView {
     pub ty: ResourceType,
     pub scope: Scope,
     pub description: String,
-    pub notes: String,
+    pub usage: String,
     /// `None` means the type default.
     pub health: Option<HealthSpec>,
     pub created_at: i64,
@@ -47,7 +47,7 @@ impl From<Resource> for ResourceView {
             ty: r.ty,
             scope: r.scope,
             description: r.description,
-            notes: r.notes,
+            usage: r.usage,
             health: r.health,
             created_at: r.created_at,
             shadows_user: r.shadows_user,
@@ -61,7 +61,7 @@ impl From<Resource> for ResourceView {
 pub struct UnitView {
     pub id: UnitId,
     pub settings: UnitSettings,
-    pub notes: String,
+    pub description: String,
     pub dirty: Option<DirtyInfo>,
     pub retiring: bool,
     pub last_health: Option<String>,
@@ -74,7 +74,7 @@ impl From<Unit> for UnitView {
         Self {
             id: u.id,
             settings: u.settings,
-            notes: u.notes,
+            description: u.description,
             dirty: u.dirty,
             retiring: u.retiring,
             last_health: u.last_health,
@@ -121,6 +121,7 @@ impl From<Created<Unit>> for CreatedUnit {
 pub struct PromotionView {
     pub id: PromotionId,
     pub resource: ResourceId,
+    pub description: String,
     pub requester: Option<ProjectKey>,
     pub reason: String,
     pub created_at: i64,
@@ -131,6 +132,7 @@ impl From<Promotion> for PromotionView {
         Self {
             id: p.id,
             resource: p.resource,
+            description: p.description,
             requester: p.requester,
             reason: p.reason,
             created_at: p.created_at,

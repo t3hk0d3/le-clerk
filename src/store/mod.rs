@@ -48,7 +48,10 @@ impl ErrorCode for StoreError {
     }
 }
 
-fn migrations() -> Migrations<'static> {
+/// The schema migrations, oldest first. Public so tests can stop at an
+/// earlier version.
+#[must_use]
+pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(include_str!("migrations/0001_init.sql")),
         M::up(include_str!("migrations/0002_link_origin.sql")),
@@ -59,6 +62,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0007_link_suppression.sql")),
         M::up(include_str!("migrations/0008_cleanup_ending.sql")),
         M::up(include_str!("migrations/0009_override_reason.sql")),
+        M::up(include_str!("migrations/0010_description_usage.sql")),
     ])
 }
 

@@ -9,6 +9,6 @@ pub use ids::{IdError, LeaseId, NoticeId, PromotionId, RequestId, ResourceId, Un
 pub use resource::{Resource, Unit};
 pub use text::{
     DESCRIPTION_MAX_CHARS, Description, RenderResource, RenderUnit, TextError, USAGE_MAX_BYTES,
-    UsageTemplate,
+    UsageTemplate, placeholder_keys,
 };
 pub use types::*;

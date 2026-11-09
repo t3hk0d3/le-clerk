@@ -148,7 +148,7 @@ impl Fixture {
                         ty: ResourceType::Generic,
                         scope: scope.clone(),
                         description: String::new(),
-                        notes: String::new(),
+                        usage: String::new(),
                         health: None,
                     },
                 )?;
@@ -160,7 +160,7 @@ impl Fixture {
                         &NewUnit {
                             id: uid(u),
                             settings: generic_settings(&format!("{key}-{u}")),
-                            notes: String::new(),
+                            description: String::new(),
                         },
                     )?;
                 }
@@ -1621,7 +1621,7 @@ mod health_backoff {
                         &uid("u1"),
                         UnitPatch {
                             settings: Some(generic_settings("board-u1-new")),
-                            notes: None,
+                            description: None,
                         },
                     )
                 })

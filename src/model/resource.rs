@@ -13,8 +13,8 @@ pub struct Unit {
     pub id: UnitId,
     /// Settings handed to the holder.
     pub settings: UnitSettings,
-    /// Free-form notes.
-    pub notes: String,
+    /// One-line description.
+    pub description: String,
     /// Set when the unit needs cleaning before reuse.
     pub dirty: Option<DirtyInfo>,
     /// Set when the unit is to be removed once its lease ends.
@@ -40,8 +40,8 @@ pub struct Resource {
     pub scope: Scope,
     /// Short description.
     pub description: String,
-    /// Free-form notes.
-    pub notes: String,
+    /// Usage template (Markdown with unit placeholders), as written.
+    pub usage: String,
     /// Health checks; `None` means the type default.
     pub health: Option<HealthSpec>,
     /// Creation time, unix milliseconds.

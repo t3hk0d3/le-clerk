@@ -646,19 +646,19 @@ mod server {
                     &h,
                     "update_resource",
                     &a,
-                    json!({"id": "board", "notes": "on desk", "health": null}),
+                    json!({"id": "board", "usage": "on desk", "health": null}),
                 )
                 .await;
-                assert_eq!(updated["notes"], "on desk");
+                assert_eq!(updated["usage"], "on desk");
                 assert_eq!(updated["health"], Value::Null);
                 let unit = result(
                     &h,
                     "update_unit",
                     &a,
-                    json!({"resource": "board", "unit": "u1", "notes": "blue"}),
+                    json!({"resource": "board", "unit": "u1", "description": "blue"}),
                 )
                 .await;
-                assert_eq!(unit["unit"]["notes"], "blue");
+                assert_eq!(unit["unit"]["description"], "blue");
                 result(
                     &h,
                     "add_unit",
@@ -1028,12 +1028,18 @@ mod api_error {
         }
 
         #[test]
-        fn duplicate_in_scope_carries_resource_and_unit() {
+        fn duplicate_in_scope_carries_resource_unit_and_descriptions() {
             let e = InventoryError::DuplicateInScope {
                 resource: ResourceId::parse("board").unwrap(),
                 unit: UnitId::parse("u1").unwrap(),
+                resource_description: "boards".into(),
+                unit_description: "left port".into(),
             };
-            assert_eq!(details(e), Some(json!({"resource": "board", "unit": "u1"})));
+            assert_eq!(
+                details(e),
+                Some(json!({"resource": "board", "unit": "u1",
+                            "resource_description": "boards", "unit_description": "left port"}))
+            );
         }
 
         #[test]
@@ -1076,7 +1082,8 @@ mod api_error {
             assert_eq!(body["error"]["code"], "duplicate_in_scope");
             assert_eq!(
                 body["error"]["details"],
-                json!({"resource": "board", "unit": "u1"})
+                json!({"resource": "board", "unit": "u1",
+                       "resource_description": "", "unit_description": ""})
             );
         }
     }
@@ -1303,6 +1310,264 @@ mod lease_rpc {
             .await;
             let mine = ok(&h, "list_my_leases", &user("a"), json!({})).await;
             assert_eq!(mine, json!({"leases": [], "requests": []}));
+        }
+    }
+}
+
+mod wire_text {
+    use super::*;
+
+    async fn board(h: &EngineHandle) -> Value {
+        ok(
+            h,
+            "create_resource",
+            &user("a"),
+            json!({"id": "board", "type": "device", "scope": "user",
+                   "description": "dev boards", "usage": "flash {unit.path}"}),
+        )
+        .await;
+        ok(
+            h,
+            "add_unit",
+            &user("a"),
+            json!({"resource": "board", "id": "u1",
+                   "settings": {"type": "device", "path": "/dev/ttyUSB0"},
+                   "description": "left port"}),
+        )
+        .await;
+        ok(h, "get_resource", &user("a"), json!({"id": "board"})).await
+    }
+
+    mod create_resource {
+        use super::*;
+
+        mod on_args_with_description_and_usage {
+            use super::*;
+
+            #[tokio::test]
+            async fn round_trips_into_get_resource() {
+                let (h, _clock) = spawn();
+                let got = board(&h).await;
+                assert_eq!(got["description"], "dev boards");
+                assert_eq!(got["usage"], "flash {unit.path}");
+            }
+        }
+
+        mod on_args_with_legacy_notes {
+            use super::*;
+
+            #[test]
+            fn is_rejected_as_an_unknown_field() {
+                let e = Command::parse(
+                    "create_resource",
+                    user("a"),
+                    json!({"id": "b", "type": "generic", "scope": "user", "notes": "x"}),
+                )
+                .unwrap_err();
+                assert_eq!(e.code, "invalid_request");
+            }
+        }
+
+        mod on_an_unknown_placeholder {
+            use super::*;
+
+            #[tokio::test]
+            async fn fails_with_unknown_placeholder_and_details() {
+                let (h, _clock) = spawn();
+                let e = rpc(
+                    &h,
+                    "create_resource",
+                    &user("a"),
+                    json!({"id": "b", "type": "device", "scope": "user",
+                           "usage": "{unit.pth}"}),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(e.code, "unknown_placeholder");
+                assert_eq!(e.details.unwrap()["placeholder"], "unit.pth");
+            }
+        }
+    }
+
+    mod update_resource {
+        use super::*;
+
+        mod on_args_with_description_and_usage {
+            use super::*;
+
+            #[tokio::test]
+            async fn round_trips_into_get_resource() {
+                let (h, _clock) = spawn();
+                board(&h).await;
+                ok(
+                    &h,
+                    "update_resource",
+                    &user("a"),
+                    json!({"id": "board", "description": "new", "usage": "use {unit.id}"}),
+                )
+                .await;
+                let got = ok(&h, "get_resource", &user("a"), json!({"id": "board"})).await;
+                assert_eq!(got["description"], "new");
+                assert_eq!(got["usage"], "use {unit.id}");
+            }
+        }
+
+        mod on_args_with_legacy_notes {
+            use super::*;
+
+            #[test]
+            fn is_rejected_as_an_unknown_field() {
+                let e = Command::parse(
+                    "update_resource",
+                    user("a"),
+                    json!({"id": "board", "notes": "x"}),
+                )
+                .unwrap_err();
+                assert_eq!(e.code, "invalid_request");
+            }
+        }
+    }
+
+    mod add_unit {
+        use super::*;
+
+        mod on_args_with_description {
+            use super::*;
+
+            #[tokio::test]
+            async fn round_trips_into_get_resource() {
+                let (h, _clock) = spawn();
+                let got = board(&h).await;
+                assert_eq!(got["units"][0]["description"], "left port");
+            }
+        }
+
+        mod on_args_with_legacy_notes {
+            use super::*;
+
+            #[test]
+            fn is_rejected_as_an_unknown_field() {
+                let e = Command::parse(
+                    "add_unit",
+                    user("a"),
+                    json!({"resource": "board", "id": "u1", "notes": "x",
+                           "settings": {"type": "generic", "identity_key": "k"}}),
+                )
+                .unwrap_err();
+                assert_eq!(e.code, "invalid_request");
+            }
+        }
+    }
+
+    mod update_unit {
+        use super::*;
+
+        mod on_args_with_description {
+            use super::*;
+
+            #[tokio::test]
+            async fn round_trips_into_get_resource() {
+                let (h, _clock) = spawn();
+                board(&h).await;
+                ok(
+                    &h,
+                    "update_unit",
+                    &user("a"),
+                    json!({"resource": "board", "unit": "u1", "description": "right port"}),
+                )
+                .await;
+                let got = ok(&h, "get_resource", &user("a"), json!({"id": "board"})).await;
+                assert_eq!(got["units"][0]["description"], "right port");
+            }
+        }
+
+        mod on_args_with_legacy_notes {
+            use super::*;
+
+            #[test]
+            fn is_rejected_as_an_unknown_field() {
+                let e = Command::parse(
+                    "update_unit",
+                    user("a"),
+                    json!({"resource": "board", "unit": "u1", "notes": "x"}),
+                )
+                .unwrap_err();
+                assert_eq!(e.code, "invalid_request");
+            }
+        }
+    }
+
+    mod resource_and_unit_views {
+        use super::*;
+
+        mod on_json {
+            use super::*;
+
+            #[tokio::test]
+            async fn expose_description_and_usage_and_no_notes() {
+                let (h, _clock) = spawn();
+                let got = board(&h).await;
+                assert!(got.get("notes").is_none(), "{got}");
+                assert!(got["units"][0].get("notes").is_none(), "{got}");
+                assert!(got.get("usage").is_some());
+                assert!(got["units"][0].get("description").is_some());
+            }
+        }
+    }
+
+    mod list_resources {
+        use super::*;
+
+        mod on_a_resource_with_text {
+            use super::*;
+
+            #[tokio::test]
+            async fn includes_descriptions_and_usage() {
+                let (h, _clock) = spawn();
+                board(&h).await;
+                let list = ok(&h, "list_resources", &user("a"), json!({})).await;
+                assert_eq!(list[0]["description"], "dev boards");
+                assert_eq!(list[0]["usage"], "flash {unit.path}");
+                assert_eq!(list[0]["units"][0]["description"], "left port");
+            }
+        }
+    }
+
+    mod list_promotions {
+        use super::*;
+
+        mod on_a_pending_promotion {
+            use super::*;
+
+            #[tokio::test]
+            async fn exposes_the_resources_description() {
+                let (h, _clock) = spawn();
+                let b = in_project("b", "/p/b");
+                let a = in_project("a", "/p/a");
+                for (who, project, id, text) in [
+                    (&b, "/p/b", "theirs", "their board"),
+                    (&a, "/p/a", "mine", "my board"),
+                ] {
+                    ok(
+                        &h,
+                        "create_resource",
+                        who,
+                        json!({"id": id, "type": "generic", "scope": {"project": project},
+                               "description": text}),
+                    )
+                    .await;
+                    ok(
+                        &h,
+                        "add_unit",
+                        who,
+                        json!({"resource": id, "id": "u1",
+                               "settings": {"type": "generic", "identity_key": "same"}}),
+                    )
+                    .await;
+                }
+                let promos = ok(&h, "list_promotions", &user("u"), json!({})).await;
+                assert_eq!(promos[0]["description"], "their board");
+            }
         }
     }
 }

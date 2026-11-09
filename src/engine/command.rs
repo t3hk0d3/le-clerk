@@ -82,7 +82,7 @@ pub struct CreateResourceArgs {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
-    pub notes: String,
+    pub usage: String,
     /// Absent means the type default.
     #[serde(default)]
     pub health: Option<HealthSpec>,
@@ -97,7 +97,7 @@ pub struct UpdateResourceArgs {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub notes: Option<String>,
+    pub usage: Option<String>,
     #[serde(default, deserialize_with = "present")]
     pub health: Option<Option<HealthSpec>>,
 }
@@ -125,7 +125,7 @@ pub struct AddUnitArgs {
     pub id: UnitId,
     pub settings: UnitSettings,
     #[serde(default)]
-    pub notes: String,
+    pub description: String,
 }
 
 /// `update_unit`. Absent fields are left alone.
@@ -137,7 +137,7 @@ pub struct UpdateUnitArgs {
     #[serde(default)]
     pub settings: Option<UnitSettings>,
     #[serde(default)]
-    pub notes: Option<String>,
+    pub description: Option<String>,
 }
 
 /// `remove_unit`, `retire_unit`.
@@ -407,7 +407,7 @@ macro_rules! commands {
 commands! {
     /// Create a resource.
     CreateResource(CreateResourceArgs) = "create_resource", read_only: false;
-    /// Change a resource's description, notes or health checks.
+    /// Change a resource's description, usage or health checks.
     UpdateResource(UpdateResourceArgs) = "update_resource", read_only: false;
     /// Delete a free resource.
     DeleteResource(ResourceArgs) = "delete_resource", read_only: false;
@@ -417,7 +417,7 @@ commands! {
     GetResource(ResourceArgs) = "get_resource", read_only: true;
     /// Add a unit.
     AddUnit(AddUnitArgs) = "add_unit", read_only: false;
-    /// Change a unit's settings or notes.
+    /// Change a unit's settings or description.
     UpdateUnit(UpdateUnitArgs) = "update_unit", read_only: false;
     /// Remove a free unit.
     RemoveUnit(UnitArgs) = "remove_unit", read_only: false;
@@ -543,7 +543,7 @@ impl Command {
                     ty: a.ty,
                     scope: a.scope,
                     description: a.description,
-                    notes: a.notes,
+                    usage: a.usage,
                     health: a.health,
                 };
                 encode(CreatedResource::from(inv.create_resource(tx, &who, &new)?))
@@ -551,7 +551,7 @@ impl Command {
             Self::UpdateResource(who, a) => {
                 let patch = ResourcePatch {
                     description: a.description,
-                    notes: a.notes,
+                    usage: a.usage,
                     health: a.health,
                 };
                 let updated = inv.update_resource(tx, &who, &a.id, patch)?;
@@ -576,7 +576,7 @@ impl Command {
                 let new = NewUnit {
                     id: a.id,
                     settings: a.settings,
-                    notes: a.notes,
+                    description: a.description,
                 };
                 encode(CreatedUnit::from(inv.add_unit(
                     tx,
@@ -588,7 +588,7 @@ impl Command {
             Self::UpdateUnit(who, a) => {
                 let patch = UnitPatch {
                     settings: a.settings,
-                    notes: a.notes,
+                    description: a.description,
                 };
                 let updated = inv.update_unit(tx, &who, &a.resource, &a.unit, patch)?;
                 sched.forget_health(&[updated.value.row]);

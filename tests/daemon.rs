@@ -1120,7 +1120,7 @@ mod restart_grace {
                         ty: ResourceType::Generic,
                         scope: Scope::User,
                         description: String::new(),
-                        notes: String::new(),
+                        usage: String::new(),
                         health: None,
                     },
                 )?;
@@ -1133,7 +1133,7 @@ mod restart_grace {
                         settings: UnitSettings::Generic {
                             identity_key: "key-u1".into(),
                         },
-                        notes: String::new(),
+                        description: String::new(),
                     },
                 )?;
                 Ok(())
