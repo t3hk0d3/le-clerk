@@ -8,10 +8,12 @@ use leclerk::config::Config;
 use leclerk::daemon::server as http;
 use leclerk::engine::{ApiError, Command, Engine, EngineHandle, EngineOptions, MAX_WAIT};
 use leclerk::health::HealthResult;
-use leclerk::model::{Caller, HealthSpec, HolderRef, ProjectKey, ResourceId, UnitId, UnitSettings};
+use leclerk::model::{
+    Caller, HealthSpec, HolderRef, LeaseId, ProjectKey, ResourceId, UnitId, UnitSettings,
+};
 use leclerk::scheduler::HealthProbe;
 use leclerk::store::Store;
-use leclerk::store::notices::{Notice, NoticeKind};
+use leclerk::store::notices::{Notice, NoticeFilter, NoticeKind};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -454,6 +456,158 @@ mod engine {
                 let out = ok(&h, "daemon_stop", &user("admin"), json!({})).await;
                 assert_eq!(out, json!({"stopping": true}));
                 tokio::time::timeout(PATIENCE, h.stopped()).await.unwrap();
+            }
+        }
+    }
+
+    mod wait_notices_matching {
+        use super::*;
+
+        /// User a holds units u1 and u2 and released both, so each lease has
+        /// a pending `CleanupWindowStarted`. Returns the two lease ids.
+        async fn two_released_leases(h: &EngineHandle) -> (String, String) {
+            seed_board(h, &["u1", "u2"]).await;
+            let mut ids = Vec::new();
+            for unit in ["u1", "u2"] {
+                let grant = ok(
+                    h,
+                    "acquire",
+                    &user("a"),
+                    json!({"target": {"resource": "board", "unit": unit},
+                           "duration_ms": 60_000, "purpose": "test"}),
+                )
+                .await;
+                let id = grant["lease_id"].as_str().unwrap().to_owned();
+                ok(h, "release", &user("a"), json!({"lease_id": id})).await;
+                ids.push(id);
+            }
+            (ids.remove(0), ids.remove(0))
+        }
+
+        fn only(lease: &str) -> NoticeFilter {
+            NoticeFilter {
+                leases: vec![LeaseId::parse(lease).unwrap()],
+                requests: Vec::new(),
+            }
+        }
+
+        mod on_filter {
+            use super::*;
+
+            #[tokio::test]
+            async fn delivers_only_matching_notices() {
+                let (h, _clock) = spawn();
+                let (first, _second) = two_released_leases(&h).await;
+                let got = h
+                    .wait_notices_matching(holder("a"), Some(only(&first)), Duration::ZERO)
+                    .await
+                    .unwrap();
+                assert_ne!(got, Vec::<Notice>::new());
+                assert!(
+                    got.iter()
+                        .all(|n| n.lease_id.as_ref().map(LeaseId::as_str) == Some(first.as_str())),
+                    "{got:?}"
+                );
+            }
+
+            #[tokio::test]
+            async fn leaves_other_notices_pending() {
+                let (h, _clock) = spawn();
+                let (first, second) = two_released_leases(&h).await;
+                h.wait_notices_matching(holder("a"), Some(only(&first)), Duration::ZERO)
+                    .await
+                    .unwrap();
+                let rest = h.wait_notices(holder("a"), Duration::ZERO).await.unwrap();
+                assert!(
+                    rest.iter()
+                        .any(|n| n.lease_id.as_ref().map(LeaseId::as_str) == Some(second.as_str())),
+                    "{rest:?}"
+                );
+                assert!(
+                    rest.iter()
+                        .all(|n| n.lease_id.as_ref().map(LeaseId::as_str) != Some(first.as_str())),
+                    "{rest:?}"
+                );
+            }
+        }
+
+        mod without_filter {
+            use super::*;
+
+            #[tokio::test]
+            async fn delivers_every_notice() {
+                let (h, _clock) = spawn();
+                let (first, second) = two_released_leases(&h).await;
+                let got = h
+                    .wait_notices_matching(holder("a"), None, Duration::ZERO)
+                    .await
+                    .unwrap();
+                for id in [&first, &second] {
+                    assert!(
+                        got.iter()
+                            .any(|n| n.lease_id.as_ref().map(LeaseId::as_str) == Some(id.as_str())),
+                        "{got:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    mod lease_holder {
+        use super::*;
+
+        fn agent(session: &str) -> Caller {
+            Caller {
+                holder: HolderRef::AgentSession {
+                    session_id: session.into(),
+                },
+                project: None,
+                override_reason: None,
+            }
+        }
+
+        mod on_live_user_lease {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_its_user_holder() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &user("a"), 60_000).await["lease_id"].clone();
+                let got = ok(&h, "lease_holder", &user("x"), json!({"lease_id": lease})).await;
+                assert_eq!(got, json!({"holder": {"kind": "user", "tag": "a"}}));
+            }
+        }
+
+        mod on_agent_lease {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_not_found() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &agent("s1"), 60_000).await["lease_id"].clone();
+                let err = rpc(&h, "lease_holder", &user("x"), json!({"lease_id": lease}))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, "not_found");
+            }
+        }
+
+        mod on_ended_lease {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_not_found() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &user("a"), 60_000).await["lease_id"].clone();
+                ok(&h, "release", &user("a"), json!({"lease_id": lease})).await;
+                ok(&h, "confirm", &user("a"), json!({"lease_id": lease})).await;
+                let err = rpc(&h, "lease_holder", &user("x"), json!({"lease_id": lease}))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, "not_found");
             }
         }
     }

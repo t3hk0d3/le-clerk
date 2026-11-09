@@ -14,11 +14,11 @@ use leclerk::config::{Config, Paths};
 use leclerk::health::HealthResult;
 use leclerk::inventory::{Inventory, NewResource, NewUnit};
 use leclerk::model::{
-    Caller, HealthSpec, HolderRef, LeaseId, Priority, ResourceId, ResourceType, Scope, UnitId,
-    UnitSettings,
+    Caller, HealthSpec, HolderRef, LeaseId, Priority, RequestId, ResourceId, ResourceType, Scope,
+    UnitId, UnitSettings,
 };
 use leclerk::scheduler::{AcquireOutcome, AcquireRequest, Confirm, HealthProbe, Scheduler, Target};
-use leclerk::store::notices::{Notice, NoticeKind};
+use leclerk::store::notices::{Notice, NoticeFilter, NoticeKind};
 use leclerk::store::{Store, StoreError, Tx, audit};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -950,6 +950,63 @@ mod daemon {
                     got.iter()
                         .any(|n| n.kind == NoticeKind::CleanupWindowStarted)
                 );
+            }
+
+            mod on_filter {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn leaves_other_notices_pending() {
+                    let h = Harness::new();
+                    let client = h.start().await;
+                    seed_board(&client).await;
+                    let grant = acquire(&client, &user("a"), 60_000).await;
+                    ok(
+                        &client,
+                        "release",
+                        &user("a"),
+                        json!({"lease_id": grant["lease_id"]}),
+                    )
+                    .await;
+                    let elsewhere = NoticeFilter {
+                        leases: vec![LeaseId::new()],
+                        requests: vec![RequestId::new()],
+                    };
+                    let filtered = client
+                        .wait_notices_matching(&holder("a"), Some(&elsewhere), 1)
+                        .await
+                        .unwrap();
+                    assert_eq!(filtered, Vec::<Notice>::new());
+                    let rest = client.wait_notices(&holder("a"), 5).await.unwrap();
+                    assert!(
+                        rest.iter()
+                            .any(|n| n.kind == NoticeKind::CleanupWindowStarted),
+                        "{rest:?}"
+                    );
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn delivers_matching_notices() {
+                    let h = Harness::new();
+                    let client = h.start().await;
+                    seed_board(&client).await;
+                    let grant = acquire(&client, &user("a"), 60_000).await;
+                    let id = grant["lease_id"].as_str().unwrap();
+                    ok(&client, "release", &user("a"), json!({"lease_id": id})).await;
+                    let ours = NoticeFilter {
+                        leases: vec![LeaseId::parse(id).unwrap()],
+                        requests: Vec::new(),
+                    };
+                    let got = client
+                        .wait_notices_matching(&holder("a"), Some(&ours), 5)
+                        .await
+                        .unwrap();
+                    assert!(
+                        got.iter()
+                            .any(|n| n.kind == NoticeKind::CleanupWindowStarted),
+                        "{got:?}"
+                    );
+                }
             }
         }
     }

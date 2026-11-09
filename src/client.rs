@@ -24,9 +24,9 @@ use tokio::net::UnixStream;
 
 use crate::config::Paths;
 use crate::error::ErrorCode;
-use crate::model::{Caller, HolderRef};
+use crate::model::{Caller, HolderRef, LeaseId, RequestId};
 use crate::scheduler::liveness;
-use crate::store::notices::Notice;
+use crate::store::notices::{Notice, NoticeFilter};
 
 /// How long `ensure_running` waits for a spawned daemon to answer.
 pub const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -475,9 +475,36 @@ impl Client {
         holder: &HolderRef,
         secs: u64,
     ) -> Result<Vec<Notice>, ApiError> {
+        self.wait_notices_matching(holder, None, secs).await
+    }
+
+    /// [`Client::wait_notices`], but with `filter` only the notices naming
+    /// one of its leases or requests are delivered (and waited for); the
+    /// holder's other notices stay pending.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub async fn wait_notices_matching(
+        &self,
+        holder: &HolderRef,
+        filter: Option<&NoticeFilter>,
+        secs: u64,
+    ) -> Result<Vec<Notice>, ApiError> {
         let holder = serde_json::to_string(holder)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
-        let query = serde_urlencoded::to_string([("holder", holder), ("wait", secs.to_string())])
+        let mut params = vec![("holder", holder), ("wait", secs.to_string())];
+        if let Some(f) = filter {
+            let join = |ids: Vec<&str>| ids.join(",");
+            params.push((
+                "leases",
+                join(f.leases.iter().map(LeaseId::as_str).collect()),
+            ));
+            params.push((
+                "requests",
+                join(f.requests.iter().map(RequestId::as_str).collect()),
+            ));
+        }
+        let query = serde_urlencoded::to_string(params)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let path = format!("/v1/notices?{query}");
         let wait = Duration::from_secs(secs).min(crate::engine::MAX_WAIT);

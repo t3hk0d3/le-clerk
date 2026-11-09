@@ -462,6 +462,8 @@ commands! {
     GetLease(LeaseArgs) = "get_lease", read_only: true;
     /// The caller's live leases and queued requests.
     ListMyLeases(NoArgs) = "list_my_leases", read_only: true;
+    /// The `User` holder of a live lease (anything else is `not_found`).
+    LeaseHolder(LeaseArgs) = "lease_holder", read_only: true;
     /// Confirm cleanup (or a yield).
     Confirm(ConfirmArgs) = "confirm", read_only: false;
     /// Use the one cleanup extension.
@@ -669,6 +671,9 @@ impl Command {
             }
             Self::GetLease(who, a) => {
                 encode(LeaseView::from(sched.get_lease(tx, &who, &a.lease_id)?))
+            }
+            Self::LeaseHolder(_, a) => {
+                encode(json!({ "holder": sched.user_holder(tx, &a.lease_id)? }))
             }
             Self::ListMyLeases(who, NoArgs {}) => {
                 encode(MyLeasesView::from(sched.my_leases(tx, &who)?))

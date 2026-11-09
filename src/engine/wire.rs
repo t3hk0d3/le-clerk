@@ -210,6 +210,9 @@ pub struct LeaseView {
     pub paused_remaining_ms: Option<u64>,
     /// Once ended: why.
     pub end_cause: Option<EndCause>,
+    /// The queued request the lease was offered for; `null` for a direct
+    /// grant.
+    pub request_id: Option<RequestId>,
 }
 
 /// The caller's live leases and queued requests (`list_my_leases`).
@@ -254,6 +257,7 @@ impl From<Lease> for LeaseView {
             yield_deadline: l.yield_deadline,
             paused_remaining_ms: l.paused_remaining.map(millis),
             end_cause: l.end_cause,
+            request_id: l.request_id,
         }
     }
 }

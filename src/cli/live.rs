@@ -123,11 +123,22 @@ pub enum Phase {
     Held { lease: String },
 }
 
-/// One long-poll for `holder`'s notices, owning what it needs so it can
-/// outlive a loop iteration (dropping it would lose the notices it took).
-fn poll(client: &Client, holder: &HolderRef) -> PollFuture {
+/// One long-poll for `holder`'s notices about what `phase` names, owning
+/// what it needs so it can outlive a loop iteration (dropping it would lose
+/// the notices it took). The holder's other notices stay pending: an agent
+/// session reads them itself.
+fn poll(client: &Client, holder: &HolderRef, phase: &Phase) -> PollFuture {
+    let filter = match phase {
+        Phase::Queued { request } => lease::filter(&[], &[request]),
+        Phase::Offered { request, lease } => lease::filter(&[lease], &[request]),
+        Phase::Held { lease } => lease::filter(&[lease], &[]),
+    };
     let (client, holder) = (client.clone(), holder.clone());
-    Box::pin(async move { client.wait_notices(&holder, lease::POLL_SECS).await })
+    Box::pin(async move {
+        client
+            .wait_notices_matching(&holder, Some(&filter), lease::POLL_SECS)
+            .await
+    })
 }
 
 type PollFuture = Pin<Box<dyn Future<Output = Result<Vec<Notice>, ApiError>>>>;
@@ -210,7 +221,12 @@ impl View<'_> {
     async fn session(&self) -> anyhow::Result<()> {
         let mut keys = keys();
         let mut typing = true;
-        let mut notices = poll(self.client, &self.caller.holder);
+        if let Phase::Offered { lease, .. } = self.phase()
+            && self.claim(&lease, &mut keys).await?
+        {
+            return Ok(());
+        }
+        let mut notices = poll(self.client, &self.caller.holder, &self.phase());
         loop {
             tokio::select! {
                 key = keys.recv(), if typing => match key {
@@ -224,12 +240,14 @@ impl View<'_> {
                     None => typing = false,
                 },
                 batch = &mut notices => {
-                    notices = poll(self.client, &self.caller.holder);
                     for n in batch? {
                         if self.on_notice(&n, &mut keys).await? {
                             return Ok(());
                         }
                     }
+                    // After the batch: an offer claimed in it moves the
+                    // view on to the lease.
+                    notices = poll(self.client, &self.caller.holder, &self.phase());
                 }
             }
         }

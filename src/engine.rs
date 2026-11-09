@@ -35,7 +35,7 @@ use crate::error::ErrorCode;
 use crate::inventory::{Inventory, InventoryError, PromotionError, Promotions};
 use crate::model::HolderRef;
 use crate::scheduler::{HealthProbe, Scheduler, SchedulerError, liveness};
-use crate::store::notices::{self, Notice};
+use crate::store::notices::{self, Notice, NoticeFilter};
 use crate::store::{Store, StoreError};
 
 pub use command::*;
@@ -240,8 +240,9 @@ type Reply<T> = oneshot::Sender<Result<T, ApiError>>;
 enum Job {
     /// An RPC command.
     Command(Box<Command>, Reply<Value>),
-    /// Deliver up to [`NOTICE_BATCH`] pending notices of a holder.
-    TakeNotices(HolderRef, Reply<Vec<Notice>>),
+    /// Deliver up to [`NOTICE_BATCH`] pending notices of a holder (with a
+    /// filter, only those it matches).
+    TakeNotices(HolderRef, Option<NoticeFilter>, Reply<Vec<Notice>>),
 }
 
 /// The canonical key of a holder: its JSON encoding, as stored with its
@@ -389,6 +390,21 @@ impl EngineHandle {
         holder: HolderRef,
         timeout: Duration,
     ) -> Result<Vec<Notice>, ApiError> {
+        self.wait_notices_matching(holder, None, timeout).await
+    }
+
+    /// [`EngineHandle::wait_notices`], but with `filter` only the notices
+    /// it matches are delivered (and waited for); the holder's others stay
+    /// pending.
+    ///
+    /// # Errors
+    /// As [`EngineHandle::wait_notices`].
+    pub async fn wait_notices_matching(
+        &self,
+        holder: HolderRef,
+        filter: Option<NoticeFilter>,
+        timeout: Duration,
+    ) -> Result<Vec<Notice>, ApiError> {
         let deadline = tokio::time::Instant::now() + timeout.min(MAX_WAIT);
         // Registered before the first take, so a notice published between
         // the take and the wait is never missed.
@@ -397,7 +413,7 @@ impl EngineHandle {
             let notified = registration.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let got = self.take(holder.clone()).await?;
+            let got = self.take(holder.clone(), filter.clone()).await?;
             if !got.is_empty() || tokio::time::Instant::now() >= deadline {
                 return Ok(got);
             }
@@ -423,10 +439,14 @@ impl EngineHandle {
         let _ = stopped.wait_for(|s| *s).await;
     }
 
-    async fn take(&self, holder: HolderRef) -> Result<Vec<Notice>, ApiError> {
+    async fn take(
+        &self,
+        holder: HolderRef,
+        filter: Option<NoticeFilter>,
+    ) -> Result<Vec<Notice>, ApiError> {
         let (reply, answer) = oneshot::channel();
         self.jobs
-            .send(Job::TakeNotices(holder, reply))
+            .send(Job::TakeNotices(holder, filter, reply))
             .map_err(|_| ApiError::unavailable())?;
         answer.await.map_err(|_| ApiError::unavailable())?
     }
@@ -589,12 +609,12 @@ impl Engine {
                     self.maintain();
                 }
             }
-            Job::TakeNotices(holder, reply) => {
+            Job::TakeNotices(holder, filter, reply) => {
                 let result = self.guarded("take_notices", |engine| {
                     let now = engine.clock.now_ms();
-                    Ok(engine
-                        .store
-                        .tx(|tx| notices::take(tx, &holder, NOTICE_BATCH, now))?)
+                    Ok(engine.store.tx(|tx| {
+                        notices::take_matching(tx, &holder, filter.as_ref(), NOTICE_BATCH, now)
+                    })?)
                 });
                 let _ = reply.send(result);
             }

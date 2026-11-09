@@ -22,8 +22,8 @@ use std::time::Duration;
 use clap::{Args, ValueEnum};
 use leclerk::client::{ApiError, Client};
 use leclerk::clock::{Clock, SystemClock};
-use leclerk::model::{Caller, HolderRef, UnitSettings};
-use leclerk::store::notices::{Notice, NoticeKind};
+use leclerk::model::{Caller, HolderRef, LeaseId, RequestId, UnitSettings};
+use leclerk::store::notices::{Notice, NoticeFilter, NoticeKind};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::signal::unix::{SignalKind, signal};
@@ -225,7 +225,7 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
     }
     let request = id(&outcome, "request_id")?;
     note(&outcome_text(&outcome));
-    let lease = await_offer(&client, &caller, &request).await?;
+    let lease = await_offer(ctx, &client, &caller, &request).await?;
     ctx.out.emit(&View::new(lease, granted_text))
 }
 
@@ -243,9 +243,25 @@ pub async fn attach(ctx: &Ctx, lease: String) -> anyhow::Result<()> {
     }
     let _raw = RawMode::enable()?;
     let screen = Screen::new(ctx.out.mode());
-    screen.say(&view, &granted_text(&view));
-    screen.hint_held();
-    live::run(&client, &caller, &screen, Phase::Held { lease }).await
+    // An offer waiting to be claimed: claim it, and Ctrl+C withdraws it.
+    let offered_for = view["request_id"]
+        .as_str()
+        .filter(|_| view["state"] == "offered");
+    let phase = if let Some(request) = offered_for {
+        screen.say(
+            &view,
+            &format!("Offered: lease {lease} is yours to take; claiming it…"),
+        );
+        Phase::Offered {
+            request: request.to_owned(),
+            lease,
+        }
+    } else {
+        screen.say(&view, &granted_text(&view));
+        screen.hint_held();
+        Phase::Held { lease }
+    };
+    live::run(&client, &caller, &screen, phase).await
 }
 
 pub async fn release(ctx: &Ctx, lease: String) -> anyhow::Result<()> {
@@ -290,7 +306,7 @@ pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
         Some("granted") => outcome,
         Some("queued") => {
             note(&outcome_text(&outcome));
-            await_offer(&client, &caller, &id(&outcome, "request_id")?).await?
+            await_offer(ctx, &client, &caller, &id(&outcome, "request_id")?).await?
         }
         _ => anyhow::bail!("the daemon answered the acquire with {outcome}"),
     };
@@ -391,14 +407,24 @@ pub fn dropped(n: &Notice) -> ApiError {
     }
 }
 
-/// Wait for `request`'s offer and claim it; returns the held lease. Other
-/// notices are shown on stderr. SIGINT or SIGTERM cancels the request.
-async fn await_offer(client: &Client, caller: &Caller, request: &str) -> anyhow::Result<Value> {
+/// Wait for `request`'s offer and claim it; returns the held lease. Only
+/// notices about the request are taken (the holder's others stay pending);
+/// those that are not the offer are shown on stderr. SIGINT, SIGTERM or
+/// SIGHUP cancels the request, and so does a failed wait, so a detached
+/// holder never leaves a request queued behind it.
+async fn await_offer(
+    ctx: &Ctx,
+    client: &Client,
+    caller: &Caller,
+    request: &str,
+) -> anyhow::Result<Value> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    let only_ours = filter(&[], &[request]);
     loop {
-        let batch = tokio::select! {
-            batch = client.wait_notices(&caller.holder, POLL_SECS) => batch?,
+        let waited = tokio::select! {
+            batch = client.wait_notices_matching(&caller.holder, Some(&only_ours), POLL_SECS) => batch,
             _ = interrupt.recv() => {
                 cancel(client, caller, request).await?;
                 return Err(Exit(EXIT_INTERRUPTED).into());
@@ -407,23 +433,83 @@ async fn await_offer(client: &Client, caller: &Caller, request: &str) -> anyhow:
                 cancel(client, caller, request).await?;
                 return Err(Exit(128 + 15).into());
             }
+            _ = hangup.recv() => {
+                cancel(client, caller, request).await?;
+                return Err(Exit(128 + 1).into());
+            }
         };
+        let batch = match waited {
+            Ok(batch) => batch,
+            Err(e) => {
+                cancel_after_failure(ctx, caller, request).await;
+                return Err(e.into());
+            }
+        };
+        // The whole batch is shown; the last word on the request decides.
+        let mut offer = None;
+        let mut gone = None;
         for n in &batch {
-            let ours = n.request_id.as_ref().is_some_and(|r| r.as_str() == request);
-            match (ours, n.kind, &n.lease_id) {
-                (true, NoticeKind::Offered, Some(lease)) => {
-                    return Ok(claim(client, caller, lease.as_str()).await?);
+            match (n.kind, &n.lease_id) {
+                (NoticeKind::Offered, Some(lease)) => {
+                    offer = Some(lease.as_str().to_owned());
+                    gone = None;
                 }
-                (true, NoticeKind::QueueDropped, _) => return Err(dropped(n).into()),
+                (NoticeKind::QueueDropped, _) => {
+                    note(&notice_text(n));
+                    gone = Some(dropped(n));
+                    offer = None;
+                }
                 _ => note(&notice_text(n)),
             }
+        }
+        if let Some(e) = gone {
+            return Err(e.into());
+        }
+        if let Some(lease) = offer {
+            return Ok(claim(client, caller, &lease).await?);
         }
     }
 }
 
+/// Cancel `request` after its wait failed, through a fresh connection (the
+/// daemon is started again if it went away). Best effort: the original
+/// failure is what the command reports.
+async fn cancel_after_failure(ctx: &Ctx, caller: &Caller, request: &str) {
+    let cancelled = match ctx.client().await {
+        Ok(client) => cancel(&client, caller, request)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    match cancelled {
+        Ok(()) => note(&format!(
+            "Request {request} is cancelled, as waiting for it failed."
+        )),
+        Err(e) => note(&format!(
+            "Request {request} may still be queued; cancelling it failed ({e})."
+        )),
+    }
+}
+
+/// A notice filter naming `leases` and `requests` (ids that do not parse
+/// are left out; they come from the daemon, so there are none).
+pub fn filter(leases: &[&str], requests: &[&str]) -> NoticeFilter {
+    NoticeFilter {
+        leases: leases
+            .iter()
+            .filter_map(|l| LeaseId::parse(l).ok())
+            .collect(),
+        requests: requests
+            .iter()
+            .filter_map(|r| RequestId::parse(r).ok())
+            .collect(),
+    }
+}
+
 /// Run `command` while holding `lease`, then give the lease back: cleanup
-/// confirmed on exit 0, else ended at once with the unit dirty. SIGINT and
-/// SIGTERM go on to the command; an override, an expiry or an
+/// confirmed on exit 0, else ended at once with the unit dirty. SIGTERM
+/// goes on to the command, and SIGINT too unless the terminal already
+/// delivered it (Ctrl+C); an override, an expiry or an
 /// administrator's release sends it SIGTERM at the lease's deadline.
 /// Returns the command's exit code (128 + signal when killed).
 async fn supervise(
@@ -467,7 +553,9 @@ async fn supervise(
     };
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
-    let mut notices = Box::pin(client.wait_notices(&caller.holder, POLL_SECS));
+    let only_ours = filter(&[&lease_id], &[]);
+    let wait = || client.wait_notices_matching(&caller.holder, Some(&only_ours), POLL_SECS);
+    let mut notices = Box::pin(wait());
     let mut stop_at: Option<Instant> = None;
     let mut stopped = false;
     let status = loop {
@@ -484,18 +572,16 @@ async fn supervise(
                     Ok(batch) => {
                         for n in &batch {
                             note(&notice_text(n));
-                            if n.lease_id.as_ref().is_some_and(|l| l.as_str() == lease_id)
-                                && let Some(at) = stop_time(n)
-                            {
+                            if let Some(at) = stop_time(n) {
                                 stop_at = Some(stop_at.map_or(at, |s| s.min(at)));
                             }
                         }
-                        notices = Box::pin(client.wait_notices(&caller.holder, POLL_SECS));
+                        notices = Box::pin(wait());
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "cannot read notices; retrying");
                         tokio::time::sleep(POLL_RETRY).await;
-                        notices = Box::pin(client.wait_notices(&caller.holder, POLL_SECS));
+                        notices = Box::pin(wait());
                     }
                 }
             }
@@ -504,7 +590,12 @@ async fn supervise(
                 send(libc::SIGTERM);
                 stopped = true;
             }
-            _ = interrupt.recv() => send(libc::SIGINT),
+            // A Ctrl+C on the terminal already reached the command, which
+            // shares our foreground process group; pass on only the rest.
+            _ = interrupt.recv() => if !terminal_delivers_sigint() {
+                note("Passing SIGINT on to the command.");
+                send(libc::SIGINT);
+            },
             _ = terminate.recv() => send(libc::SIGTERM),
         }
     };
@@ -526,6 +617,14 @@ async fn supervise(
         tracing::debug!(error = %e, "lease not given back");
     }
     Ok(code)
+}
+
+/// True when stdin is a terminal whose foreground process group is ours: a
+/// SIGINT then came from Ctrl+C, which the terminal sent to the whole group,
+/// the command included.
+fn terminal_delivers_sigint() -> bool {
+    // SAFETY: tcgetpgrp(2) and getpgrp(2) only read process state.
+    std::io::stdin().is_terminal() && unsafe { libc::tcgetpgrp(0) == libc::getpgrp() }
 }
 
 /// When a notice about the running command's lease means the command must
@@ -602,7 +701,8 @@ async fn user_holders(client: &Client, caller: &Caller) -> anyhow::Result<Vec<Ho
 }
 
 /// Who acts on `lease`: an agent session acts as itself (the daemon checks
-/// it holds the lease); the user acts as the lease's `User` holder.
+/// it holds the lease); the user acts as the lease's `User` holder, which
+/// the daemon names for live user leases only.
 ///
 /// # Errors
 /// `not_found` when the user has no live lease of that id.
@@ -611,21 +711,16 @@ async fn lease_caller(ctx: &Ctx, client: &Client, lease: &str) -> anyhow::Result
     if caller::is_agent(&caller) {
         return Ok(caller);
     }
-    let status = client
-        .call("status", &caller, json!({ "view": "all" }))
-        .await?;
-    let holder = status["resources"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|r| r["units"].as_array().into_iter().flatten())
-        .map(|u| &u["occupancy"])
-        .find(|o| o["lease_id"] == lease)
-        .and_then(|o| serde_json::from_value::<HolderRef>(o["holder"].clone()).ok());
-    match holder {
-        Some(holder @ HolderRef::User { .. }) => Ok(Caller { holder, ..caller }),
-        _ => Err(no_live_lease(lease).into()),
-    }
+    let answer = match client
+        .call("lease_holder", &caller, json!({ "lease_id": lease }))
+        .await
+    {
+        Ok(answer) => answer,
+        Err(e) if e.code == "not_found" => return Err(no_live_lease(lease).into()),
+        Err(e) => return Err(e.into()),
+    };
+    let holder: HolderRef = serde_json::from_value(answer["holder"].clone())?;
+    Ok(Caller { holder, ..caller })
 }
 
 fn no_live_lease(lease: &str) -> ApiError {

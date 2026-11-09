@@ -303,6 +303,20 @@ fn detached_lease(env: &Env) -> String {
 
 const ACQUIRE: &str = "\"$CLERK\" acquire board --for 10m";
 
+/// A user request for the board, made without a terminal while the unit
+/// is held (exit 6).
+fn queue_detached(env: &Env) {
+    let out = env
+        .env
+        .cmd()
+        .env_remove(SESSION_VAR)
+        .args(["acquire", "board", "--for", "10m"])
+        .timeout(PATIENCE)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6), "{out:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Behaviour
 // ---------------------------------------------------------------------------
@@ -461,8 +475,69 @@ mod cli {
         }
     }
 
+    mod run {
+        use super::*;
+
+        mod on_ctrl_c {
+            use super::*;
+
+            #[test]
+            fn cmd_gets_one_sigint() {
+                let env = Env::new();
+                seed(&env);
+                let file = env.home().join("ints");
+                let file_text = file.to_string_lossy().into_owned();
+                let mut tty = Tty::spawn_with(
+                    &env,
+                    "\"$CLERK\" run board --for 10m -- sh -c 'trap \"echo INT >> \\\"$F\\\"\" INT; \
+                     echo started; i=0; while [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done'",
+                    &[("F", &file_text)],
+                );
+                tty.expect("started");
+                tty.send(CTRL_C);
+                let (code, shown) = tty.finish();
+                assert_eq!(code, 0, "{shown}");
+                let ints = fs::read_to_string(&file).unwrap_or_default();
+                assert_eq!(ints.lines().count(), 1, "{ints:?}\n{shown}");
+                // Near-simultaneous SIGINTs can merge into one trap run, so
+                // the count alone cannot see a forwarded copy; clerk says
+                // when it forwards one.
+                assert!(!shown.contains("Passing SIGINT on"), "{shown}");
+            }
+        }
+    }
+
     mod attach {
         use super::*;
+
+        mod on_offered_lease {
+            use super::*;
+
+            #[test]
+            fn ctrl_c_cancels_the_request_withdrawing_the_offer() {
+                let env = Env::new();
+                seed(&env);
+                let theirs = hold(&env, "x");
+                queue_detached(&env);
+                free(&env, "x", &theirs);
+                let occupancy = unit_status(&env)["occupancy"].clone();
+                assert_eq!(occupancy["state"], "offered", "{occupancy}");
+                let offer = occupancy["lease_id"].as_str().unwrap().to_owned();
+                let mut tty = Tty::spawn_with(
+                    &env,
+                    &format!("\"$CLERK\" attach {offer}"),
+                    &[("CLERK_TEST_CLAIM_DELAY_MS", "60000")],
+                );
+                tty.expect("claiming");
+                tty.send(CTRL_C);
+                let (code, shown) = tty.finish();
+                assert_eq!(code, 130, "{shown}");
+                let cancelled = &audit(&env, "request_cancelled")[0]["detail"];
+                assert_eq!(cancelled["offer"], offer.as_str(), "{shown}");
+                assert_eq!(ending(&env, &offer)["cause"], "unclaimed");
+                assert_eq!(audit(&env, "offer_declined"), Vec::<Value>::new());
+            }
+        }
 
         mod on_tty {
             use super::*;

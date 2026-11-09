@@ -1827,10 +1827,42 @@ mod cli {
         body["lease_id"].as_str().unwrap().to_owned()
     }
 
+    /// A background clerk in a process group of its own. Dropping it kills
+    /// the group, so the commands `clerk run` started go too, even when an
+    /// assertion fails first.
+    struct Bg(std::process::Child);
+
+    impl std::ops::Deref for Bg {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for Bg {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl Drop for Bg {
+        fn drop(&mut self) {
+            if let Ok(pid) = libc::pid_t::try_from(self.0.id()) {
+                // SAFETY: kill(2) on the process group this test created.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            let _ = self.0.wait();
+        }
+    }
+
     /// clerk `args` in the background as the user (or agent `session`):
     /// stdin a pipe that stays open, stdout and stderr piped.
-    fn spawn(env: &Env, args: &[&str], session: Option<&str>) -> std::process::Child {
+    fn spawn(env: &Env, args: &[&str], session: Option<&str>) -> Bg {
+        use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"));
+        cmd.process_group(0);
         cmd.args(args)
             .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
             .env("CLERK_HOME", env.home())
@@ -1841,7 +1873,7 @@ mod cli {
         if let Some(session) = session {
             cmd.env(SESSION_VAR, session);
         }
-        cmd.spawn().unwrap()
+        Bg(cmd.spawn().unwrap())
     }
 
     /// The lines `child` prints on stdout, as they come.
@@ -1878,6 +1910,71 @@ mod cli {
     fn now_ms() -> i64 {
         use leclerk::clock::Clock;
         leclerk::clock::SystemClock.now_ms()
+    }
+
+    /// Board unit `u2` keyed `k2`, beside [`seed`]'s `u1`.
+    fn add_u2(env: &Env) {
+        env.ok(&["unit", "add", "board", "u2", "--key", "k2"]);
+    }
+
+    /// Agent `session` (in `dir`) acquires board/u2; returns the lease id.
+    fn agent_holds_u2(env: &Env, session: &str, dir: &Path) -> String {
+        lease_of(&json_of(
+            env.agent(session, dir)
+                .args(["acquire", "board/u2", "--for", "10m"]),
+        ))
+    }
+
+    /// True when agent `session`'s pending notices name `lease`.
+    fn session_has_notice_for(env: &Env, session: &str, dir: &Path, lease: &str) -> bool {
+        let body = json_of(env.agent(session, dir).args(["wait", "--once"]));
+        body.as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["lease_id"] == lease)
+    }
+
+    /// A lent user lease: an interruptible lease `paused` that yielded to a
+    /// higher-priority user lease `borrower`, both made by the user's CLI.
+    /// Returns (paused, borrower).
+    fn lent(env: &Env) -> (String, String) {
+        seed(env, "board", "k1");
+        let paused = lease_of(&env.ok(&["acquire", "board", "--for", "10m", "--interruptible"]));
+        let owner: HolderRef =
+            serde_json::from_value(unit_status(env)["occupancy"]["holder"].clone()).unwrap();
+        let owner = Caller {
+            holder: owner,
+            project: None,
+            override_reason: None,
+        };
+        let mut borrower = spawn(
+            env,
+            &[
+                "acquire",
+                "board",
+                "--for",
+                "5m",
+                "--priority",
+                "high",
+                "--wait",
+            ],
+            None,
+        );
+        let deadline = Instant::now() + PATIENCE;
+        while env
+            .rpc(
+                "confirm",
+                &owner,
+                json!({"lease_id": paused, "how": "yielded"}),
+            )
+            .is_err()
+        {
+            assert!(Instant::now() < deadline, "never asked to yield");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(code_of(&mut borrower), 0);
+        let body: Value = serde_json::from_str(&stdout_of(&mut borrower)).unwrap();
+        (paused, lease_of(&body))
     }
 
     mod acquire {
@@ -1923,6 +2020,61 @@ mod cli {
 
         mod on_wait_flag {
             use super::*;
+
+            mod on_agent_session_with_another_lease {
+                use super::*;
+
+                #[test]
+                fn leaves_that_leases_notices_for_the_session() {
+                    let env = Env::new();
+                    seed(&env, "board", "k1");
+                    add_u2(&env);
+                    let dir = env.dir("alpha");
+                    let other = agent_holds_u2(&env, "sess-1", &dir);
+                    let theirs = lease_of(
+                        &env.rpc(
+                            "acquire",
+                            &user("x"),
+                            json!({"target": {"resource": "board", "unit": "u1"},
+                                   "duration_ms": 600_000, "purpose": "theirs"}),
+                        )
+                        .unwrap(),
+                    );
+                    let mut child = spawn(
+                        &env,
+                        &["acquire", "board/u1", "--for", "10m", "--wait"],
+                        Some("sess-1"),
+                    );
+                    std::thread::sleep(Duration::from_millis(300));
+                    json_of(env.agent("sess-1", &dir).args(["release", &other]));
+                    std::thread::sleep(Duration::from_millis(500));
+                    free(&env, "x", &theirs);
+                    assert_eq!(code_of(&mut child), 0);
+                    assert!(session_has_notice_for(&env, "sess-1", &dir, &other));
+                }
+            }
+
+            mod on_daemon_stopped_mid_wait {
+                use super::*;
+
+                #[test]
+                fn cancels_the_request() {
+                    let env = Env::new();
+                    seed(&env, "board", "k1");
+                    hold(&env, "x");
+                    let mut child =
+                        spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
+                    let deadline = Instant::now() + PATIENCE;
+                    while env.ok(&["queue", "board"])[0]["queue"] == json!([]) {
+                        assert!(Instant::now() < deadline, "never queued");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                    env.cmd().args(["daemon", "stop"]).assert().success();
+                    assert_eq!(code_of(&mut child), 5);
+                    assert_eq!(env.ok(&["queue", "board"])[0]["queue"], json!([]));
+                }
+            }
 
             #[test]
             fn blocks_until_granted_then_prints_and_exits_0() {
@@ -2038,6 +2190,19 @@ mod cli {
     mod attach {
         use super::*;
 
+        mod on_lent_lease {
+            use super::*;
+
+            #[test]
+            fn prints_its_brief() {
+                let env = Env::new();
+                let (paused, _) = lent(&env);
+                let body = env.ok(&["attach", &paused]);
+                assert_eq!(lease_of(&body), paused);
+                assert_eq!(body["state"], "paused");
+            }
+        }
+
         #[test]
         fn prints_the_brief_from_get_lease() {
             let env = Env::new();
@@ -2101,6 +2266,18 @@ mod cli {
     mod release {
         use super::*;
 
+        mod on_lent_lease {
+            use super::*;
+
+            #[test]
+            fn ends_it() {
+                let env = Env::new();
+                let (paused, _) = lent(&env);
+                let body = env.ok(&["release", &paused]);
+                assert_eq!(body["state"], "ended", "{body}");
+            }
+        }
+
         #[test]
         fn starts_cleanup_and_confirms_clean() {
             let env = Env::new();
@@ -2118,6 +2295,22 @@ mod cli {
 
     mod extend {
         use super::*;
+
+        mod on_borrowers_lease {
+            use super::*;
+
+            #[test]
+            fn moves_its_end() {
+                let env = Env::new();
+                let (_, borrower) = lent(&env);
+                let before = now_ms();
+                let body = env.ok(&["extend", &borrower, "--for", "1h"]);
+                assert!(
+                    body["ends_at"].as_i64().unwrap() >= before + 3_600_000,
+                    "{body}"
+                );
+            }
+        }
 
         #[test]
         fn new_end_is_now_plus_duration() {
@@ -2162,6 +2355,35 @@ mod cli {
 
     mod run {
         use super::*;
+
+        mod on_agent_session_with_another_lease {
+            use super::*;
+
+            #[test]
+            fn leaves_that_leases_notices_for_the_session() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                add_u2(&env);
+                let dir = env.dir("alpha");
+                let other = agent_holds_u2(&env, "sess-1", &dir);
+                env.agent("sess-1", &dir)
+                    .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
+                    .env("OTHER", &other)
+                    .args([
+                        "run",
+                        "board/u1",
+                        "--for",
+                        "10m",
+                        "--",
+                        "sh",
+                        "-c",
+                        "\"$CLERK\" release \"$OTHER\" >/dev/null && sleep 1",
+                    ])
+                    .assert()
+                    .code(0);
+                assert!(session_has_notice_for(&env, "sess-1", &dir, &other));
+            }
+        }
 
         mod on_cmd {
             use super::*;
@@ -2378,6 +2600,10 @@ mod cli {
                 assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
                 assert_eq!(out.recv_timeout(PATIENCE).unwrap(), "interrupted");
                 assert_eq!(code_of(&mut child), 9);
+                let mut stderr = String::new();
+                std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr)
+                    .unwrap();
+                assert!(stderr.contains("Passing SIGINT on"), "{stderr}");
             }
         }
     }

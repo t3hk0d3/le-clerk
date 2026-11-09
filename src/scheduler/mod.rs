@@ -220,6 +220,9 @@ pub struct Lease {
     pub paused_remaining: Option<Duration>,
     /// Once ended: why.
     pub end_cause: Option<EndCause>,
+    /// The queued request the lease was offered for; `None` for a direct
+    /// grant.
+    pub request_id: Option<RequestId>,
 }
 
 /// A queued request as seen by its holder.
@@ -1022,6 +1025,7 @@ impl Scheduler {
             yield_deadline: lease.yield_deadline,
             paused_remaining: lease.paused_remaining_ms.map(from_millis),
             end_cause: lease.end_cause,
+            request_id: lease.request_id,
         })
     }
 
@@ -1036,6 +1040,21 @@ impl Scheduler {
             return Err(SchedulerError::NotFound);
         }
         Self::lease_view(tx, lease)
+    }
+
+    /// The holder of live lease `id`, only when it is a `User` holder: the
+    /// user's CLI acts as that holder on leases it made. Any other holder
+    /// is not disclosed.
+    ///
+    /// # Errors
+    /// [`SchedulerError::NotFound`] for an unknown or ended lease, or one
+    /// held by anything but a `User` holder.
+    pub fn user_holder(&self, tx: &Tx, id: &LeaseId) -> Result<HolderRef, SchedulerError> {
+        let lease = leases::find_lease(tx, id)?.ok_or(SchedulerError::NotFound)?;
+        match lease.holder {
+            holder @ HolderRef::User { .. } if lease.state != LeaseState::Ended => Ok(holder),
+            _ => Err(SchedulerError::NotFound),
+        }
     }
 
     /// The caller's live leases (oldest first) and queued requests (in

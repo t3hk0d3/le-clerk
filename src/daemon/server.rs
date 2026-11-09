@@ -5,7 +5,9 @@
 //!   `200 {"result": ...}` or an error status with
 //!   `{"error": {"code": "...", "message": "..."}}`
 //! - `GET /v1/notices?holder=<url-encoded HolderRef JSON>&wait=<secs, max 60>`
-//!   → `200 {"result": [Notice, ...]}` (the long-poll)
+//!   → `200 {"result": [Notice, ...]}` (the long-poll). Optional
+//!   `leases=<id,id…>` and `requests=<id,id…>` narrow it to notices naming
+//!   one of those; the holder's other notices stay pending.
 //!
 //! Status mapping: 404 not found or unknown method, 409 conflict/refused,
 //! 422 invalid request or argument, 500 internal, 503 engine stopped.
@@ -24,6 +26,7 @@ use serde_json::{Value, json};
 
 use crate::engine::{ApiError, Command, EngineHandle, ErrorKind, MAX_WAIT};
 use crate::model::{Caller, HolderRef};
+use crate::store::notices::NoticeFilter;
 
 /// What `GET /v1/version` reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +129,36 @@ struct NoticesQuery {
     /// Seconds to wait; capped at 60.
     #[serde(default)]
     wait: u64,
+    /// Comma-separated lease ids: with `requests`, the filter.
+    #[serde(default)]
+    leases: Option<String>,
+    /// Comma-separated request ids: with `leases`, the filter.
+    #[serde(default)]
+    requests: Option<String>,
+}
+
+/// Comma-separated ids; empty entries are skipped.
+fn ids<T: serde::de::DeserializeOwned>(list: Option<&str>) -> Result<Vec<T>, ApiError> {
+    list.into_iter()
+        .flat_map(|l| l.split(','))
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            serde_json::from_value(Value::String(id.to_owned()))
+                .map_err(|e| ApiError::invalid_request(format!("bad id {id:?}: {e}")))
+        })
+        .collect()
+}
+
+/// The filter a notices query asks for; `None` without `leases` and
+/// `requests`.
+fn filter_of(query: &NoticesQuery) -> Result<Option<NoticeFilter>, ApiError> {
+    if query.leases.is_none() && query.requests.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(NoticeFilter {
+        leases: ids(query.leases.as_deref())?,
+        requests: ids(query.requests.as_deref())?,
+    }))
 }
 
 async fn notices(
@@ -143,8 +176,12 @@ async fn notices(
                 .into_response();
         }
     };
+    let filter = match filter_of(&query) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
     let wait = Duration::from_secs(query.wait).min(MAX_WAIT);
-    match engine.wait_notices(holder, wait).await {
+    match engine.wait_notices_matching(holder, filter, wait).await {
         Ok(list) => ok(list),
         Err(e) => e.into_response(),
     }

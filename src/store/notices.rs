@@ -143,13 +143,48 @@ pub fn take(
     limit: u32,
     now_ms: i64,
 ) -> Result<Vec<Notice>, StoreError> {
+    take_matching(tx, holder, None, limit, now_ms)
+}
+
+/// Which of a holder's notices a wait is about: those naming one of these
+/// leases or requests. Used by a CLI command that acts for an agent
+/// session, so the session's other notices stay pending for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticeFilter {
+    pub leases: Vec<LeaseId>,
+    pub requests: Vec<RequestId>,
+}
+
+impl NoticeFilter {
+    /// True when `n` names one of the filter's leases or requests.
+    #[must_use]
+    pub fn matches(&self, n: &Notice) -> bool {
+        n.lease_id.as_ref().is_some_and(|l| self.leases.contains(l))
+            || n.request_id
+                .as_ref()
+                .is_some_and(|r| self.requests.contains(r))
+    }
+}
+
+/// [`take`], but with `filter` only the notices it matches are taken (up to
+/// `limit`, oldest first); the others stay pending.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure or a damaged row.
+pub fn take_matching(
+    tx: &Tx,
+    holder: &HolderRef,
+    filter: Option<&NoticeFilter>,
+    limit: u32,
+    now_ms: i64,
+) -> Result<Vec<Notice>, StoreError> {
     let holder = serde_json::to_string(holder)?;
     let rows = {
         let mut stmt = tx.conn().prepare(
             "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
-             ORDER BY created_at, row_id LIMIT ?2",
+             ORDER BY created_at, row_id",
         )?;
-        stmt.query_map(rusqlite::params![holder, limit], |r| {
+        stmt.query_map(rusqlite::params![holder], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?
@@ -157,12 +192,20 @@ pub fn take(
     let mut mark = tx
         .conn()
         .prepare("UPDATE notices SET delivered_at = ?2 WHERE row_id = ?1")?;
-    rows.iter()
-        .map(|(row, payload)| {
-            mark.execute(rusqlite::params![row, now_ms])?;
-            serde_json::from_str(payload).map_err(StoreError::from)
-        })
-        .collect()
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut taken = Vec::new();
+    for (row, payload) in rows {
+        if taken.len() >= limit {
+            break;
+        }
+        let notice: Notice = serde_json::from_str(&payload)?;
+        if filter.is_some_and(|f| !f.matches(&notice)) {
+            continue;
+        }
+        mark.execute(rusqlite::params![row, now_ms])?;
+        taken.push(notice);
+    }
+    Ok(taken)
 }
 
 /// The highest notice row written so far; 0 when there are none. Rows only
