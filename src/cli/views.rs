@@ -2,7 +2,8 @@
 //! `log`, `promotions`) and `approve`.
 //!
 //! The user's CLI sees every scope (view `all`); an agent session sees only
-//! user scope and its own project (view `caller`).
+//! user scope and its own project (view `caller`). `log` and `promotions`
+//! cover every project, so agents need `--override "<reason>"` for them.
 
 use std::fmt::Write as _;
 
@@ -162,6 +163,8 @@ pub async fn queue(ctx: &Ctx, resource: &str) -> anyhow::Result<()> {
 
 pub async fn log(ctx: &Ctx, args: LogArgs) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Interactive)?;
+    // The log covers every project; an agent must not read it unasked.
+    gate::require_override("read the audit log, which covers every project", &caller)?;
     let now = SystemClock.now_ms();
     let since = args
         .since
@@ -216,6 +219,8 @@ pub async fn log(ctx: &Ctx, args: LogArgs) -> anyhow::Result<()> {
 
 pub async fn promotions(ctx: &Ctx) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Interactive)?;
+    // Promotions name other projects' resources and paths.
+    gate::require_override("list promotions, which cover every project", &caller)?;
     let result = ctx
         .client()
         .await?

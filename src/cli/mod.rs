@@ -129,7 +129,10 @@ impl Ctx {
 
 /// Parse the command line, run the command and return its exit code.
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return parse_failure(&e),
+    };
     let out = Output::new(Mode::detect(cli.json));
     if let Command::Daemon { action: None } = cli.command {
         // The daemon logs to its own file.
@@ -143,6 +146,25 @@ pub fn run() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => out.fail(Failure::from(e)),
     }
+}
+
+/// A command line clap refused. Help and version text print as clap prints
+/// them; a real usage error is a JSON error in JSON mode, exit 2 either way.
+fn parse_failure(e: &clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    let json_flag = std::env::args_os().any(|a| a == "--json");
+    let shows_text = matches!(
+        e.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    if shows_text || Mode::detect(json_flag) == Mode::Human {
+        e.exit();
+    }
+    let rendered = e.render().to_string();
+    let message = rendered.trim().trim_start_matches("error: ").to_owned();
+    Output::new(Mode::Json).fail(UsageError(message))
 }
 
 fn run_daemon() -> anyhow::Result<()> {

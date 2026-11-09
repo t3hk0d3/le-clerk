@@ -225,6 +225,34 @@ fn restore(home: &Path) {
     fs::set_permissions(home, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Project resources in alpha (`sess-a`) and beta (`sess-b`), each with
+/// one unit `u`. Returns the two project directories.
+fn two_projects(env: &Env, alpha_id: &str, beta_id: &str) -> (PathBuf, PathBuf) {
+    let (a, b) = (env.dir("alpha"), env.dir("beta"));
+    for (session, dir, id, key) in [
+        ("sess-a", &a, alpha_id, "k-a"),
+        ("sess-b", &b, beta_id, "k-b"),
+    ] {
+        json_of(env.agent(session, dir).args([
+            "resource", "create", id, "--type", "generic", "--scope", "project",
+        ]));
+        json_of(
+            env.agent(session, dir)
+                .args(["unit", "add", id, "u", "--key", key]),
+        );
+    }
+    (a, b)
+}
+
+/// The values of `key` in a JSON array, as strings.
+fn strings(list: &Value, key: &str) -> Vec<String> {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item[key].as_str().unwrap().to_owned())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Behaviour
 // ---------------------------------------------------------------------------
@@ -291,6 +319,63 @@ mod cli {
                 assert_eq!(body["error"]["code"], "daemon_unavailable");
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 assert!(stderr.contains("cannot start the clerk daemon"), "{stderr}");
+            }
+        }
+    }
+
+    mod usage_errors {
+        use super::*;
+
+        mod on_unknown_flag_without_a_tty {
+            use super::*;
+
+            #[test]
+            fn prints_a_json_error_and_exits_2() {
+                let env = Env::new();
+                let error = error_of(env.cmd().args(["status", "--bogus"]), 2);
+                assert_eq!(error["code"], "usage_error");
+                assert!(
+                    error["message"].as_str().unwrap().contains("--bogus"),
+                    "{error}"
+                );
+            }
+        }
+
+        mod on_missing_value_with_json_flag_on_a_tty {
+            use super::*;
+
+            #[test]
+            fn prints_a_json_error() {
+                let env = Env::new();
+                let shown = env.tty("\"$CLERK\" --json log --action; echo \"exit=$?\"");
+                let (json_text, exit) = shown.trim().rsplit_once('\n').unwrap();
+                let body: Value = serde_json::from_str(json_text.trim()).unwrap();
+                assert_eq!(body["error"]["code"], "usage_error");
+                assert_eq!(exit, "exit=2");
+            }
+        }
+
+        mod on_unknown_flag_on_a_tty {
+            use super::*;
+
+            #[test]
+            fn prints_clap_text() {
+                let env = Env::new();
+                let shown = env.tty("\"$CLERK\" status --bogus");
+                assert!(shown.contains("unexpected argument '--bogus'"), "{shown}");
+                assert!(serde_json::from_str::<Value>(shown.trim()).is_err());
+            }
+        }
+
+        mod on_help {
+            use super::*;
+
+            #[test]
+            fn prints_help_text_even_without_a_tty() {
+                let env = Env::new();
+                let out = env.cmd().args(["status", "--help"]).output().unwrap();
+                assert_eq!(out.status.code(), Some(0), "{out:?}");
+                assert!(String::from_utf8_lossy(&out.stdout).contains("Usage: clerk status"));
             }
         }
     }
@@ -1309,6 +1394,18 @@ mod cli {
             let shown = env.tty("\"$CLERK\" resources --tag esp32");
             assert!(shown.contains("esp32, thread"), "{shown}");
         }
+
+        mod on_agent_session {
+            use super::*;
+
+            #[test]
+            fn omits_other_projects_resources() {
+                let env = Env::new();
+                let (_, b) = two_projects(&env, "a-board", "b-board");
+                let body = json_of(env.agent("sess-b", &b).arg("resources"));
+                assert_eq!(strings(&body, "id"), ["b-board"]);
+            }
+        }
     }
 
     mod views {
@@ -1414,6 +1511,20 @@ mod cli {
             }
         }
 
+        mod on_agent_session {
+            use super::*;
+
+            #[test]
+            fn omits_other_projects_leases() {
+                let env = Env::new();
+                let (a, b) = two_projects(&env, "a-board", "b-board");
+                acquire(&env, &agent_caller("sess-a", &a), "a-board");
+                acquire(&env, &agent_caller("sess-b", &b), "b-board");
+                let body = json_of(env.agent("sess-b", &b).arg("leases"));
+                assert_eq!(strings(&body, "resource"), ["b-board"]);
+            }
+        }
+
         mod on_mine_without_session_id {
             use super::*;
 
@@ -1444,6 +1555,32 @@ mod cli {
                 body[0]["queue"][0]["holder"],
                 json!({"kind": "user", "tag": "second"})
             );
+        }
+
+        mod on_agent_session {
+            use super::*;
+
+            #[test]
+            fn shows_only_its_own_projects_resource_of_that_id() {
+                let env = Env::new();
+                let (a, b) = two_projects(&env, "board", "board");
+                for (session, dir) in [("sess-a", &a), ("sess-b", &b)] {
+                    acquire(&env, &agent_caller(session, dir), "board");
+                    acquire(&env, &agent_caller(&format!("{session}-2"), dir), "board");
+                }
+                let body = json_of(env.agent("sess-b", &b).args(["queue", "board"]));
+                let scopes: Vec<&Value> = body
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|q| &q["scope"])
+                    .collect();
+                assert_eq!(scopes, [&json!({"project": canonical(&b)})]);
+                assert_eq!(
+                    body[0]["queue"][0]["holder"],
+                    json!({"kind": "agent_session", "session_id": "sess-b-2"})
+                );
+            }
         }
 
         mod on_unknown_resource {
@@ -1484,6 +1621,43 @@ mod cli {
             let later = (at + 60_000).to_string();
             assert_eq!(env.ok(&["log", "--since", &later]), json!([]));
         }
+
+        mod on_agent_session_without_override {
+            use super::*;
+
+            #[test]
+            fn exits_4_and_prints_nothing_from_other_projects() {
+                let env = Env::new();
+                promotion(&env);
+                let gamma = env.dir("gamma");
+                let out = env.agent("sess-c", &gamma).arg("log").output().unwrap();
+                assert_eq!(out.status.code(), Some(4), "{out:?}");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(!stdout.contains("a-board"), "{stdout}");
+                assert!(!stdout.contains("alpha"), "{stdout}");
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(body["error"]["code"], "override_required");
+            }
+        }
+
+        mod on_agent_session_with_override {
+            use super::*;
+
+            #[test]
+            fn lists_the_log() {
+                let env = Env::new();
+                promotion(&env);
+                let gamma = env.dir("gamma");
+                let body = json_of(env.agent("sess-c", &gamma).args([
+                    "log",
+                    "--action",
+                    "resource_created",
+                    "--override",
+                    "the user asked for the log",
+                ]));
+                assert_eq!(body.as_array().unwrap().len(), 2, "{body}");
+            }
+        }
     }
 
     /// Two projects registering the same key: beta's unit raises a
@@ -1513,6 +1687,45 @@ mod cli {
             promotion(&env);
             let body = env.ok(&["promotions"]);
             assert_eq!(body[0]["resource"], "a-board");
+        }
+
+        mod on_agent_session_without_override {
+            use super::*;
+
+            #[test]
+            fn exits_4_and_prints_nothing_from_other_projects() {
+                let env = Env::new();
+                promotion(&env);
+                let gamma = env.dir("gamma");
+                let out = env
+                    .agent("sess-c", &gamma)
+                    .arg("promotions")
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.code(), Some(4), "{out:?}");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(!stdout.contains("a-board"), "{stdout}");
+                assert!(!stdout.contains("beta"), "{stdout}");
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(body["error"]["code"], "override_required");
+            }
+        }
+
+        mod on_agent_session_with_override {
+            use super::*;
+
+            #[test]
+            fn lists_pending_promotions() {
+                let env = Env::new();
+                promotion(&env);
+                let gamma = env.dir("gamma");
+                let body = json_of(env.agent("sess-c", &gamma).args([
+                    "promotions",
+                    "--override",
+                    "the user asked what to approve",
+                ]));
+                assert_eq!(body[0]["resource"], "a-board");
+            }
         }
     }
 

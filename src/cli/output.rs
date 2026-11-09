@@ -206,7 +206,8 @@ fn exit_for(code: &str) -> u8 {
         | "settings_type_mismatch"
         | "settings_empty_field"
         | "settings_zero_port"
-        | "extend_not_later" => EXIT_USAGE,
+        | "extend_not_later"
+        | "no_such_directory" => EXIT_USAGE,
         "internal_error" | "database_error" | "corrupt_database" | "migration_error"
         | "io_error" | "json_error" | "bad_response" => EXIT_INTERNAL,
         // Conflicts and refusals: busy, already_held, no_units, ...
@@ -368,11 +369,81 @@ mod tests {
 
     #[test]
     fn exit_codes_follow_the_constraints() {
-        assert_eq!(exit_for("not_found"), 3);
-        assert_eq!(exit_for("no_units"), 4);
-        assert_eq!(exit_for("duplicate_in_scope"), 4);
-        assert_eq!(exit_for("daemon_unresponsive"), 5);
-        assert_eq!(exit_for("version_mismatch"), 5);
-        assert_eq!(exit_for("unknown_placeholder"), 2);
+        // Every error code the daemon and client produce, by class.
+        let classes: [(u8, &[&str]); 5] = [
+            (3, &["not_found", "unknown_method"]),
+            (
+                5,
+                &[
+                    "daemon_unavailable",
+                    "daemon_unresponsive",
+                    "version_mismatch",
+                    "engine_unavailable",
+                ],
+            ),
+            (
+                2,
+                &[
+                    "invalid_request",
+                    "invalid_argument",
+                    "invalid_id",
+                    "invalid_settings",
+                    "invalid_tag",
+                    "too_many_tags",
+                    "conflicting_tag_edit",
+                    "description_multiline",
+                    "description_too_long",
+                    "usage_too_long",
+                    "unknown_placeholder",
+                    "health_empty",
+                    "health_blank_command",
+                    "health_check_not_allowed",
+                    "settings_type_mismatch",
+                    "settings_empty_field",
+                    "settings_zero_port",
+                    "extend_not_later",
+                    "no_such_directory",
+                ],
+            ),
+            (
+                1,
+                &[
+                    "internal_error",
+                    "database_error",
+                    "corrupt_database",
+                    "migration_error",
+                    "io_error",
+                    "json_error",
+                    "bad_response",
+                ],
+            ),
+            (
+                4,
+                &[
+                    "already_exists",
+                    "already_held",
+                    "ambiguous_duplicate",
+                    "bad_state",
+                    "borrower_not_overrun",
+                    "busy",
+                    "duplicate_in_scope",
+                    "extend_refused",
+                    "extension_used",
+                    "id_clash",
+                    "import_clash",
+                    "link_conflict",
+                    "not_directly_linked",
+                    "not_holder",
+                    "no_units",
+                    "retiring",
+                    "scope_not_allowed",
+                ],
+            ),
+        ];
+        for (exit, codes) in classes {
+            for code in codes {
+                assert_eq!(exit_for(code), exit, "{code}");
+            }
+        }
     }
 }
