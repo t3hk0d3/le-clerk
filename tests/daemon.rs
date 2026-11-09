@@ -973,6 +973,16 @@ mod daemon {
                 }
             }
 
+            /// `var` set to an absolute directory inside the working directory.
+            fn absolute(var: &'static str, dir: &str) -> Self {
+                let cwd = TempDir::new().unwrap();
+                let abs = cwd.path().join(dir);
+                Self {
+                    cwd,
+                    vars: vec![(var, abs)],
+                }
+            }
+
             /// Also set `var` to an absolute directory inside the working
             /// directory, so the paths still resolve.
             fn and_absolute(mut self, var: &'static str, dir: &str) -> Self {
@@ -1000,6 +1010,14 @@ mod daemon {
                     .unwrap()
             }
 
+            /// Start (or replace) the daemon; the pid `restart` reports.
+            fn start(&self) -> u64 {
+                let out = self.daemon("restart");
+                assert!(out.status.success(), "{out:?}");
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                body["pid"].as_u64().unwrap()
+            }
+
             fn pid(&self) -> u64 {
                 let out = self.daemon("status");
                 assert!(out.status.success(), "{out:?}");
@@ -1016,13 +1034,15 @@ mod daemon {
         }
 
         /// Start the daemon from the working directory, then check that its
-        /// socket is at `socket` (below the working directory) and that a
-        /// second client from there finds the same daemon.
+        /// socket is at `socket` (below the working directory), that a later
+        /// client finds the very daemon `restart` started (so no second one
+        /// exists) and that the daemon itself runs in `/`.
         fn assert_listens_at(r: &Relative, socket: &str) {
-            let out = r.daemon("restart");
-            assert!(out.status.success(), "{out:?}");
+            let started = r.start();
             assert!(r.cwd.path().join(socket).exists(), "no socket at {socket}");
-            assert_eq!(r.pid(), r.pid());
+            assert_eq!(r.pid(), started);
+            let cwd = fs::read_link(format!("/proc/{started}/cwd")).unwrap();
+            assert_eq!(cwd, Path::new("/"));
         }
 
         mod spawn {
@@ -1069,6 +1089,59 @@ mod daemon {
                         .and_absolute("XDG_STATE_HOME", "st")
                         .and_absolute("XDG_CONFIG_HOME", "cfg");
                     assert_listens_at(&r, "rel-run/clerk/clerk.sock");
+                }
+            }
+
+            mod on_relative_clerk_home_files {
+                use super::*;
+
+                #[test]
+                fn lock_and_database_are_under_the_clients_directory() {
+                    let r = Relative::new("CLERK_HOME", "rel-home");
+                    r.start();
+                    let home = r.cwd.path().join("rel-home");
+                    assert!(home.join("run/daemon.lock").exists());
+                    assert!(home.join("state/clerk.db").exists());
+                }
+            }
+
+            mod on_relative_xdg_config_home {
+                use super::*;
+
+                #[test]
+                fn daemon_reads_the_config_below_the_clients_directory() {
+                    let r = Relative::new("XDG_CONFIG_HOME", "rel-cfg")
+                        .and_absolute("XDG_STATE_HOME", "st");
+                    let dir = r.cwd.path().join("rel-cfg/clerk");
+                    fs::create_dir_all(&dir).unwrap();
+                    // Unknown keys are rejected: a daemon that reads this file
+                    // refuses to start, one that looks elsewhere would not.
+                    fs::write(dir.join("config.toml"), "no_such_setting = 1\n").unwrap();
+                    let out = r.daemon("restart");
+                    assert!(!out.status.success(), "{out:?}");
+                    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                    assert_eq!(body["error"]["code"], json!("daemon_unavailable"));
+                }
+            }
+
+            mod on_absolute_clerk_home {
+                use super::*;
+
+                #[test]
+                fn daemon_listens_at_exactly_that_location() {
+                    let r = Relative::absolute("CLERK_HOME", "abs-home");
+                    assert_listens_at(&r, "abs-home/run/clerk.sock");
+                }
+            }
+
+            mod on_absolute_xdg_state_home {
+                use super::*;
+
+                #[test]
+                fn daemon_listens_at_exactly_that_location() {
+                    let r = Relative::absolute("XDG_STATE_HOME", "abs-state")
+                        .and_absolute("XDG_CONFIG_HOME", "cfg");
+                    assert_listens_at(&r, "abs-state/clerk/clerk.sock");
                 }
             }
         }
