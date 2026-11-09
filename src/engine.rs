@@ -122,6 +122,20 @@ impl ApiError {
         Self::new(ErrorKind::Invalid, "invalid_argument", message)
     }
 
+    /// `scope_not_allowed`: an agent session asked for scopes beyond its
+    /// own (every scope, an explicit scope, or another holder's identity).
+    #[must_use]
+    pub fn scope_not_allowed(what: &str) -> Self {
+        Self::new(
+            ErrorKind::Conflict,
+            "scope_not_allowed",
+            format!(
+                "an agent session may not {what}: it sees only user scope and its own project; \
+                 ask the user to do it from their terminal"
+            ),
+        )
+    }
+
     /// `internal_error`.
     #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {

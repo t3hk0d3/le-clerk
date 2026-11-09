@@ -167,10 +167,12 @@ impl NoticeFilter {
 }
 
 /// [`take`], but with `filter` only the notices it matches are taken (up to
-/// `limit`, oldest first); the others stay pending.
+/// `limit`, oldest first); the others stay pending. The filter runs in SQL
+/// on the stored payload, so only the rows taken are read and parsed: a
+/// damaged row that is not taken cannot fail the take.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure or a damaged row among those taken.
 pub fn take_matching(
     tx: &Tx,
     holder: &HolderRef,
@@ -179,33 +181,48 @@ pub fn take_matching(
     now_ms: i64,
 ) -> Result<Vec<Notice>, StoreError> {
     let holder = serde_json::to_string(holder)?;
-    let rows = {
-        let mut stmt = tx.conn().prepare(
-            "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
-             ORDER BY created_at, row_id",
-        )?;
-        stmt.query_map(rusqlite::params![holder], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
+    let rows = match filter {
+        None => {
+            let mut stmt = tx.conn().prepare(
+                "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
+                 ORDER BY created_at, row_id LIMIT ?2",
+            )?;
+            stmt.query_map(rusqlite::params![holder, limit], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        }
+        Some(f) => {
+            // CASE keeps json_extract away from payloads that are not JSON.
+            let mut stmt = tx.conn().prepare(
+                "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
+                 AND (CASE WHEN json_valid(payload) THEN \
+                        json_extract(payload, '$.lease_id') IN (SELECT value FROM json_each(?2)) \
+                        OR json_extract(payload, '$.request_id') IN (SELECT value FROM json_each(?3)) \
+                      ELSE 0 END) \
+                 ORDER BY created_at, row_id LIMIT ?4",
+            )?;
+            stmt.query_map(
+                rusqlite::params![
+                    holder,
+                    serde_json::to_string(&f.leases)?,
+                    serde_json::to_string(&f.requests)?,
+                    limit
+                ],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        }
     };
     let mut mark = tx
         .conn()
         .prepare("UPDATE notices SET delivered_at = ?2 WHERE row_id = ?1")?;
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let mut taken = Vec::new();
-    for (row, payload) in rows {
-        if taken.len() >= limit {
-            break;
-        }
-        let notice: Notice = serde_json::from_str(&payload)?;
-        if filter.is_some_and(|f| !f.matches(&notice)) {
-            continue;
-        }
-        mark.execute(rusqlite::params![row, now_ms])?;
-        taken.push(notice);
-    }
-    Ok(taken)
+    rows.iter()
+        .map(|(row, payload)| {
+            mark.execute(rusqlite::params![row, now_ms])?;
+            serde_json::from_str(payload).map_err(StoreError::from)
+        })
+        .collect()
 }
 
 /// The highest notice row written so far; 0 when there are none. Rows only

@@ -610,6 +610,72 @@ mod engine {
                 assert_eq!(err.code, "not_found");
             }
         }
+
+        mod on_agent_session_caller {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_refused_scope_not_allowed() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &user("a"), 60_000).await["lease_id"].clone();
+                let err = rpc(&h, "lease_holder", &agent("s1"), json!({"lease_id": lease}))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, "scope_not_allowed");
+            }
+        }
+    }
+
+    /// Daemon-side guard: agent sessions never get a view of every scope.
+    mod agent_session_guard {
+        use super::*;
+
+        fn agent() -> Caller {
+            Caller {
+                holder: HolderRef::AgentSession {
+                    session_id: "s1".into(),
+                },
+                project: None,
+                override_reason: None,
+            }
+        }
+
+        mod on_status_view_all {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_refused_scope_not_allowed() {
+                let (h, _clock) = spawn();
+                let err = rpc(&h, "status", &agent(), json!({"view": "all"}))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, "scope_not_allowed");
+            }
+        }
+
+        mod on_list_resources_view_all {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_refused_scope_not_allowed() {
+                let (h, _clock) = spawn();
+                let err = rpc(&h, "list_resources", &agent(), json!({"view": "all"}))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, "scope_not_allowed");
+            }
+        }
+
+        mod on_caller_view {
+            use super::*;
+
+            #[tokio::test]
+            async fn status_is_answered() {
+                let (h, _clock) = spawn();
+                ok(&h, "status", &agent(), json!({"view": "caller"})).await;
+            }
+        }
     }
 }
 

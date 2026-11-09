@@ -33,8 +33,7 @@ pub enum ViewArg {
     /// User scope plus the caller's project.
     #[default]
     Caller,
-    /// Every scope. Accepted from any caller at this layer: gating admin
-    /// views (`--override` for agents) is the CLI's job (phase 2).
+    /// Every scope. Refused to agent sessions (`scope_not_allowed`).
     All,
 }
 
@@ -463,6 +462,7 @@ commands! {
     /// The caller's live leases and queued requests.
     ListMyLeases(NoArgs) = "list_my_leases", read_only: true;
     /// The `User` holder of a live lease (anything else is `not_found`).
+    /// Refused to agent sessions.
     LeaseHolder(LeaseArgs) = "lease_holder", read_only: true;
     /// Confirm cleanup (or a yield).
     Confirm(ConfirmArgs) = "confirm", read_only: false;
@@ -474,8 +474,8 @@ commands! {
     RefuseYield(LeaseArgs) = "refuse_yield", read_only: false;
     /// Take a lent unit back from an overrunning borrower.
     Reclaim(LeaseArgs) = "reclaim", read_only: false;
-    /// Units, holders and queues. `view: "all"` is not gated here (see
-    /// [`ViewArg::All`]).
+    /// Units, holders and queues. `view: "all"` is refused to agent
+    /// sessions (see [`ViewArg::All`]).
     Status(ViewArgs) = "status", read_only: true;
     /// Audit log entries, newest first.
     ListAudit(AuditArgs) = "list_audit", read_only: true;
@@ -549,7 +549,23 @@ impl Command {
         {
             return Err(ApiError::invalid_argument("duration_ms must be positive"));
         }
+        if matches!(self.caller().holder, HolderRef::AgentSession { .. })
+            && let Some(what) = self.beyond_own_scopes()
+        {
+            return Err(ApiError::scope_not_allowed(what));
+        }
         Ok(())
+    }
+
+    /// What this command reaches beyond the caller's own scopes and
+    /// holder, if anything: agent sessions are refused it.
+    fn beyond_own_scopes(&self) -> Option<&'static str> {
+        match self {
+            Self::Status(_, a) if a.view == ViewArg::All => Some("view every scope"),
+            Self::ListResources(_, a) if a.view == ViewArg::All => Some("list every scope"),
+            Self::LeaseHolder(..) => Some("look up the user's lease holders"),
+            _ => None,
+        }
     }
 
     /// Run the command in `tx` and encode its result. `DaemonStop` only

@@ -14,7 +14,7 @@ use leclerk::scheduler::{
     AcquireOutcome, AcquireRequest, Confirm, Grant, HealthProbe, Scheduler, Target,
 };
 use leclerk::store::audit::{self, AuditEntry, AuditFilter};
-use leclerk::store::notices::{self, Notice, NoticeKind};
+use leclerk::store::notices::{self, Notice, NoticeFilter, NoticeKind};
 use leclerk::store::{Store, StoreError, Tx};
 
 const T0: i64 = 1_000_000;
@@ -348,6 +348,21 @@ mod notice_queue {
             }
         }
 
+        mod on_a_damaged_row_beyond_the_first_page {
+            use super::*;
+
+            #[test]
+            fn still_takes_the_first_page() {
+                let mut f = fixture();
+                let h = holder("h");
+                for i in 0..3 {
+                    f.publish(&notice(&h, NoticeKind::LeaseEnded, T0 + i));
+                }
+                insert_damaged(&mut f, &h, T0 + 10);
+                assert_eq!(f.take(&h, 3).len(), 3);
+            }
+        }
+
         mod on_none_pending {
             use super::*;
 
@@ -396,6 +411,86 @@ mod notice_queue {
                 assert_eq!(f.take(&other, 10).len(), 0);
                 assert_eq!(f.take(&p, 10).len(), 1);
             }
+        }
+    }
+}
+
+/// A row of `h` whose payload is not a notice, created at `at`.
+fn insert_damaged(f: &mut Fixture, h: &HolderRef, at: i64) {
+    let holder = serde_json::to_string(h).unwrap();
+    f.with_tx(|tx| {
+        tx.conn()
+            .execute(
+                "INSERT INTO notices (notice_id, holder, kind, payload, created_at) \
+                 VALUES ('ntc_bad', ?1, 'offered', 'not json', ?2)",
+                rusqlite::params![holder, at],
+            )
+            .unwrap();
+    });
+}
+
+mod take_matching {
+    use super::*;
+
+    fn filter_for(lease: &LeaseId) -> NoticeFilter {
+        NoticeFilter {
+            leases: vec![lease.clone()],
+            requests: Vec::new(),
+        }
+    }
+
+    fn take_for(f: &mut Fixture, h: &HolderRef, lease: &LeaseId, limit: u32) -> Vec<Notice> {
+        let filter = filter_for(lease);
+        f.with_tx(|tx| notices::take_matching(tx, h, Some(&filter), limit, DELIVERED_AT).unwrap())
+    }
+
+    fn about(h: &HolderRef, lease: &LeaseId, at: i64) -> Notice {
+        let mut n = notice(h, NoticeKind::LeaseEnded, at);
+        n.lease_id = Some(lease.clone());
+        n
+    }
+
+    mod on_a_filter {
+        use super::*;
+
+        #[test]
+        fn takes_only_matching_notices_up_to_the_limit_oldest_first() {
+            let mut f = fixture();
+            let h = holder("h");
+            let (ours, other) = (LeaseId::new(), LeaseId::new());
+            let first = about(&h, &ours, T0 + 1);
+            f.publish(&about(&h, &other, T0));
+            f.publish(&first);
+            f.publish(&about(&h, &ours, T0 + 2));
+            let got = take_for(&mut f, &h, &ours, 1);
+            assert_eq!(got.iter().map(|n| &n.id).collect::<Vec<_>>(), [&first.id]);
+        }
+
+        #[test]
+        fn leaves_the_others_pending() {
+            let mut f = fixture();
+            let h = holder("h");
+            let (ours, other) = (LeaseId::new(), LeaseId::new());
+            f.publish(&about(&h, &other, T0));
+            f.publish(&about(&h, &ours, T0 + 1));
+            take_for(&mut f, &h, &ours, 10);
+            let left = f.with_tx(|tx| notices::pending(tx, &h).unwrap());
+            assert_eq!(left.len(), 1);
+            assert_eq!(left[0].lease_id, Some(other));
+        }
+    }
+
+    mod on_a_damaged_row_that_does_not_match {
+        use super::*;
+
+        #[test]
+        fn still_takes_the_matching_notices() {
+            let mut f = fixture();
+            let h = holder("h");
+            let ours = LeaseId::new();
+            insert_damaged(&mut f, &h, T0);
+            f.publish(&about(&h, &ours, T0 + 1));
+            assert_eq!(take_for(&mut f, &h, &ours, 10).len(), 1);
         }
     }
 }
