@@ -1848,6 +1848,26 @@ mod cli {
             }
         }
 
+        mod on_since_followed_by_an_option {
+            use super::*;
+
+            #[test]
+            fn exits_2_without_daemon_call() {
+                let env = Env::new();
+                let error = error_of(env.cmd().args(["log", "--since", "--actor", "user:x"]), 2);
+                assert_eq!(error["code"], "usage_error");
+                assert!(!env.daemon_started());
+            }
+
+            #[test]
+            fn says_since_needs_a_value() {
+                let env = Env::new();
+                let error = error_of(env.cmd().args(["log", "--since", "--json"]), 2);
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("--since needs a value"), "{message}");
+            }
+        }
+
         mod on_since_negative {
             use super::*;
 
@@ -2379,6 +2399,60 @@ mod cli {
                     free(&env, "x", &theirs);
                     assert_eq!(code_of(&mut child), 0);
                     assert!(session_has_notice_for(&env, "sess-1", &dir, &other));
+                }
+            }
+
+            mod on_free_unit {
+                use super::*;
+
+                #[test]
+                fn lease_survives_the_process() {
+                    let env = Env::new();
+                    seed(&env, "board", "k1");
+                    let out = env
+                        .cmd()
+                        // assert_cmd gives the command an empty, closed stdin.
+                        .args(["--json", "acquire", "board", "--for", "10m", "--wait"])
+                        .output()
+                        .unwrap();
+                    assert!(out.status.success(), "{out:?}");
+                    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                    let lease = lease_of(&body);
+                    // Past the daemon's liveness probes of CLI processes.
+                    std::thread::sleep(Duration::from_secs(3));
+                    let leases = env.ok(&["leases"]);
+                    let listed = leases
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|l| l["occupancy"].clone())
+                        .find(|o| o["lease_id"] == lease.as_str())
+                        .unwrap_or_else(|| panic!("{lease} not listed: {leases}"));
+                    assert_eq!(listed["holder"]["kind"], "user", "{listed}");
+                    assert_eq!(unit_status(&env)["dirty"], Value::Null);
+                }
+            }
+
+            mod on_queued_then_granted {
+                use super::*;
+
+                #[test]
+                fn lease_survives_the_process() {
+                    let env = Env::new();
+                    seed(&env, "board", "k1");
+                    let theirs = hold(&env, "x");
+                    let mut child =
+                        spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
+                    std::thread::sleep(Duration::from_millis(500));
+                    free(&env, "x", &theirs);
+                    assert_eq!(code_of(&mut child), 0);
+                    let body: Value = serde_json::from_str(&stdout_of(&mut child)).unwrap();
+                    let lease = lease_of(&body);
+                    std::thread::sleep(Duration::from_secs(3));
+                    let occupancy = unit_status(&env)["occupancy"].clone();
+                    assert_eq!(occupancy["lease_id"], lease.as_str(), "{occupancy}");
+                    assert_eq!(occupancy["state"], "held", "{occupancy}");
+                    assert_eq!(unit_status(&env)["dirty"], Value::Null);
                 }
             }
 

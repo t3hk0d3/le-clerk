@@ -190,7 +190,8 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
     let interactive = std::io::stdin().is_terminal();
     // `--wait` holds the request as this process while it waits, so its
     // offer goes to no one else's `clerk wait` and a killed script leaves
-    // nothing queued; the lease moves to a user holder once claimed.
+    // nothing queued; every lease it ends up holding (granted at once or
+    // claimed later) moves to a user holder before it is printed.
     let kind = if interactive || args.wait {
         CallerKind::Interactive
     } else {
@@ -225,6 +226,9 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
     }
     let outcome = client.call("acquire", &caller, body).await?;
     if outcome["outcome"] != "queued" {
+        // Granted at once to `--wait`'s process holder: hand the lease to
+        // a user holder before this process exits, or liveness ends it.
+        detach_from_process(&client, &caller, outcome.clone()).await?;
         return ctx.out.emit(&View::new(outcome, outcome_text));
     }
     if !args.wait {

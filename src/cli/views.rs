@@ -265,6 +265,14 @@ fn parse_since(s: &str, now_ms: i64) -> Result<i64, UsageError> {
              RFC 3339 timestamp (e.g. 2026-11-10T09:00:00Z)."
         ))
     };
+    // `--since` takes hyphen values (so `-5m` gets this message), which
+    // would also swallow a following option.
+    if s.starts_with("--") {
+        return Err(UsageError(format!(
+            "--since needs a value before the next option ({s}): use <n>s|m|h|d for how long \
+             ago (e.g. 2h), or an RFC 3339 timestamp (e.g. 2026-11-10T09:00:00Z)."
+        )));
+    }
     if let Some(ms) = parse_rfc3339(s) {
         return Ok(ms);
     }
