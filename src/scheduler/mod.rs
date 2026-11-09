@@ -40,7 +40,7 @@ use crate::inventory::{Inventory, InventoryError, View};
 use crate::model::{
     Caller, DirtyInfo, EndCause, HealthSpec, HolderRef, LeaseId, LeaseState, Priority, ProjectKey,
     RenderResource, RenderUnit, RequestId, Resource, ResourceId, ResourceType, Scope, ServiceMode,
-    Unit, UnitId, UnitSettings, UsageTemplate,
+    TagSet, Unit, UnitId, UnitSettings, UsageTemplate,
 };
 use crate::store::inventory::{self as inventory_sql, ScopeFilter};
 use crate::store::leases::{self, LeaseRow, NewLease, NewRequest};
@@ -103,9 +103,17 @@ pub struct AcquireRequest {
 }
 
 /// What a holder is told about what it leases: the resource's description,
-/// the unit's description and the resource's usage template rendered for the
-/// unit. Shared by grants and lease views so every path carries one brief.
-fn brief(resource: &Resource, unit: &Unit) -> (String, String, String) {
+/// the unit's description, the resource's usage template rendered for the
+/// unit and the resource's tags. Shared by grants and lease views so every
+/// path carries one brief.
+struct Brief {
+    resource_description: String,
+    unit_description: String,
+    usage: String,
+    resource_tags: TagSet,
+}
+
+fn brief(resource: &Resource, unit: &Unit) -> Brief {
     // The stored template passed `parse` when it was written.
     let usage = UsageTemplate::from_stored(resource.usage.clone()).render(
         &RenderResource {
@@ -118,11 +126,12 @@ fn brief(resource: &Resource, unit: &Unit) -> (String, String, String) {
             settings: &unit.settings,
         },
     );
-    (
-        resource.description.clone(),
-        unit.description.clone(),
+    Brief {
+        resource_description: resource.description.clone(),
+        unit_description: unit.description.clone(),
         usage,
-    )
+        resource_tags: resource.tags.clone(),
+    }
 }
 
 /// An immediate grant.
@@ -138,6 +147,8 @@ pub struct Grant {
     pub unit_description: String,
     /// The resource's usage template, rendered for this unit.
     pub usage: String,
+    /// The resource's tags.
+    pub resource_tags: TagSet,
     /// Unix milliseconds.
     pub ends_at: i64,
     /// Set when the unit was handed over without confirmed cleanup.
@@ -188,6 +199,8 @@ pub struct Lease {
     pub unit_description: String,
     /// The resource's usage template, rendered for this unit.
     pub usage: String,
+    /// The resource's tags.
+    pub resource_tags: TagSet,
     pub state: LeaseState,
     pub holder: HolderRef,
     pub priority: Priority,
@@ -321,6 +334,10 @@ pub struct ResourceStatus {
     #[serde(rename = "type")]
     pub ty: ResourceType,
     pub scope: Scope,
+    /// The resource's description.
+    pub description: String,
+    /// The resource's tags.
+    pub tags: TagSet,
     /// True when this project resource hides a user resource of the same id.
     pub shadows_user: bool,
     pub units: Vec<UnitStatus>,
@@ -332,6 +349,8 @@ pub struct ResourceStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UnitStatus {
     pub id: UnitId,
+    /// The unit's description.
+    pub description: String,
     pub retiring: bool,
     pub dirty: Option<DirtyInfo>,
     pub last_health: Option<String>,
@@ -744,15 +763,16 @@ impl Scheduler {
                     "dirty": handed.dirty,
                 }),
             )?;
-            let (resource_description, unit_description, usage) = brief(&resource, unit);
+            let brief = brief(&resource, unit);
             return Ok(AcquireOutcome::Granted(Grant {
                 lease_id: handed.id,
                 resource: resource.id.clone(),
                 unit: unit.id.clone(),
                 settings: unit.settings.clone(),
-                resource_description,
-                unit_description,
-                usage,
+                resource_description: brief.resource_description,
+                unit_description: brief.unit_description,
+                usage: brief.usage,
+                resource_tags: brief.resource_tags,
                 // Invariant: a held hand-over always sets ends_at.
                 ends_at: handed.ends_at.unwrap_or_default(),
                 dirty: handed.dirty,
@@ -977,15 +997,16 @@ impl Scheduler {
             .iter()
             .find(|u| u.row == lease.unit_row)
             .ok_or(SchedulerError::NotFound)?;
-        let (resource_description, unit_description, usage) = brief(&resource, unit);
+        let brief = brief(&resource, unit);
         Ok(Lease {
             id: lease.id,
             resource: resource.id,
             unit: unit.id.clone(),
             settings: unit.settings.clone(),
-            resource_description,
-            unit_description,
-            usage,
+            resource_description: brief.resource_description,
+            unit_description: brief.unit_description,
+            usage: brief.usage,
+            resource_tags: brief.resource_tags,
             state: lease.state,
             holder: lease.holder,
             priority: lease.priority,
@@ -1136,6 +1157,7 @@ impl Scheduler {
                 };
                 units.push(UnitStatus {
                     id: unit.id.clone(),
+                    description: unit.description.clone(),
                     retiring: unit.retiring,
                     dirty: unit.dirty.clone(),
                     last_health: unit.last_health.clone(),
@@ -1160,6 +1182,8 @@ impl Scheduler {
                 id: resource.id,
                 ty: resource.ty,
                 scope: resource.scope,
+                description: resource.description,
+                tags: resource.tags,
                 shadows_user: resource.shadows_user,
                 units,
                 queue: entries,

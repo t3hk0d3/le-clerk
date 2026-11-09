@@ -11,7 +11,7 @@ use leclerk::health::HealthResult;
 use leclerk::inventory::{Inventory, NewResource, NewUnit, ResourcePatch, UnitPatch, View};
 use leclerk::model::{
     Caller, DirtyInfo, DirtyReason, HealthSpec, HolderRef, LeaseId, LeaseState, Priority,
-    ProjectKey, RequestId, ResourceId, ResourceType, Scope, UnitId, UnitSettings,
+    ProjectKey, RequestId, ResourceId, ResourceType, Scope, Tag, TagSet, UnitId, UnitSettings,
 };
 use leclerk::scheduler::{
     AcquireOutcome, AcquireRequest, Confirm, Grant, HealthProbe, Occupancy, OtherParty, Scheduler,
@@ -372,6 +372,34 @@ impl Fixture {
     }
 }
 
+impl Fixture {
+    /// Replace the tags of resource `id` (as an admin).
+    fn set_tags(&mut self, id: &str, tags: &[&str]) {
+        self.set_tags_as(&caller("admin"), id, tags);
+    }
+
+    /// Replace the tags of resource `id` as `who`.
+    fn set_tags_as(&mut self, who: &Caller, id: &str, tags: &[&str]) {
+        self.store
+            .tx(|tx| {
+                self.inv.update_resource(
+                    tx,
+                    who,
+                    &rid(id),
+                    ResourcePatch {
+                        tags: Some(tags.iter().map(|t| (*t).to_owned()).collect()),
+                        ..ResourcePatch::default()
+                    },
+                )
+            })
+            .unwrap();
+    }
+}
+
+fn tag_names(tags: &TagSet) -> Vec<&str> {
+    tags.iter().map(Tag::as_str).collect()
+}
+
 const RENDERED: &str = "flash: idf.py -p /dev/ttyU1 flash; env ${PORT}; ESP32 rig / left board";
 
 mod scheduler {
@@ -391,6 +419,19 @@ mod scheduler {
                 assert_eq!(g.resource_description, "ESP32 rig");
                 assert_eq!(g.unit_description, "left board");
                 assert_eq!(g.usage, RENDERED);
+            }
+        }
+
+        mod on_immediate_grant_with_tags {
+            use super::*;
+
+            #[test]
+            fn grant_carries_resource_tags_sorted() {
+                let mut f = fixture();
+                f.seed_rig();
+                f.set_tags("rig", &["zigbee", "esp32"]);
+                let g = f.grant(&caller("a"), req(on("rig"), MIN, Priority::Normal, "x"));
+                assert_eq!(tag_names(&g.resource_tags), ["esp32", "zigbee"]);
             }
         }
 
@@ -1574,6 +1615,68 @@ mod scheduler {
 mod status {
     use super::*;
 
+    fn status_of(f: &mut Fixture, who: &Caller, view: View) -> leclerk::scheduler::StatusView {
+        f.store.tx(|tx| f.sched.status(tx, who, view)).unwrap()
+    }
+
+    mod on_a_described_and_tagged_resource {
+        use super::*;
+
+        #[test]
+        fn resource_status_carries_description_and_sorted_tags() {
+            let mut f = fixture();
+            f.seed_rig();
+            f.set_tags("rig", &["zigbee", "esp32"]);
+            let status = status_of(&mut f, &caller("a"), View::Caller);
+            assert_eq!(status.resources[0].description, "ESP32 rig");
+            assert_eq!(tag_names(&status.resources[0].tags), ["esp32", "zigbee"]);
+        }
+
+        #[test]
+        fn unit_status_carries_description() {
+            let mut f = fixture();
+            f.seed_rig();
+            let status = status_of(&mut f, &caller("a"), View::Caller);
+            assert_eq!(status.resources[0].units[0].description, "left board");
+        }
+    }
+
+    mod on_a_holder_in_another_project {
+        use super::*;
+
+        #[test]
+        fn stays_held_by_an_agent_in_another_project_without_leaking_its_resource() {
+            let mut f = fixture();
+            let a = caller_in("a", Some("/p/a"));
+            let b = caller_in("b", Some("/p/b"));
+            f.seed_keyed(
+                &a,
+                "board",
+                &Scope::Project(project("/p/a")),
+                &["u1"],
+                "same",
+            );
+            f.seed_keyed(
+                &b,
+                "hidden",
+                &Scope::Project(project("/p/b")),
+                &["u1"],
+                "same",
+            );
+            f.set_tags_as(&b, "hidden", &["secret-tag"]);
+            f.grant(&b, req(on("hidden"), MIN, Priority::Normal, "x"));
+            let status = status_of(&mut f, &a, View::Caller);
+            assert_eq!(status.resources.len(), 1);
+            assert_eq!(
+                status.resources[0].units[0].occupancy,
+                Occupancy::HeldInAnotherProject
+            );
+            let json = serde_json::to_string(&status).unwrap();
+            assert!(!json.contains("secret-tag"));
+            assert!(!json.contains("hidden"));
+        }
+    }
+
     mod on_a_project_resource_shadowing_a_user_one {
         use super::*;
 
@@ -1820,6 +1923,22 @@ mod scheduler_leases {
                 assert_eq!(lease.unit_description, "left board");
                 assert_eq!(lease.usage, RENDERED);
             }
+
+            #[test]
+            fn lease_carries_resource_tags() {
+                let mut f = fixture();
+                f.seed_rig();
+                f.set_tags("rig", &["esp32"]);
+                let a = caller("a");
+                let b = caller("b");
+                let first = f.grant(&a, req(on("rig"), MIN, Priority::Normal, "x"));
+                f.queue(&b, req(on("rig"), MIN, Priority::Normal, "y"));
+                f.end(&first.lease_id);
+                f.dispatch();
+                let offer = f.offered_lease(&b.holder);
+                let lease = f.store.tx(|tx| f.sched.claim(tx, &b, &offer)).unwrap();
+                assert_eq!(tag_names(&lease.resource_tags), ["esp32"]);
+            }
         }
     }
 
@@ -1838,6 +1957,38 @@ mod scheduler_leases {
                 assert_eq!(lease.resource_description, "ESP32 rig");
                 assert_eq!(lease.unit_description, "left board");
                 assert_eq!(lease.usage, RENDERED);
+            }
+        }
+
+        mod on_any_lease_with_tags {
+            use super::*;
+
+            #[test]
+            fn lease_carries_resource_tags() {
+                let mut f = fixture();
+                let a = caller("a");
+                let id = held(&mut f, &a);
+                f.set_tags("rig", &["zigbee", "esp32"]);
+                let lease = f.store.tx(|tx| f.sched.get_lease(tx, &a, &id)).unwrap();
+                assert_eq!(tag_names(&lease.resource_tags), ["esp32", "zigbee"]);
+            }
+        }
+
+        mod after_a_tag_change {
+            use super::*;
+
+            #[test]
+            fn shows_the_new_tags() {
+                let mut f = fixture();
+                let a = caller("a");
+                f.seed_rig();
+                f.set_tags("rig", &["old"]);
+                let id = f
+                    .grant(&a, req(on("rig"), MIN, Priority::Normal, "x"))
+                    .lease_id;
+                f.set_tags("rig", &["new", "fresh"]);
+                let lease = f.store.tx(|tx| f.sched.get_lease(tx, &a, &id)).unwrap();
+                assert_eq!(tag_names(&lease.resource_tags), ["fresh", "new"]);
             }
         }
 
@@ -1901,6 +2052,16 @@ mod scheduler_leases {
                 assert_eq!(mine.leases[0].resource_description, "ESP32 rig");
                 assert_eq!(mine.leases[0].unit_description, "left board");
                 assert_eq!(mine.leases[0].usage, RENDERED);
+            }
+
+            #[test]
+            fn lease_carries_resource_tags() {
+                let mut f = fixture();
+                let a = caller("a");
+                held(&mut f, &a);
+                f.set_tags("rig", &["esp32"]);
+                let mine = f.store.tx(|tx| f.sched.my_leases(tx, &a)).unwrap();
+                assert_eq!(tag_names(&mine.leases[0].resource_tags), ["esp32"]);
             }
         }
     }

@@ -192,6 +192,8 @@ pub struct LeaseView {
     pub unit_description: String,
     /// The usage template rendered for this unit.
     pub usage: String,
+    /// The resource's tags, sorted.
+    pub resource_tags: TagSet,
     pub state: LeaseState,
     pub holder: HolderRef,
     pub priority: Priority,
@@ -236,6 +238,7 @@ impl From<Lease> for LeaseView {
             resource_description: l.resource_description,
             unit_description: l.unit_description,
             usage: l.usage,
+            resource_tags: l.resource_tags,
             state: l.state,
             holder: l.holder,
             priority: l.priority,

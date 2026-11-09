@@ -1773,6 +1773,82 @@ mod wire_tags {
         }
     }
 
+    mod grant_and_lease_views {
+        use super::*;
+
+        async fn tagged_rig(h: &EngineHandle) {
+            create(
+                h,
+                &user("a"),
+                "board",
+                json!("user"),
+                json!(["zigbee", "esp32"]),
+            )
+            .await;
+            ok(
+                h,
+                "add_unit",
+                &user("a"),
+                json!({"resource": "board", "id": "u1",
+                       "settings": {"type": "generic", "identity_key": "k1"}}),
+            )
+            .await;
+        }
+
+        mod on_a_tagged_resource {
+            use super::*;
+
+            #[tokio::test]
+            async fn acquire_grant_exposes_resource_tags_sorted() {
+                let (h, _clock) = spawn();
+                tagged_rig(&h).await;
+                let out = ok(
+                    &h,
+                    "acquire",
+                    &user("a"),
+                    json!({"target": {"resource": "board"}, "duration_ms": 60_000, "purpose": "t"}),
+                )
+                .await;
+                assert_eq!(out["resource_tags"], json!(["esp32", "zigbee"]));
+            }
+
+            #[tokio::test]
+            async fn get_lease_exposes_resource_tags_sorted() {
+                let (h, _clock) = spawn();
+                tagged_rig(&h).await;
+                let out = ok(
+                    &h,
+                    "acquire",
+                    &user("a"),
+                    json!({"target": {"resource": "board"}, "duration_ms": 60_000, "purpose": "t"}),
+                )
+                .await;
+                let view = ok(
+                    &h,
+                    "get_lease",
+                    &user("a"),
+                    json!({"lease_id": out["lease_id"]}),
+                )
+                .await;
+                assert_eq!(view["resource_tags"], json!(["esp32", "zigbee"]));
+            }
+
+            #[tokio::test]
+            async fn status_exposes_description_and_tags() {
+                let (h, _clock) = spawn();
+                tagged_rig(&h).await;
+                let status = ok(&h, "status", &user("a"), json!({"view": "caller"})).await;
+                assert_eq!(status["resources"][0]["tags"], json!(["esp32", "zigbee"]));
+                assert!(status["resources"][0].get("description").is_some());
+                assert!(
+                    status["resources"][0]["units"][0]
+                        .get("description")
+                        .is_some()
+                );
+            }
+        }
+    }
+
     mod create_resource {
         use super::*;
 
