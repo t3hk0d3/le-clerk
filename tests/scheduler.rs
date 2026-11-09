@@ -8,7 +8,7 @@ use std::time::Duration;
 use leclerk::clock::ManualClock;
 use leclerk::config::Config;
 use leclerk::health::HealthResult;
-use leclerk::inventory::{Inventory, NewResource, NewUnit, View};
+use leclerk::inventory::{Inventory, NewResource, NewUnit, ResourcePatch, UnitPatch, View};
 use leclerk::model::{
     Caller, DirtyInfo, DirtyReason, HealthSpec, HolderRef, LeaseId, LeaseState, Priority,
     ProjectKey, RequestId, ResourceId, ResourceType, Scope, UnitId, UnitSettings,
@@ -330,11 +330,67 @@ impl Fixture {
     }
 }
 
+const FLASH_USAGE: &str =
+    "flash: idf.py -p {unit.path} flash; env ${PORT}; {resource.description} / {unit.description}";
+
+impl Fixture {
+    /// A user-scope device resource `rig` with unit `u1` (`/dev/ttyU1`), both
+    /// described, and a usage template over the unit's path.
+    fn seed_rig(&mut self) {
+        let who = caller("admin");
+        self.store
+            .tx(|tx| -> Result<(), leclerk::inventory::InventoryError> {
+                self.inv.create_resource(
+                    tx,
+                    &who,
+                    &NewResource {
+                        id: rid("rig"),
+                        ty: ResourceType::Device,
+                        scope: Scope::User,
+                        description: "ESP32 rig".into(),
+                        usage: FLASH_USAGE.into(),
+                        health: None,
+                    },
+                )?;
+                self.inv.add_unit(
+                    tx,
+                    &who,
+                    &rid("rig"),
+                    &NewUnit {
+                        id: uid("u1"),
+                        settings: UnitSettings::Device {
+                            path: PathBuf::from("/dev/ttyU1"),
+                        },
+                        description: "left board".into(),
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+const RENDERED: &str = "flash: idf.py -p /dev/ttyU1 flash; env ${PORT}; ESP32 rig / left board";
+
 mod scheduler {
     use super::*;
 
     mod acquire {
         use super::*;
+
+        mod on_immediate_grant {
+            use super::*;
+
+            #[test]
+            fn grant_carries_resource_description_unit_description_and_rendered_usage() {
+                let mut f = fixture();
+                f.seed_rig();
+                let g = f.grant(&caller("a"), req(on("rig"), MIN, Priority::Normal, "x"));
+                assert_eq!(g.resource_description, "ESP32 rig");
+                assert_eq!(g.unit_description, "left board");
+                assert_eq!(g.usage, RENDERED);
+            }
+        }
 
         mod on_free_healthy_unit_in_target_resource {
             use super::*;
@@ -1545,7 +1601,6 @@ mod status {
 
 mod health_backoff {
     use super::*;
-    use leclerk::inventory::{ResourcePatch, UnitPatch};
     use leclerk::scheduler::HEALTH_RECHECK_BACKOFF;
 
     /// `board/u1` failing its check, with `w` waiting for it; the acquire
@@ -1729,5 +1784,122 @@ mod notify_helper {
             published(Some("/p/a"), &Scope::User).as_deref(),
             Some("secret purpose")
         );
+    }
+}
+
+mod scheduler_leases {
+    use super::*;
+
+    fn held(f: &mut Fixture, who: &Caller) -> LeaseId {
+        f.seed_rig();
+        f.grant(who, req(on("rig"), MIN, Priority::Normal, "x"))
+            .lease_id
+    }
+
+    mod claim {
+        use super::*;
+
+        mod on_any_lease {
+            use super::*;
+
+            #[test]
+            fn lease_carries_resource_description_unit_description_and_rendered_usage() {
+                let mut f = fixture();
+                f.seed_rig();
+                let a = caller("a");
+                let b = caller("b");
+                let first = f.grant(&a, req(on("rig"), MIN, Priority::Normal, "x"));
+                f.queue(&b, req(on("rig"), MIN, Priority::Normal, "y"));
+                f.end(&first.lease_id);
+                f.dispatch();
+                let offer = f.offered_lease(&b.holder);
+                let lease = f.store.tx(|tx| f.sched.claim(tx, &b, &offer)).unwrap();
+                assert_eq!(lease.resource_description, "ESP32 rig");
+                assert_eq!(lease.unit_description, "left board");
+                assert_eq!(lease.usage, RENDERED);
+            }
+        }
+    }
+
+    mod get_lease {
+        use super::*;
+
+        mod on_any_lease {
+            use super::*;
+
+            #[test]
+            fn lease_carries_resource_description_unit_description_and_rendered_usage() {
+                let mut f = fixture();
+                let a = caller("a");
+                let id = held(&mut f, &a);
+                let lease = f.store.tx(|tx| f.sched.get_lease(tx, &a, &id)).unwrap();
+                assert_eq!(lease.resource_description, "ESP32 rig");
+                assert_eq!(lease.unit_description, "left board");
+                assert_eq!(lease.usage, RENDERED);
+            }
+        }
+
+        mod after_description_change {
+            use super::*;
+
+            #[test]
+            fn shows_the_new_descriptions_and_re_rendered_usage() {
+                let mut f = fixture();
+                let a = caller("a");
+                let id = held(&mut f, &a);
+                let admin = caller("admin");
+                f.store
+                    .tx(|tx| -> Result<(), leclerk::inventory::InventoryError> {
+                        f.inv.update_resource(
+                            tx,
+                            &admin,
+                            &rid("rig"),
+                            ResourcePatch {
+                                description: Some("Rig two".into()),
+                                ..ResourcePatch::default()
+                            },
+                        )?;
+                        f.inv.update_unit(
+                            tx,
+                            &admin,
+                            &rid("rig"),
+                            &uid("u1"),
+                            UnitPatch {
+                                settings: None,
+                                description: Some("right board".into()),
+                            },
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                let lease = f.store.tx(|tx| f.sched.get_lease(tx, &a, &id)).unwrap();
+                assert_eq!(lease.resource_description, "Rig two");
+                assert_eq!(lease.unit_description, "right board");
+                assert_eq!(
+                    lease.usage,
+                    "flash: idf.py -p /dev/ttyU1 flash; env ${PORT}; Rig two / right board"
+                );
+            }
+        }
+    }
+
+    mod my_leases {
+        use super::*;
+
+        mod on_any_lease {
+            use super::*;
+
+            #[test]
+            fn lease_carries_resource_description_unit_description_and_rendered_usage() {
+                let mut f = fixture();
+                let a = caller("a");
+                held(&mut f, &a);
+                let mine = f.store.tx(|tx| f.sched.my_leases(tx, &a)).unwrap();
+                assert_eq!(mine.leases.len(), 1);
+                assert_eq!(mine.leases[0].resource_description, "ESP32 rig");
+                assert_eq!(mine.leases[0].unit_description, "left board");
+                assert_eq!(mine.leases[0].usage, RENDERED);
+            }
+        }
     }
 }

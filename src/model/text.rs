@@ -266,6 +266,15 @@ impl UsageTemplate {
         Ok(Self(text.to_owned()))
     }
 
+    /// Wrap text read back from storage.
+    ///
+    /// Only for text that passed [`UsageTemplate::parse`] when stored; no
+    /// check is repeated here.
+    #[must_use]
+    pub(crate) fn from_stored(text: String) -> Self {
+        Self(text)
+    }
+
     /// The raw template text.
     #[must_use]
     pub fn as_str(&self) -> &str {

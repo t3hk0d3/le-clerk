@@ -1571,3 +1571,55 @@ mod wire_text {
         }
     }
 }
+
+mod brief {
+    use super::*;
+
+    mod acquire {
+        use super::*;
+
+        mod on_a_device_resource_with_a_usage_template {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_the_rendered_usage() {
+                let (h, _clock) = spawn();
+                let admin = user("admin");
+                ok(
+                    &h,
+                    "create_resource",
+                    &admin,
+                    json!({
+                        "id": "rig", "type": "device", "scope": "user",
+                        "description": "ESP32 rig",
+                        "usage": "flash: idf.py -p {unit.path} flash; env ${PORT}",
+                    }),
+                )
+                .await;
+                ok(
+                    &h,
+                    "add_unit",
+                    &admin,
+                    json!({
+                        "resource": "rig", "id": "u1", "description": "left board",
+                        "settings": {"type": "device", "path": "/dev/ttyU1"},
+                    }),
+                )
+                .await;
+                let out = ok(
+                    &h,
+                    "acquire",
+                    &user("a"),
+                    json!({"target": {"resource": "rig"}, "duration_ms": 60_000, "purpose": "t"}),
+                )
+                .await;
+                assert_eq!(
+                    out["usage"],
+                    "flash: idf.py -p /dev/ttyU1 flash; env ${PORT}"
+                );
+                assert_eq!(out["resource_description"], "ESP32 rig");
+                assert_eq!(out["unit_description"], "left board");
+            }
+        }
+    }
+}

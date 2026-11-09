@@ -39,7 +39,8 @@ use crate::health::{HealthChecker, HealthResult};
 use crate::inventory::{Inventory, InventoryError, View};
 use crate::model::{
     Caller, DirtyInfo, EndCause, HealthSpec, HolderRef, LeaseId, LeaseState, Priority, ProjectKey,
-    RequestId, Resource, ResourceId, ResourceType, Scope, ServiceMode, Unit, UnitId, UnitSettings,
+    RenderResource, RenderUnit, RequestId, Resource, ResourceId, ResourceType, Scope, ServiceMode,
+    Unit, UnitId, UnitSettings, UsageTemplate,
 };
 use crate::store::inventory::{self as inventory_sql, ScopeFilter};
 use crate::store::leases::{self, LeaseRow, NewLease, NewRequest};
@@ -101,6 +102,29 @@ pub struct AcquireRequest {
     pub override_reason: Option<String>,
 }
 
+/// What a holder is told about what it leases: the resource's description,
+/// the unit's description and the resource's usage template rendered for the
+/// unit. Shared by grants and lease views so every path carries one brief.
+fn brief(resource: &Resource, unit: &Unit) -> (String, String, String) {
+    // The stored template passed `parse` when it was written.
+    let usage = UsageTemplate::from_stored(resource.usage.clone()).render(
+        &RenderResource {
+            id: &resource.id,
+            description: &resource.description,
+        },
+        &RenderUnit {
+            id: &unit.id,
+            description: &unit.description,
+            settings: &unit.settings,
+        },
+    );
+    (
+        resource.description.clone(),
+        unit.description.clone(),
+        usage,
+    )
+}
+
 /// An immediate grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Grant {
@@ -108,6 +132,12 @@ pub struct Grant {
     pub resource: ResourceId,
     pub unit: UnitId,
     pub settings: UnitSettings,
+    /// The resource's description.
+    pub resource_description: String,
+    /// The unit's description.
+    pub unit_description: String,
+    /// The resource's usage template, rendered for this unit.
+    pub usage: String,
     /// Unix milliseconds.
     pub ends_at: i64,
     /// Set when the unit was handed over without confirmed cleanup.
@@ -115,6 +145,8 @@ pub struct Grant {
 }
 
 /// The answer to an acquire.
+// One short-lived value per call; boxing the grant would only add noise for callers.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum AcquireOutcome {
@@ -150,6 +182,12 @@ pub struct Lease {
     pub resource: ResourceId,
     pub unit: UnitId,
     pub settings: UnitSettings,
+    /// The resource's description.
+    pub resource_description: String,
+    /// The unit's description.
+    pub unit_description: String,
+    /// The resource's usage template, rendered for this unit.
+    pub usage: String,
     pub state: LeaseState,
     pub holder: HolderRef,
     pub priority: Priority,
@@ -706,11 +744,15 @@ impl Scheduler {
                     "dirty": handed.dirty,
                 }),
             )?;
+            let (resource_description, unit_description, usage) = brief(&resource, unit);
             return Ok(AcquireOutcome::Granted(Grant {
                 lease_id: handed.id,
                 resource: resource.id.clone(),
                 unit: unit.id.clone(),
                 settings: unit.settings.clone(),
+                resource_description,
+                unit_description,
+                usage,
                 // Invariant: a held hand-over always sets ends_at.
                 ends_at: handed.ends_at.unwrap_or_default(),
                 dirty: handed.dirty,
@@ -932,14 +974,18 @@ impl Scheduler {
         let resource = inventory_sql::load_resource(tx, lease.resource_row)?;
         let unit = resource
             .units
-            .into_iter()
+            .iter()
             .find(|u| u.row == lease.unit_row)
             .ok_or(SchedulerError::NotFound)?;
+        let (resource_description, unit_description, usage) = brief(&resource, unit);
         Ok(Lease {
             id: lease.id,
             resource: resource.id,
-            unit: unit.id,
-            settings: unit.settings,
+            unit: unit.id.clone(),
+            settings: unit.settings.clone(),
+            resource_description,
+            unit_description,
+            usage,
             state: lease.state,
             holder: lease.holder,
             priority: lease.priority,

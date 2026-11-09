@@ -141,6 +141,8 @@ impl From<Promotion> for PromotionView {
 }
 
 /// The answer to an acquire, tagged by `outcome`.
+// One short-lived value per call; boxing the grant would only add noise for callers.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum AcquireView {
@@ -182,6 +184,10 @@ pub struct LeaseView {
     pub resource: ResourceId,
     pub unit: UnitId,
     pub settings: UnitSettings,
+    pub resource_description: String,
+    pub unit_description: String,
+    /// The usage template rendered for this unit.
+    pub usage: String,
     pub state: LeaseState,
     pub holder: HolderRef,
     pub priority: Priority,
@@ -223,6 +229,9 @@ impl From<Lease> for LeaseView {
             resource: l.resource,
             unit: l.unit,
             settings: l.settings,
+            resource_description: l.resource_description,
+            unit_description: l.unit_description,
+            usage: l.usage,
             state: l.state,
             holder: l.holder,
             priority: l.priority,
