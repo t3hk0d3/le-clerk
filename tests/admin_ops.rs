@@ -1723,6 +1723,94 @@ mod admin_ops {
             }
         }
 
+        /// A database file whose migrated text breaks the rules: resource
+        /// `board` has an unknown placeholder in its usage, its unit `u1`
+        /// a multiline description; `fine` is untouched.
+        async fn legacy_text() -> (TempDir, std::path::PathBuf) {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("clerk.db");
+            let (h, _clock) = spawn_on(Store::open(&path).unwrap());
+            seed_board(&h, &["u1"]).await;
+            seed(&h, &user("o"), "fine", json!("user"), &[("f1", "kf")]).await;
+            stop(&h).await;
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "UPDATE resources SET usage = 'flash {unit.pth}' WHERE id = 'board'; \
+                 UPDATE units SET description = 'left' || char(10) || 'port' \
+                     WHERE id = 'u1';",
+            )
+            .unwrap();
+            drop(conn);
+            (dir, path)
+        }
+
+        mod on_legacy_text_that_breaks_the_rules {
+            use super::*;
+
+            #[tokio::test]
+            async fn reports_the_resource_with_invalid_usage() {
+                let (_dir, path) = legacy_text().await;
+                let (h, _clock) = spawn_on(Store::open(&path).unwrap());
+                let report = ok(&h, "admin_doctor", &admin(), json!({})).await;
+                let found = finding(&report, "invalid_resource_text");
+                assert_eq!(found.len(), 1, "{report}");
+                assert_eq!(found[0]["subject"], "board (user)");
+                assert_eq!(found[0]["fixed"], false);
+            }
+
+            #[tokio::test]
+            async fn reports_the_unit_with_a_multiline_description() {
+                let (_dir, path) = legacy_text().await;
+                let (h, _clock) = spawn_on(Store::open(&path).unwrap());
+                let report = ok(&h, "admin_doctor", &admin(), json!({})).await;
+                let found = finding(&report, "invalid_unit_text");
+                assert_eq!(found.len(), 1, "{report}");
+                assert_eq!(found[0]["subject"], "board/u1 (user)");
+                assert_eq!(found[0]["fixed"], false);
+            }
+
+            #[tokio::test]
+            async fn reports_nothing_else() {
+                let (_dir, path) = legacy_text().await;
+                let (h, _clock) = spawn_on(Store::open(&path).unwrap());
+                let report = ok(&h, "admin_doctor", &admin(), json!({})).await;
+                assert_eq!(report["findings"].as_array().unwrap().len(), 2, "{report}");
+            }
+
+            #[tokio::test]
+            async fn leaves_the_text_unchanged_and_unfixed_with_fix() {
+                let (_dir, path) = legacy_text().await;
+                let (h, _clock) = spawn_on(Store::open(&path).unwrap());
+                let report = ok(&h, "admin_doctor", &admin(), json!({"fix": true})).await;
+                for f in report["findings"].as_array().unwrap() {
+                    assert_eq!(f["fixed"], false, "{f}");
+                }
+                let out = export(&h).await;
+                let board = out["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r["id"] == "board")
+                    .unwrap();
+                assert_eq!(board["usage"], "flash {unit.pth}");
+                assert_eq!(board["units"][0]["description"], "left\nport");
+                let again = ok(&h, "admin_doctor", &admin(), json!({})).await;
+                assert_eq!(again["findings"].as_array().unwrap().len(), 2, "{again}");
+            }
+
+            #[tokio::test]
+            async fn export_then_import_into_a_fresh_database_imports_nothing() {
+                let (_dir, path) = legacy_text().await;
+                let (h, _clock) = spawn_on(Store::open(&path).unwrap());
+                let doc = export(&h).await;
+                let (fresh, _clock) = spawn();
+                let e = err(&fresh, "admin_import", &admin(), json!({"doc": doc})).await;
+                assert_eq!(e.code, "unknown_placeholder");
+                let after = export(&fresh).await;
+                assert_eq!(after["resources"], json!([]));
+            }
+        }
+
         mod read_only {
             use super::*;
 
@@ -2243,7 +2331,19 @@ mod export_text {
                 let (h, _clock) = spawn();
                 seed(&h, &user("o"), "other", json!("user"), &[("x1", "kx")]).await;
                 let before = export(&h).await;
-                let _ = err(&h, "admin_import", &admin(), json!({"doc": bad_doc()})).await;
+                // A valid resource comes first, so the failure arrives
+                // after a write.
+                let mut doc = legacy_doc();
+                doc["resources"][0]["id"] = json!("first");
+                doc["resources"][0]["notes"] = json!("flash {unit.path}");
+                let mut second = bad_doc()["resources"][0].clone();
+                second["id"] = json!("second");
+                second["units"][0]["settings"]["path"] = json!("/dev/ttyUSB1");
+                doc["resources"].as_array_mut().unwrap().push(second);
+                let e = err(&h, "admin_import", &admin(), json!({"doc": doc})).await;
+                assert_eq!(e.code, "unknown_placeholder");
+                let missing = err(&h, "get_resource", &user("x"), json!({"id": "first"})).await;
+                assert_eq!(missing.code, "not_found");
                 assert_eq!(export(&h).await, before);
             }
         }

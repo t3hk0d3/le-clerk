@@ -133,10 +133,10 @@ impl Description {
     /// Validate `text` as a description. It is stored as given, untrimmed.
     ///
     /// # Errors
-    /// [`TextError::DescriptionMultiline`] on `\n` or `\r`;
+    /// [`TextError::DescriptionMultiline`] on `\n`, `\r`, U+0085, U+2028 or U+2029;
     /// [`TextError::DescriptionTooLong`] over [`DESCRIPTION_MAX_CHARS`] characters.
     pub fn parse(text: &str) -> Result<Self, TextError> {
-        if text.contains(['\n', '\r']) {
+        if text.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']) {
             return Err(TextError::DescriptionMultiline);
         }
         if text.chars().count() > DESCRIPTION_MAX_CHARS {
@@ -399,6 +399,34 @@ mod tests {
                         Err(TextError::DescriptionMultiline)
                     );
                 }
+            }
+        }
+
+        mod on_text_containing_a_unicode_line_break {
+            use super::*;
+
+            #[test]
+            fn returns_description_multiline_for_next_line() {
+                assert_eq!(
+                    Description::parse("a\u{85}b"),
+                    Err(TextError::DescriptionMultiline)
+                );
+            }
+
+            #[test]
+            fn returns_description_multiline_for_line_separator() {
+                assert_eq!(
+                    Description::parse("a\u{2028}b"),
+                    Err(TextError::DescriptionMultiline)
+                );
+            }
+
+            #[test]
+            fn returns_description_multiline_for_paragraph_separator() {
+                assert_eq!(
+                    Description::parse("a\u{2029}b"),
+                    Err(TextError::DescriptionMultiline)
+                );
             }
         }
     }

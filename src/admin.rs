@@ -19,8 +19,8 @@ use crate::error::ErrorCode;
 use crate::health;
 use crate::inventory::{Inventory, InventoryError, NewResource, NewUnit, Warning};
 use crate::model::{
-    Caller, EndCause, HealthSpec, HolderRef, LeaseId, ProjectKey, RequestId, Resource, ResourceId,
-    ResourceType, Scope, Unit, UnitId, UnitSettings,
+    Caller, Description, EndCause, HealthSpec, HolderRef, LeaseId, ProjectKey, RequestId, Resource,
+    ResourceId, ResourceType, Scope, Unit, UnitId, UnitSettings, UsageTemplate,
 };
 use crate::scheduler::liveness;
 use crate::scheduler::{Lease, LeaseEdit, Scheduler, SchedulerError};
@@ -272,6 +272,12 @@ pub enum FindingKind {
     MissingDevicePath,
     /// A link naming a unit that no longer exists.
     LinkToMissingUnit,
+    /// A resource whose stored description or usage breaks the text rules
+    /// (text from before migration 0010 is not validated). Never fixed.
+    InvalidResourceText,
+    /// A unit whose stored description breaks the text rules (text from
+    /// before migration 0010 is not validated). Never fixed.
+    InvalidUnitText,
 }
 
 /// One doctor finding.
@@ -279,7 +285,7 @@ pub enum FindingKind {
 pub struct Finding {
     pub kind: FindingKind,
     /// What it is about: a lease or request id, a holder, `resource/unit`,
-    /// or `<unit row>-<unit row>` for a link.
+    /// `resource (scope)` or `resource/unit (scope)` for invalid text, or `<unit row>-<unit row>` for a link.
     pub subject: String,
     /// True when this run repaired it.
     pub fixed: bool,
@@ -836,8 +842,10 @@ impl<'a> Admin<'a> {
     }
 
     /// Look for damage: leases on missing units, requests for missing
-    /// resources, dead CLI holders, device units whose path is gone, and
-    /// links to missing units. With `fix`, repair each one that can be
+    /// resources, dead CLI holders, device units whose path is gone, links
+    /// to missing units, and stored descriptions or usage that break the
+    /// text rules (text from before migration 0010 is not validated; these
+    /// are only reported, never fixed). With `fix`, repair each one that can be
     /// repaired (a missing device path is only reported) and audit each
     /// repair as `admin_doctor_fix`.
     ///
@@ -912,7 +920,22 @@ impl<'a> Admin<'a> {
             found(tx, FindingKind::DeadHolder, subject, fix)?;
         }
         for resource in inventory_sql::list_resources(tx, ScopeFilter::All)? {
+            if Description::parse(&resource.description).is_err()
+                || UsageTemplate::parse(&resource.usage, resource.ty).is_err()
+            {
+                let subject = label(&resource.id, &resource.scope);
+                found(tx, FindingKind::InvalidResourceText, subject, false)?;
+            }
             for unit in &resource.units {
+                if Description::parse(&unit.description).is_err() {
+                    let subject = format!(
+                        "{}/{} ({})",
+                        resource.id,
+                        unit.id,
+                        ScopeSpec::from(&resource.scope)
+                    );
+                    found(tx, FindingKind::InvalidUnitText, subject, false)?;
+                }
                 if let UnitSettings::Device { path } = &unit.settings
                     && !health::path_exists(path)
                 {
@@ -933,6 +956,11 @@ impl<'a> Admin<'a> {
     /// Every resource with its units, and every link, in the export format
     /// (version 1). Resources are ordered by id then scope; links by their
     /// ends.
+    ///
+    /// Text from before migration 0010 is exported as stored, without
+    /// validation. `admin doctor` reports such text; it must be corrected
+    /// (`update_resource` / `update_unit`) before the export can be
+    /// re-imported.
     ///
     /// # Errors
     /// [`AdminError::Store`] on storage failure.
@@ -1056,7 +1084,13 @@ impl<'a> Admin<'a> {
     /// [`AdminError::ImportClash`] listing existing resources when not
     /// `replace`; [`AdminError::LinkConflict`] naming the units when a
     /// document link would join two leased identity groups; [`AdminError::Inventory`] when an inventory rule refuses
-    /// (e.g. a unit duplicating one in the same scope).
+    /// (e.g. a unit duplicating one in the same scope); text validation
+    /// errors arrive as `AdminError::Inventory(InventoryError::InvalidText(_))`.
+    ///
+    /// Descriptions and usage are validated on import. A document exported
+    /// from a database holding text from before migration 0010 (which is
+    /// not validated) fails until that text is corrected; `admin doctor`
+    /// reports it.
     pub fn import(
         &self,
         tx: &Tx,

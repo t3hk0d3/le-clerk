@@ -2854,6 +2854,62 @@ mod text_fields {
         }
     }
 
+    mod update_unit_duplicates {
+        use super::*;
+
+        mod on_new_settings_matching_a_unit_in_the_same_scope {
+            use super::*;
+
+            fn refused() -> InventoryError {
+                let mut f = fixture();
+                f.seed_described(None, "first", ("first board", "first port"), "k1")
+                    .unwrap();
+                f.seed_described(None, "second", ("second board", "second port"), "k2")
+                    .unwrap();
+                let who = caller(None);
+                f.store
+                    .tx(|tx| {
+                        f.inv.update_unit(
+                            tx,
+                            &who,
+                            &rid("second"),
+                            &uid("u1"),
+                            UnitPatch {
+                                settings: Some(generic_settings("k1")),
+                                description: None,
+                            },
+                        )
+                    })
+                    .unwrap_err()
+            }
+
+            #[test]
+            fn duplicate_in_scope_carries_the_existing_descriptions() {
+                assert!(matches!(
+                    refused(),
+                    InventoryError::DuplicateInScope {
+                        ref resource,
+                        ref unit,
+                        ref resource_description,
+                        ref unit_description,
+                    } if *resource == rid("first")
+                        && *unit == uid("u1")
+                        && resource_description == "first board"
+                        && unit_description == "first port"
+                ));
+            }
+
+            #[test]
+            fn details_include_both_descriptions() {
+                let details = refused().details().unwrap();
+                assert_eq!(details["resource"], "first");
+                assert_eq!(details["unit"], "u1");
+                assert_eq!(details["resource_description"], "first board");
+                assert_eq!(details["unit_description"], "first port");
+            }
+        }
+    }
+
     mod add_unit_duplicates {
         use super::*;
 
