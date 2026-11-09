@@ -38,7 +38,16 @@ pub struct AdminArgs {
 pub struct ScopeFlag {
     /// `user` or `project:<path>`; default: your project, then user scope.
     #[arg(long, value_parser = ScopeSpec::parse, value_name = "SCOPE")]
-    scope: Option<ScopeSpec>,
+    pub scope: Option<ScopeSpec>,
+}
+
+impl ScopeFlag {
+    /// Add the scope, when one is given, to RPC arguments `args`.
+    pub fn put(&self, args: &mut Value) {
+        if let Some(scope) = &self.scope {
+            args["scope"] = json!(scope.to_string());
+        }
+    }
 }
 
 #[derive(Subcommand)]

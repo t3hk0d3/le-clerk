@@ -13,7 +13,8 @@ use leclerk::model::{BuiltinCheck, Check, HealthSpec, ResourceType, Scope, Servi
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
-use super::caller::CallerKind;
+use super::admin::ScopeFlag;
+use super::caller::{self, CallerKind};
 use super::input::{self, InputSpec};
 use super::output::View;
 use super::{Ctx, UsageError, views};
@@ -28,6 +29,8 @@ pub enum ResourceAction {
     Delete {
         /// The resource id.
         id: String,
+        #[command(flatten)]
+        scope: ScopeFlag,
     },
     /// List resources, optionally only those carrying every given tag.
     List(views::TagFilter),
@@ -35,6 +38,8 @@ pub enum ResourceAction {
     Show {
         /// The resource id.
         id: String,
+        #[command(flatten)]
+        scope: ScopeFlag,
     },
 }
 
@@ -169,7 +174,8 @@ pub struct CreateArgs {
     /// What kind of thing it is.
     #[arg(long = "type", value_enum)]
     ty: Option<TypeArg>,
-    /// `user` (the default) or `project` (the working directory's project).
+    /// `user` or `project` (the working directory's project). Default:
+    /// `user`; in an agent session, the session's project when there is one.
     #[arg(long, value_enum)]
     scope: Option<ScopeArg>,
     #[command(flatten)]
@@ -188,6 +194,8 @@ pub struct CreateArgs {
 pub struct UpdateArgs {
     /// The resource id.
     id: String,
+    #[command(flatten)]
+    scope: ScopeFlag,
     #[command(flatten)]
     text: TextArgs,
     /// Replace every tag with these.
@@ -212,6 +220,8 @@ pub struct UnitRef {
     resource: String,
     /// The unit id.
     unit: String,
+    #[command(flatten)]
+    scope: ScopeFlag,
 }
 
 #[derive(Args)]
@@ -220,6 +230,8 @@ pub struct UnitArgs {
     resource: String,
     /// The unit id.
     unit: String,
+    #[command(flatten)]
+    scope: ScopeFlag,
     /// Device: the node's path.
     #[arg(long)]
     path: Option<String>,
@@ -344,9 +356,9 @@ pub async fn resource(ctx: &Ctx, action: ResourceAction) -> anyhow::Result<()> {
     match action {
         ResourceAction::Create(args) => create(ctx, args).await,
         ResourceAction::Update(args) => update(ctx, args).await,
-        ResourceAction::Delete { id } => delete(ctx, id).await,
+        ResourceAction::Delete { id, scope } => delete(ctx, id, &scope).await,
         ResourceAction::List(filter) => views::resources(ctx, filter.tags).await,
-        ResourceAction::Show { id } => views::show(ctx, &id).await,
+        ResourceAction::Show { id, scope } => views::show(ctx, &id, &scope).await,
     }
 }
 
@@ -369,6 +381,10 @@ async fn create(ctx: &Ctx, args: CreateArgs) -> anyhow::Result<()> {
         )
     })?;
     let scope = match once("scope", "--scope", args.scope, doc.scope)? {
+        // An agent registers what it finds for its own project by default.
+        None if caller::is_agent(&caller) => {
+            caller.project.clone().map_or(Scope::User, Scope::Project)
+        }
         None | Some(ScopeArg::User) => Scope::User,
         Some(ScopeArg::Project) => Scope::Project(caller.project.clone().ok_or_else(|| {
             UsageError(
@@ -416,6 +432,9 @@ async fn update(ctx: &Ctx, args: UpdateArgs) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Interactive)?;
     let mut a = Map::new();
     a.insert("id".into(), json!(args.id));
+    if let Some(scope) = &args.scope.scope {
+        a.insert("scope".into(), json!(scope.to_string()));
+    }
     put_text(&mut a, &args.text, doc.description, doc.usage)?;
     let lists = [
         (
@@ -468,11 +487,13 @@ async fn update(ctx: &Ctx, args: UpdateArgs) -> anyhow::Result<()> {
     }))
 }
 
-async fn delete(ctx: &Ctx, id: String) -> anyhow::Result<()> {
+async fn delete(ctx: &Ctx, id: String, scope: &ScopeFlag) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Interactive)?;
+    let mut a = json!({ "id": id });
+    scope.put(&mut a);
     ctx.client()
         .await?
-        .call("delete_resource", &caller, json!({ "id": id }))
+        .call("delete_resource", &caller, a)
         .await?;
     ctx.out
         .emit(&View::new(json!({"deleted": {"resource": id}}), |v| {
@@ -606,6 +627,7 @@ async fn add_unit(ctx: &Ctx, args: UnitArgs) -> anyhow::Result<()> {
     let settings = fields.new_settings()?;
     let caller = ctx.caller(CallerKind::Interactive)?;
     let mut a = json!({"resource": args.resource, "id": args.unit, "settings": settings});
+    args.scope.put(&mut a);
     if let Some(description) = &fields.description {
         a["description"] = json!(description);
     }
@@ -628,11 +650,12 @@ async fn update_unit(ctx: &Ctx, args: UnitArgs) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Interactive)?;
     let client = ctx.client().await?;
     let mut a = json!({"resource": args.resource, "unit": args.unit});
+    args.scope.put(&mut a);
     if let Some(kind) = kind {
         // The daemon replaces settings whole: start from the current ones.
-        let resource = client
-            .call("get_resource", &caller, json!({ "id": args.resource }))
-            .await?;
+        let mut get = json!({ "id": args.resource });
+        args.scope.put(&mut get);
+        let resource = client.call("get_resource", &caller, get).await?;
         let current = resource["units"]
             .as_array()
             .and_then(|units| units.iter().find(|u| u["id"] == args.unit.as_str()))
@@ -677,14 +700,9 @@ async fn update_unit(ctx: &Ctx, args: UnitArgs) -> anyhow::Result<()> {
 
 async fn remove_unit(ctx: &Ctx, r: UnitRef, method: &'static str) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Interactive)?;
-    ctx.client()
-        .await?
-        .call(
-            method,
-            &caller,
-            json!({"resource": r.resource, "unit": r.unit}),
-        )
-        .await?;
+    let mut a = json!({"resource": r.resource, "unit": r.unit});
+    r.scope.put(&mut a);
+    ctx.client().await?.call(method, &caller, a).await?;
     let done = if method == "retire_unit" {
         "retired"
     } else {

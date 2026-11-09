@@ -745,6 +745,235 @@ mod engine {
         }
     }
 
+    /// Inventory calls naming the resource's scope (`user` or
+    /// `project:<path>`), for the user's CLI, which sees every scope.
+    mod explicit_scope {
+        use super::*;
+
+        const ALPHA: &str = "project:/work/alpha";
+
+        /// Project alpha's `board`, with unit `u1`.
+        async fn alpha_board(h: &EngineHandle) {
+            let a = in_project("a", "/work/alpha");
+            ok(
+                h,
+                "create_resource",
+                &a,
+                json!({"id": "board", "type": "generic", "scope": {"project": "/work/alpha"}}),
+            )
+            .await;
+            ok(
+                h,
+                "add_unit",
+                &a,
+                json!({"resource": "board", "id": "u1",
+                       "settings": {"type": "generic", "identity_key": "k1"}}),
+            )
+            .await;
+        }
+
+        fn agent() -> Caller {
+            Caller {
+                holder: HolderRef::AgentSession {
+                    session_id: "s1".into(),
+                },
+                project: Some(ProjectKey("/work/alpha".into())),
+                override_reason: None,
+            }
+        }
+
+        mod on_user_outside_the_project {
+            use super::*;
+
+            #[tokio::test]
+            async fn get_resource_finds_it() {
+                let (h, _clock) = spawn();
+                alpha_board(&h).await;
+                let got = ok(
+                    &h,
+                    "get_resource",
+                    &user("x"),
+                    json!({"id": "board", "scope": ALPHA}),
+                )
+                .await;
+                assert_eq!(got["scope"], json!({"project": "/work/alpha"}), "{got}");
+            }
+
+            #[tokio::test]
+            async fn update_resource_changes_it() {
+                let (h, _clock) = spawn();
+                alpha_board(&h).await;
+                ok(
+                    &h,
+                    "update_resource",
+                    &user("x"),
+                    json!({"id": "board", "scope": ALPHA, "description": "moved"}),
+                )
+                .await;
+                let got = ok(
+                    &h,
+                    "get_resource",
+                    &in_project("a", "/work/alpha"),
+                    json!({"id": "board"}),
+                )
+                .await;
+                assert_eq!(got["description"], "moved");
+            }
+
+            #[tokio::test]
+            async fn add_and_retire_unit_change_its_units() {
+                let (h, _clock) = spawn();
+                alpha_board(&h).await;
+                ok(
+                    &h,
+                    "add_unit",
+                    &user("x"),
+                    json!({"resource": "board", "scope": ALPHA, "id": "u2",
+                           "settings": {"type": "generic", "identity_key": "k2"}}),
+                )
+                .await;
+                ok(
+                    &h,
+                    "retire_unit",
+                    &user("x"),
+                    json!({"resource": "board", "scope": ALPHA, "unit": "u1"}),
+                )
+                .await;
+                let got = ok(
+                    &h,
+                    "get_resource",
+                    &in_project("a", "/work/alpha"),
+                    json!({"id": "board"}),
+                )
+                .await;
+                let ids: Vec<&Value> = got["units"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|u| &u["id"])
+                    .collect();
+                assert_eq!(ids, [&json!("u2")], "{got}");
+            }
+
+            #[tokio::test]
+            async fn delete_resource_deletes_it() {
+                let (h, _clock) = spawn();
+                alpha_board(&h).await;
+                ok(
+                    &h,
+                    "delete_resource",
+                    &user("x"),
+                    json!({"id": "board", "scope": ALPHA}),
+                )
+                .await;
+                let err = rpc(
+                    &h,
+                    "get_resource",
+                    &in_project("a", "/work/alpha"),
+                    json!({"id": "board"}),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.code, "not_found");
+            }
+        }
+
+        mod without_scope {
+            use super::*;
+
+            #[tokio::test]
+            async fn another_projects_resource_stays_not_found() {
+                let (h, _clock) = spawn();
+                alpha_board(&h).await;
+                let err = rpc(&h, "get_resource", &user("x"), json!({"id": "board"}))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, "not_found");
+            }
+        }
+
+        mod on_scope_without_that_resource {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_not_found_even_when_user_scope_has_it() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let err = rpc(
+                    &h,
+                    "get_resource",
+                    &user("x"),
+                    json!({"id": "board", "scope": ALPHA}),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.code, "not_found");
+            }
+        }
+
+        mod on_agent_session_caller {
+            use super::*;
+
+            #[tokio::test]
+            async fn get_resource_is_refused_scope_not_allowed() {
+                let (h, _clock) = spawn();
+                alpha_board(&h).await;
+                let err = rpc(
+                    &h,
+                    "get_resource",
+                    &agent(),
+                    json!({"id": "board", "scope": ALPHA}),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.code, "scope_not_allowed");
+            }
+
+            #[tokio::test]
+            async fn unit_calls_are_refused_scope_not_allowed() {
+                let (h, _clock) = spawn();
+                alpha_board(&h).await;
+                for (method, args) in [
+                    (
+                        "remove_unit",
+                        json!({"resource": "board", "scope": ALPHA, "unit": "u1"}),
+                    ),
+                    (
+                        "retire_unit",
+                        json!({"resource": "board", "scope": "user", "unit": "u1"}),
+                    ),
+                    (
+                        "update_unit",
+                        json!({"resource": "board", "scope": ALPHA, "unit": "u1"}),
+                    ),
+                ] {
+                    let err = rpc(&h, method, &agent(), args).await.unwrap_err();
+                    assert_eq!(err.code, "scope_not_allowed", "{method}");
+                }
+            }
+
+            #[tokio::test]
+            async fn nothing_changes() {
+                let (h, _clock) = spawn();
+                alpha_board(&h).await;
+                let _ = rpc(
+                    &h,
+                    "delete_resource",
+                    &agent(),
+                    json!({"id": "board", "scope": ALPHA}),
+                )
+                .await;
+                ok(
+                    &h,
+                    "get_resource",
+                    &in_project("a", "/work/alpha"),
+                    json!({"id": "board"}),
+                )
+                .await;
+            }
+        }
+    }
+
     /// Daemon-side guard: agent sessions never get a view of every scope.
     mod agent_session_guard {
         use super::*;

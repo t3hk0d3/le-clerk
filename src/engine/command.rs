@@ -17,13 +17,14 @@ use crate::engine::wire::{
     ResourceView,
 };
 use crate::inventory::{
-    Inventory, NewResource, NewUnit, Promotions, ResourcePatch, UnitPatch, View,
+    Inventory, InventoryError, NewResource, NewUnit, Promotions, ResourcePatch, UnitPatch, View,
 };
 use crate::model::{
     Caller, HealthSpec, HolderRef, LeaseId, Priority, PromotionId, RequestId, ResourceId,
     ResourceType, Scope, UnitId, UnitSettings,
 };
 use crate::scheduler::{AcquireRequest, Confirm, LeaseEdit, Scheduler, Target};
+use crate::store::inventory as inventory_sql;
 use crate::store::{Tx, audit};
 
 /// Which resources a listing or status covers.
@@ -97,6 +98,10 @@ pub struct CreateResourceArgs {
 #[serde(deny_unknown_fields)]
 pub struct UpdateResourceArgs {
     pub id: ResourceId,
+    /// Resolve the id in this scope only (`user` or `project:<path>`);
+    /// absent resolves as for the caller. Refused to agent sessions.
+    #[serde(default)]
+    pub scope: Option<ScopeSpec>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -117,6 +122,10 @@ pub struct UpdateResourceArgs {
 #[serde(deny_unknown_fields)]
 pub struct ResourceArgs {
     pub id: ResourceId,
+    /// Resolve the id in this scope only (`user` or `project:<path>`);
+    /// absent resolves as for the caller. Refused to agent sessions.
+    #[serde(default)]
+    pub scope: Option<ScopeSpec>,
 }
 
 /// `status`.
@@ -142,6 +151,10 @@ pub struct ListResourcesArgs {
 #[serde(deny_unknown_fields)]
 pub struct AddUnitArgs {
     pub resource: ResourceId,
+    /// Resolve the id in this scope only (`user` or `project:<path>`);
+    /// absent resolves as for the caller. Refused to agent sessions.
+    #[serde(default)]
+    pub scope: Option<ScopeSpec>,
     pub id: UnitId,
     pub settings: UnitSettings,
     #[serde(default)]
@@ -153,6 +166,10 @@ pub struct AddUnitArgs {
 #[serde(deny_unknown_fields)]
 pub struct UpdateUnitArgs {
     pub resource: ResourceId,
+    /// Resolve the id in this scope only (`user` or `project:<path>`);
+    /// absent resolves as for the caller. Refused to agent sessions.
+    #[serde(default)]
+    pub scope: Option<ScopeSpec>,
     pub unit: UnitId,
     #[serde(default)]
     pub settings: Option<UnitSettings>,
@@ -165,6 +182,10 @@ pub struct UpdateUnitArgs {
 #[serde(deny_unknown_fields)]
 pub struct UnitArgs {
     pub resource: ResourceId,
+    /// Resolve the id in this scope only (`user` or `project:<path>`);
+    /// absent resolves as for the caller. Refused to agent sessions.
+    #[serde(default)]
+    pub scope: Option<ScopeSpec>,
     pub unit: UnitId,
 }
 
@@ -567,6 +588,15 @@ impl Command {
             Self::Status(_, a) if a.view == ViewArg::All => Some("view every scope"),
             Self::ListResources(_, a) if a.view == ViewArg::All => Some("list every scope"),
             Self::LeaseHolder(..) => Some("look up the user's lease holders"),
+            Self::UpdateResource(_, UpdateResourceArgs { scope: Some(_), .. })
+            | Self::GetResource(_, ResourceArgs { scope: Some(_), .. })
+            | Self::DeleteResource(_, ResourceArgs { scope: Some(_), .. })
+            | Self::AddUnit(_, AddUnitArgs { scope: Some(_), .. })
+            | Self::UpdateUnit(_, UpdateUnitArgs { scope: Some(_), .. })
+            | Self::RemoveUnit(_, UnitArgs { scope: Some(_), .. })
+            | Self::RetireUnit(_, UnitArgs { scope: Some(_), .. }) => {
+                Some("name a scope explicitly")
+            }
             Self::RequestHolder(..) => Some("look up the user's request holders"),
             _ => None,
         }
@@ -601,12 +631,14 @@ impl Command {
                     add_tags: a.add_tags,
                     remove_tags: a.remove_tags,
                 };
+                let who = scoped(tx, who, a.scope.as_ref(), &a.id)?;
                 let updated = inv.update_resource(tx, &who, &a.id, patch)?;
                 let rows: Vec<i64> = updated.units.iter().map(|u| u.row).collect();
                 sched.forget_health(&rows);
                 encode(ResourceView::from(updated))
             }
             Self::DeleteResource(who, a) => {
+                let who = scoped(tx, who, a.scope.as_ref(), &a.id)?;
                 inv.delete_resource(tx, &who, &a.id)?;
                 Ok(Value::Null)
             }
@@ -617,9 +649,11 @@ impl Command {
                     .collect::<Vec<_>>(),
             ),
             Self::GetResource(who, a) => {
+                let who = scoped(tx, who, a.scope.as_ref(), &a.id)?;
                 encode(ResourceView::from(inv.get_resource(tx, &who, &a.id)?))
             }
             Self::AddUnit(who, a) => {
+                let who = scoped(tx, who, a.scope.as_ref(), &a.resource)?;
                 let new = NewUnit {
                     id: a.id,
                     settings: a.settings,
@@ -637,15 +671,18 @@ impl Command {
                     settings: a.settings,
                     description: a.description,
                 };
+                let who = scoped(tx, who, a.scope.as_ref(), &a.resource)?;
                 let updated = inv.update_unit(tx, &who, &a.resource, &a.unit, patch)?;
                 sched.forget_health(&[updated.value.row]);
                 encode(CreatedUnit::from(updated))
             }
             Self::RemoveUnit(who, a) => {
+                let who = scoped(tx, who, a.scope.as_ref(), &a.resource)?;
                 inv.remove_unit(tx, &who, &a.resource, &a.unit)?;
                 Ok(Value::Null)
             }
             Self::RetireUnit(who, a) => {
+                let who = scoped(tx, who, a.scope.as_ref(), &a.resource)?;
                 inv.retire_unit(tx, &who, &a.resource, &a.unit)?;
                 Ok(Value::Null)
             }
@@ -832,6 +869,31 @@ impl Command {
             ))),
         }
     }
+}
+
+/// `who` as seen from an explicit `scope`: the resource id then resolves in
+/// that scope and nowhere else. The inventory resolves ids by the caller's
+/// project (that project first, then user scope), so the scope stands in
+/// for the project once the resource is known to be there. Only the user's
+/// CLI sends a scope; agent sessions are refused one (see `validate`).
+fn scoped(
+    tx: &Tx,
+    who: Caller,
+    scope: Option<&ScopeSpec>,
+    id: &ResourceId,
+) -> Result<Caller, ApiError> {
+    let Some(spec) = scope else {
+        return Ok(who);
+    };
+    let scope = spec.scope();
+    if inventory_sql::find_in_scope(tx, &scope, id)?.is_none() {
+        return Err(InventoryError::NotFound.into());
+    }
+    let project = match scope {
+        Scope::User => None,
+        Scope::Project(key) => Some(key),
+    };
+    Ok(Caller { project, ..who })
 }
 
 fn encode<T: serde::Serialize>(value: T) -> Result<Value, ApiError> {

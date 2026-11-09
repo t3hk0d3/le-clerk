@@ -244,6 +244,20 @@ fn two_projects(env: &Env, alpha_id: &str, beta_id: &str) -> (PathBuf, PathBuf) 
     (a, b)
 }
 
+/// Project alpha's resource `probe` with unit `u`, made by agent session
+/// `sess-a`; returns alpha's `--scope` value, `project:<path>`.
+fn alpha_probe(env: &Env) -> String {
+    let dir = env.dir("alpha");
+    json_of(env.agent("sess-a", &dir).args([
+        "resource", "create", "probe", "--type", "generic", "--scope", "project",
+    ]));
+    json_of(
+        env.agent("sess-a", &dir)
+            .args(["unit", "add", "probe", "u", "--key", "k-a"]),
+    );
+    format!("project:{}", canonical(&dir))
+}
+
 /// The values of `key` in a JSON array, as strings.
 fn strings(list: &Value, key: &str) -> Vec<String> {
     list.as_array()
@@ -438,6 +452,40 @@ mod cli {
                 }
             }
 
+            mod on_agent_session_without_scope {
+                use super::*;
+
+                #[test]
+                fn defaults_to_the_sessions_project() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let body = json_of(
+                        env.agent("sess-1", &dir)
+                            .args(["resource", "create", "probe", "--type", "generic"]),
+                    );
+                    assert_eq!(
+                        body["resource"]["scope"],
+                        json!({"project": canonical(&dir)})
+                    );
+                }
+            }
+
+            mod on_user_without_scope_inside_a_project {
+                use super::*;
+
+                #[test]
+                fn defaults_to_user_scope() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let body = json_of(
+                        env.cmd()
+                            .current_dir(&dir)
+                            .args(["resource", "create", "probe", "--type", "generic"]),
+                    );
+                    assert_eq!(body["resource"]["scope"], "user");
+                }
+            }
+
             mod on_scope_project {
                 use super::*;
 
@@ -591,6 +639,47 @@ mod cli {
         mod resource_update {
             use super::*;
 
+            mod on_scope_flag {
+                use super::*;
+
+                #[test]
+                fn changes_another_projects_resource() {
+                    let env = Env::new();
+                    let scope = alpha_probe(&env);
+                    env.ok(&[
+                        "resource",
+                        "update",
+                        "probe",
+                        "--scope",
+                        &scope,
+                        "--description",
+                        "moved",
+                    ]);
+                    let body = env.ok(&["resource", "show", "probe", "--scope", &scope]);
+                    assert_eq!(body["description"], "moved");
+                }
+
+                #[test]
+                fn agent_session_is_refused_exit_4() {
+                    let env = Env::new();
+                    let scope = alpha_probe(&env);
+                    let dir = env.dir("alpha");
+                    let error = error_of(
+                        env.agent("sess-a", &dir).args([
+                            "resource",
+                            "update",
+                            "probe",
+                            "--scope",
+                            &scope,
+                            "--description",
+                            "x",
+                        ]),
+                        4,
+                    );
+                    assert_eq!(error["code"], "scope_not_allowed");
+                }
+            }
+
             mod on_add_and_remove_tags {
                 use super::*;
 
@@ -614,6 +703,23 @@ mod cli {
 
         mod resource_delete {
             use super::*;
+
+            mod on_scope_flag {
+                use super::*;
+
+                #[test]
+                fn deletes_another_projects_resource() {
+                    let env = Env::new();
+                    let scope = alpha_probe(&env);
+                    env.ok(&["unit", "remove", "probe", "u", "--scope", &scope]);
+                    env.ok(&["resource", "delete", "probe", "--scope", &scope]);
+                    error_of(
+                        env.cmd()
+                            .args(["resource", "show", "probe", "--scope", &scope]),
+                        3,
+                    );
+                }
+            }
 
             #[test]
             fn removes_the_resource() {
@@ -648,6 +754,38 @@ mod cli {
         mod resource_show {
             use super::*;
 
+            mod on_scope_flag {
+                use super::*;
+
+                #[test]
+                fn shows_another_projects_resource() {
+                    let env = Env::new();
+                    let scope = alpha_probe(&env);
+                    let body = env.ok(&["resource", "show", "probe", "--scope", &scope]);
+                    assert_eq!(body["units"][0]["id"], "u", "{body}");
+                }
+
+                #[test]
+                fn without_it_another_projects_resource_is_not_found() {
+                    let env = Env::new();
+                    alpha_probe(&env);
+                    let error = error_of(env.cmd().args(["resource", "show", "probe"]), 3);
+                    assert_eq!(error["code"], "not_found");
+                }
+
+                #[test]
+                fn bad_scope_exits_2_without_daemon_call() {
+                    let env = Env::new();
+                    let error = error_of(
+                        env.cmd()
+                            .args(["resource", "show", "probe", "--scope", "everywhere"]),
+                        2,
+                    );
+                    assert_eq!(error["code"], "usage_error");
+                    assert!(!env.daemon_started());
+                }
+            }
+
             #[test]
             fn prints_the_raw_usage_template() {
                 let env = Env::new();
@@ -671,6 +809,21 @@ mod cli {
 
         mod unit_add {
             use super::*;
+
+            mod on_scope_flag {
+                use super::*;
+
+                #[test]
+                fn adds_to_another_projects_resource() {
+                    let env = Env::new();
+                    let scope = alpha_probe(&env);
+                    env.ok(&[
+                        "unit", "add", "probe", "u2", "--key", "k-2", "--scope", &scope,
+                    ]);
+                    let body = env.ok(&["resource", "show", "probe", "--scope", &scope]);
+                    assert_eq!(strings(&body["units"], "id"), ["u", "u2"]);
+                }
+            }
 
             mod on_service_flags {
                 use super::*;
@@ -741,6 +894,21 @@ mod cli {
         mod unit_update {
             use super::*;
 
+            mod on_scope_flag {
+                use super::*;
+
+                #[test]
+                fn changes_another_projects_unit() {
+                    let env = Env::new();
+                    let scope = alpha_probe(&env);
+                    env.ok(&[
+                        "unit", "update", "probe", "u", "--key", "k-new", "--scope", &scope,
+                    ]);
+                    let body = env.ok(&["resource", "show", "probe", "--scope", &scope]);
+                    assert_eq!(body["units"][0]["settings"]["identity_key"], "k-new");
+                }
+            }
+
             mod on_one_setting {
                 use super::*;
 
@@ -773,6 +941,19 @@ mod cli {
         mod unit_remove {
             use super::*;
 
+            mod on_scope_flag {
+                use super::*;
+
+                #[test]
+                fn removes_another_projects_unit() {
+                    let env = Env::new();
+                    let scope = alpha_probe(&env);
+                    env.ok(&["unit", "remove", "probe", "u", "--scope", &scope]);
+                    let body = env.ok(&["resource", "show", "probe", "--scope", &scope]);
+                    assert_eq!(body["units"], json!([]));
+                }
+            }
+
             #[test]
             fn removes_the_unit() {
                 let env = Env::new();
@@ -785,6 +966,19 @@ mod cli {
 
         mod unit_retire {
             use super::*;
+
+            mod on_scope_flag {
+                use super::*;
+
+                #[test]
+                fn retires_another_projects_unit() {
+                    let env = Env::new();
+                    let scope = alpha_probe(&env);
+                    env.ok(&["unit", "retire", "probe", "u", "--scope", &scope]);
+                    let body = env.ok(&["resource", "show", "probe", "--scope", &scope]);
+                    assert_eq!(body["units"], json!([]));
+                }
+            }
 
             #[test]
             fn marks_a_held_unit_retiring() {

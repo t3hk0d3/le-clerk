@@ -14,6 +14,7 @@ use leclerk::clock::{Clock, SystemClock};
 use leclerk::model::{Caller, HolderRef};
 use serde_json::{Value, json};
 
+use super::admin::ScopeFlag;
 use super::caller::{self, CallerKind};
 use super::gate;
 use super::output::{self, View, plain, table, truncate};
@@ -87,12 +88,14 @@ pub async fn resources(ctx: &Ctx, tags: Vec<String>) -> anyhow::Result<()> {
         .emit(&View::new(result, |v| fit(&resources_text(v))))
 }
 
-pub async fn show(ctx: &Ctx, id: &str) -> anyhow::Result<()> {
+pub async fn show(ctx: &Ctx, id: &str, scope: &ScopeFlag) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Interactive)?;
+    let mut args = json!({ "id": id });
+    scope.put(&mut args);
     let result = ctx
         .client()
         .await?
-        .call("get_resource", &caller, json!({ "id": id }))
+        .call("get_resource", &caller, args)
         .await?;
     ctx.out.emit(&View::new(result, resource_text))
 }
