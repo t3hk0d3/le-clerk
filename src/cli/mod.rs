@@ -101,10 +101,18 @@ enum Command {
         /// The request id.
         request: String,
     },
-    /// Give a lease back: its cleanup is confirmed at once.
+    /// Give a lease back: its cleanup is confirmed at once. With --force,
+    /// end anyone's lease now with its unit dirty (`clerk admin release`).
     Release {
         /// The lease id.
         lease: String,
+        /// End the lease whoever holds it, as `clerk admin release` does;
+        /// asks for confirmation (or --yes), and agents need --override.
+        #[arg(long)]
+        force: bool,
+        /// With --force: confirm without asking.
+        #[arg(long, requires = "force")]
+        yes: bool,
     },
     /// Move a lease's end to now plus --for.
     Extend(lease::ExtendArgs),
@@ -251,7 +259,12 @@ async fn dispatch(ctx: &Ctx, command: Command) -> anyhow::Result<()> {
         Command::Acquire(args) => lease::acquire(ctx, args).await,
         Command::Attach { lease } => lease::attach(ctx, lease).await,
         Command::Cancel { request } => lease::cancel_request(ctx, request).await,
-        Command::Release { lease } => lease::release(ctx, lease).await,
+        Command::Release {
+            lease,
+            force: true,
+            yes,
+        } => admin::force_release(ctx, lease, yes).await,
+        Command::Release { lease, .. } => lease::release(ctx, lease).await,
         Command::Extend(args) => lease::extend(ctx, args).await,
         Command::Run(args) => lease::run(ctx, args).await,
         Command::Wait(args) => lease::wait(ctx, args).await,

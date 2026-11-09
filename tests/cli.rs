@@ -1807,13 +1807,58 @@ mod cli {
         }
 
         #[test]
-        fn since_drops_older_entries() {
+        fn since_a_span_keeps_newer_entries() {
             let env = Env::new();
             seed(&env, "board", "k1");
             assert_ne!(env.ok(&["log", "--since", "1h"]), json!([]));
-            let at = env.ok(&["log"])[0]["at"].as_i64().unwrap();
-            let later = (at + 60_000).to_string();
-            assert_eq!(env.ok(&["log", "--since", &later]), json!([]));
+        }
+
+        mod on_since_rfc3339 {
+            use super::*;
+
+            #[test]
+            fn keeps_entries_after_it() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let body = env.ok(&["log", "--since", "2000-01-01T00:00:00Z"]);
+                assert_ne!(body, json!([]));
+            }
+
+            #[test]
+            fn drops_entries_before_it() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let body = env.ok(&["log", "--since", "2999-01-01T00:00:00+02:00"]);
+                assert_eq!(body, json!([]));
+            }
+        }
+
+        mod on_since_bare_number {
+            use super::*;
+
+            #[test]
+            fn exits_2_naming_the_accepted_forms() {
+                let env = Env::new();
+                let error = error_of(env.cmd().args(["log", "--since", "5"]), 2);
+                assert_eq!(error["code"], "usage_error");
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("<n>s|m|h|d"), "{message}");
+                assert!(message.contains("RFC 3339"), "{message}");
+                assert!(!env.daemon_started());
+            }
+        }
+
+        mod on_since_negative {
+            use super::*;
+
+            #[test]
+            fn exits_2_naming_the_accepted_forms() {
+                let env = Env::new();
+                let error = error_of(env.cmd().args(["log", "--since", "-5m"]), 2);
+                assert_eq!(error["code"], "usage_error");
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("RFC 3339"), "{message}");
+            }
         }
 
         mod on_agent_session_without_override {
@@ -1881,6 +1926,26 @@ mod cli {
             promotion(&env);
             let body = env.ok(&["promotions"]);
             assert_eq!(body[0]["resource"], "a-board");
+        }
+
+        mod on_terminal {
+            use super::*;
+
+            #[test]
+            fn shows_the_resource_description() {
+                let env = Env::new();
+                promotion(&env);
+                json_of(env.cmd().current_dir(env.dir("alpha")).args([
+                    "resource",
+                    "update",
+                    "a-board",
+                    "--description",
+                    "The alpha devkit",
+                ]));
+                let shown = env.tty("\"$CLERK\" promotions");
+                assert!(shown.contains("DESCRIPTION"), "{shown}");
+                assert!(shown.contains("The alpha devkit"), "{shown}");
+            }
         }
 
         mod on_agent_session_without_override {
@@ -2133,14 +2198,18 @@ mod cli {
     /// Returns (paused, borrower).
     fn lent(env: &Env) -> (String, String) {
         seed(env, "board", "k1");
-        let paused = lease_of(&env.ok(&["acquire", "board", "--for", "10m", "--interruptible"]));
-        let owner: HolderRef =
-            serde_json::from_value(unit_status(env)["occupancy"]["holder"].clone()).unwrap();
-        let owner = Caller {
-            holder: owner,
-            project: None,
-            override_reason: None,
-        };
+        // The CLI opens leases to interruption only for agent sessions, so
+        // the user-holder lease is made directly.
+        let owner = user("owner");
+        let paused = lease_of(
+            &env.rpc(
+                "acquire",
+                &owner,
+                json!({"target": {"resource": "board"}, "duration_ms": 600_000,
+                       "interruptible": true, "purpose": "lend it"}),
+            )
+            .unwrap(),
+        );
         let mut borrower = spawn(
             env,
             &[
@@ -2421,6 +2490,66 @@ mod cli {
                 let body: Value = serde_json::from_str(&stdout_of(&mut child)).unwrap();
                 assert_eq!(body["state"], "held", "{body}");
                 assert_ne!(lease_of(&body), theirs);
+            }
+        }
+
+        mod on_interruptible_without_session {
+            use super::*;
+
+            #[test]
+            fn exits_2_without_daemon_call() {
+                let env = Env::new();
+                let error = error_of(
+                    env.cmd()
+                        .args(["acquire", "board", "--for", "10m", "--interruptible"]),
+                    2,
+                );
+                assert_eq!(error["code"], "usage_error");
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("--interruptible"), "{message}");
+                assert!(!env.daemon_started());
+            }
+
+            #[test]
+            fn run_exits_2_without_daemon_call() {
+                let env = Env::new();
+                let error = error_of(
+                    env.cmd().args([
+                        "run",
+                        "board",
+                        "--for",
+                        "10m",
+                        "--interruptible",
+                        "--",
+                        "true",
+                    ]),
+                    2,
+                );
+                assert_eq!(error["code"], "usage_error");
+                assert!(!env.daemon_started());
+            }
+        }
+
+        mod on_interruptible_in_agent_session {
+            use super::*;
+
+            #[test]
+            fn opens_the_lease_to_interruption() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let dir = env.dir("alpha");
+                let grant = json_of(env.agent("sess-1", &dir).args([
+                    "acquire",
+                    "board",
+                    "--for",
+                    "10m",
+                    "--interruptible",
+                ]));
+                let lease = json_of(
+                    env.agent("sess-1", &dir)
+                        .args(["attach", &lease_of(&grant)]),
+                );
+                assert_eq!(lease["interruptible"], true, "{lease}");
             }
         }
 

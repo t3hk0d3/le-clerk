@@ -1,11 +1,6 @@
 // Shared by every test crate; each one uses only a subset.
 #![allow(dead_code)]
 
-use assert_cmd::Command;
-use leclerk::model::{Resource, Unit};
-use leclerk::store::Tx;
-use tempfile::TempDir;
-
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,10 +8,13 @@ use std::process::{Child, ChildStdin, Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use assert_cmd::Command;
 use leclerk::client::{ApiError, Client};
 use leclerk::config::Paths;
-use leclerk::model::Caller;
+use leclerk::model::{Caller, Resource, Unit};
+use leclerk::store::Tx;
 use serde_json::Value;
+use tempfile::TempDir;
 
 /// An isolated clerk environment: every command it builds runs with
 /// `CLERK_HOME` pointing into a private tempdir.
@@ -98,7 +96,7 @@ pub const CTRL_BRACKET: &[u8] = b"\x1d";
 
 /// A private clerk home. Dropping it stops the daemon its commands started.
 pub struct Env {
-    pub env: TestEnv,
+    env: TestEnv,
 }
 
 impl Env {
@@ -118,17 +116,18 @@ impl Env {
             .unwrap()
     }
 
+    /// A clerk command run by the user: no agent session, bounded by
+    /// [`PATIENCE`].
+    pub fn cmd(&self) -> Command {
+        let mut cmd = self.env.cmd();
+        cmd.env_remove(SESSION_VAR).timeout(PATIENCE);
+        cmd
+    }
+
     /// Run `args` as the user without a terminal; assert success and parse
     /// stdout as JSON.
     pub fn ok(&self, args: &[&str]) -> Value {
-        let out = self
-            .env
-            .cmd()
-            .env_remove(SESSION_VAR)
-            .args(args)
-            .timeout(PATIENCE)
-            .output()
-            .unwrap();
+        let out = self.cmd().args(args).output().unwrap();
         assert!(out.status.success(), "{out:?}");
         serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"))
     }

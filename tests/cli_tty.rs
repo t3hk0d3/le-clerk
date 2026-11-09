@@ -10,7 +10,7 @@ use leclerk::model::{Caller, HolderRef};
 use leclerk::scope::ProjectResolver;
 use serde_json::{Value, json};
 
-use common::{CTRL_BRACKET, CTRL_C, Env, PATIENCE, SESSION_VAR, Tty};
+use common::{CTRL_BRACKET, CTRL_C, Env, Tty};
 
 fn user(tag: &str) -> Caller {
     Caller {
@@ -127,11 +127,8 @@ const ACQUIRE: &str = "\"$CLERK\" acquire board --for 10m";
 /// is held (exit 6).
 fn queue_detached(env: &Env) {
     let out = env
-        .env
         .cmd()
-        .env_remove(SESSION_VAR)
         .args(["acquire", "board", "--for", "10m"])
-        .timeout(PATIENCE)
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(6), "{out:?}");
@@ -368,6 +365,32 @@ mod cli {
                 // Near-simultaneous SIGINTs can merge into one trap run, so
                 // the count alone cannot see a forwarded copy; clerk says
                 // when it forwards one.
+                assert!(!shown.contains("Passing SIGINT on"), "{shown}");
+            }
+        }
+
+        mod on_ctrl_c_with_stdin_redirected {
+            use super::*;
+
+            #[test]
+            fn cmd_gets_one_sigint() {
+                let env = Env::new();
+                seed(&env);
+                let file = env.home().join("ints");
+                let file_text = file.to_string_lossy().into_owned();
+                let mut tty = Tty::spawn_with(
+                    &env,
+                    "\"$CLERK\" run board --for 10m -- sh -c 'trap \"echo INT >> \\\"$F\\\"\" INT; \
+                     echo started; i=0; while [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done' \
+                     < /dev/null",
+                    &[("F", &file_text)],
+                );
+                tty.expect("started");
+                tty.send(CTRL_C);
+                let (code, shown) = tty.finish();
+                assert_eq!(code, 0, "{shown}");
+                let ints = fs::read_to_string(&file).unwrap_or_default();
+                assert_eq!(ints.lines().count(), 1, "{ints:?}\n{shown}");
                 assert!(!shown.contains("Passing SIGINT on"), "{shown}");
             }
         }

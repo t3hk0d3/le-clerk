@@ -6,13 +6,18 @@
 //! on a terminal, `--yes` otherwise). `export` and `doctor` without `--fix`
 //! change nothing, so they skip the confirmation; agents still need
 //! `--override` for them, since they cover every project. Nothing here
-//! reads stdin except the gate's terminal prompt.
+//! reads stdin except the gate's terminal prompt. Files named on the
+//! command line (`import --in`) are read before the gate, which they do
+//! not need; `export --out` writes a new 0600 file (`--force` overwrites).
 
 use std::fmt::Write as _;
+use std::io::Write as _;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use leclerk::admin::{HolderSpec, ScopeSpec};
+use leclerk::client::ApiError;
 use leclerk::clock::{Clock, SystemClock};
 use serde_json::{Map, Value, json};
 
@@ -151,9 +156,13 @@ pub enum AdminAction {
     },
     /// Print the whole inventory as JSON, or write it to --out.
     Export {
-        /// Write the document to this file instead of stdout.
+        /// Write the document to this new file (mode 0600) instead of
+        /// stdout.
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
+        /// Overwrite --out when it already exists.
+        #[arg(long, requires = "out")]
+        force: bool,
     },
     /// Load an inventory document made by `export`.
     Import {
@@ -203,10 +212,10 @@ enum Shape {
     Resource,
     Lease,
     Doctor,
-    /// Reads this file for the call.
-    Import(PathBuf),
-    /// Writes to this file, or prints without one.
-    Export(Option<PathBuf>),
+    Import,
+    /// Writes to this file (overwriting it when the flag says so), or
+    /// prints without one.
+    Export(Option<PathBuf>, bool),
 }
 
 pub async fn run(ctx: &Ctx, args: AdminArgs) -> anyhow::Result<()> {
@@ -218,16 +227,28 @@ pub async fn run(ctx: &Ctx, args: AdminArgs) -> anyhow::Result<()> {
     } else {
         gate::require_override(&plan.effect, &caller)?;
     }
-    let mut call_args = plan.args;
-    if let Shape::Import(file) = &plan.shape {
-        call_args["doc"] = read_document(file)?;
-    }
     let result = ctx
         .client()
         .await?
-        .call(plan.method, &caller, call_args)
+        .call(plan.method, &caller, plan.args)
         .await?;
     finish(ctx, plan.shape, &result)
+}
+
+/// `clerk release --force <lease>`: [`AdminAction::Release`] under another
+/// name, behind the same gate.
+///
+/// # Errors
+/// As [`run`].
+pub async fn force_release(ctx: &Ctx, lease: String, yes: bool) -> anyhow::Result<()> {
+    run(
+        ctx,
+        AdminArgs {
+            yes,
+            action: AdminAction::Release { lease },
+        },
+    )
+    .await
 }
 
 /// A state-changing [`Plan`], wrapped for `?`-free arms.
@@ -346,24 +367,35 @@ fn plan(action: AdminAction) -> anyhow::Result<Plan> {
             changes_state: fix,
             shape: Shape::Doctor,
         }),
-        AdminAction::Export { out } => Ok(Plan {
-            effect: "export the whole inventory, which covers every project".to_owned(),
-            method: "admin_export",
-            args: json!({}),
-            changes_state: false,
-            shape: Shape::Export(out),
-        }),
+        AdminAction::Export { out, force } => {
+            if let Some(path) = &out
+                && !force
+                && path.exists()
+            {
+                return Err(file_exists(path).into());
+            }
+            Ok(Plan {
+                effect: "export the whole inventory, which covers every project".to_owned(),
+                method: "admin_export",
+                args: json!({}),
+                changes_state: false,
+                shape: Shape::Export(out, force),
+            })
+        }
         AdminAction::Import { input, replace } => {
             let how = if replace {
                 ", replacing resources that already exist"
             } else {
                 ""
             };
+            // Reading the named file changes nothing, so it comes before
+            // the gate: a bad file fails before anyone is asked.
+            let doc = read_document(&input)?;
             change(
                 format!("import the inventory in {}{how}", input.display()),
                 "admin_import",
-                json!({ "replace": replace }),
-                Shape::Import(input),
+                json!({ "replace": replace, "doc": doc }),
+                Shape::Import,
             )
         }
     }
@@ -491,17 +523,56 @@ fn read_document(path: &Path) -> anyhow::Result<Value> {
     })
 }
 
+/// `already_exists` (exit 4) for an `--out` file that is there already.
+fn file_exists(path: &Path) -> ApiError {
+    ApiError {
+        code: "already_exists".to_owned(),
+        message: format!(
+            "{} already exists; nothing was written. Pick another --out, or add --force to \
+             overwrite it.",
+            path.display()
+        ),
+        details: None,
+    }
+}
+
+/// Write `body` to `path`, readable by its owner only (0600): a new file,
+/// or with `force` the existing one, replaced.
+fn write_private(path: &Path, body: &str, force: bool) -> anyhow::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).mode(0o600);
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(file_exists(path).into());
+        }
+        Err(e) => return Err(cannot_write(path, &e).into()),
+    };
+    // An overwritten file keeps its old mode unless it is set again.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| file.write_all(body.as_bytes()))
+        .map_err(|e| cannot_write(path, &e))?;
+    Ok(())
+}
+
+fn cannot_write(path: &Path, e: &std::io::Error) -> UsageError {
+    UsageError(format!(
+        "Cannot write {}: {e}. Check the path given to --out.",
+        path.display()
+    ))
+}
+
 /// Print the daemon's answer (or, for `export --out`, write it).
 fn finish(ctx: &Ctx, shape: Shape, result: &Value) -> anyhow::Result<()> {
-    if let Shape::Export(Some(path)) = &shape {
+    if let Shape::Export(Some(path), force) = &shape {
         let mut body = serde_json::to_string_pretty(result)?;
         body.push('\n');
-        std::fs::write(path, body).map_err(|e| {
-            UsageError(format!(
-                "Cannot write {}: {e}. Check the path given to --out.",
-                path.display()
-            ))
-        })?;
+        write_private(path, &body, *force)?;
         let said = json!({ "written": path, "exported": count(&result["resources"]) });
         let path = path.display().to_string();
         return ctx.out.emit(&View::new(said, move |v| {
@@ -548,8 +619,8 @@ fn render(shape: &Shape, v: &Value) -> String {
             text(&v["priority"])
         ),
         Shape::Doctor => doctor_text(v),
-        Shape::Import(_) => import_text(v),
-        Shape::Export(_) => serde_json::to_string_pretty(v).unwrap_or_default(),
+        Shape::Import => import_text(v),
+        Shape::Export(..) => serde_json::to_string_pretty(v).unwrap_or_default(),
     }
 }
 

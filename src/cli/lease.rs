@@ -16,6 +16,7 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::IsTerminal;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -117,7 +118,8 @@ pub struct LeaseFlags {
         allow_hyphen_values = true
     )]
     duration: Duration,
-    /// Open the lease to interruption by more urgent requests.
+    /// Open the lease to interruption by more urgent requests (agent
+    /// sessions only).
     #[arg(long)]
     interruptible: bool,
     /// Queue priority.
@@ -195,6 +197,7 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
         CallerKind::Detached
     };
     let caller = ctx.caller(kind)?;
+    interruptible_needs_session(&args.lease, &caller)?;
     let body = request_args(
         &target,
         &args.lease,
@@ -367,6 +370,7 @@ pub async fn extend(ctx: &Ctx, args: ExtendArgs) -> anyhow::Result<()> {
 pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
     let target = target_arg(&args.target)?;
     let caller = ctx.caller(CallerKind::Run)?;
+    interruptible_needs_session(&args.lease, &caller)?;
     let purpose = purpose_of(&args.command);
     let body = request_args(&target, &args.lease, purpose, &caller);
     let client = ctx.client().await?;
@@ -688,12 +692,17 @@ async fn supervise(
     Ok(code)
 }
 
-/// True when stdin is a terminal whose foreground process group is ours: a
-/// SIGINT then came from Ctrl+C, which the terminal sent to the whole group,
-/// the command included.
+/// True when our controlling terminal's foreground process group is ours
+/// (whatever stdin is): a SIGINT then came from Ctrl+C, which the terminal
+/// sent to the whole group, the command included. Without a controlling
+/// terminal, false: the SIGINT came from elsewhere and is passed on.
 fn terminal_delivers_sigint() -> bool {
-    // SAFETY: tcgetpgrp(2) and getpgrp(2) only read process state.
-    std::io::stdin().is_terminal() && unsafe { libc::tcgetpgrp(0) == libc::getpgrp() }
+    let Ok(tty) = std::fs::File::open("/dev/tty") else {
+        return false;
+    };
+    // SAFETY: tcgetpgrp(2) on a descriptor `tty` keeps open for the call,
+    // and getpgrp(2), only read process state.
+    unsafe { libc::tcgetpgrp(tty.as_raw_fd()) == libc::getpgrp() }
 }
 
 /// When a notice about the running command's lease means the command must
@@ -836,6 +845,22 @@ fn no_live_lease(lease: &str) -> ApiError {
         ),
         details: None,
     }
+}
+
+/// Only an agent session's leases can be interrupted: a lease held from the
+/// command line is never asked to yield.
+///
+/// # Errors
+/// [`UsageError`] for `--interruptible` without an agent session.
+fn interruptible_needs_session(flags: &LeaseFlags, caller: &Caller) -> Result<(), UsageError> {
+    if flags.interruptible && !caller::is_agent(caller) {
+        return Err(UsageError(format!(
+            "--interruptible needs an agent session ({} is not set): leases held from the \
+             command line are never interrupted. Drop --interruptible.",
+            caller::SESSION_VAR
+        )));
+    }
+    Ok(())
 }
 
 /// `{"resource": r}` or `{"resource": r, "unit": u}` from `r` or `r/u`.

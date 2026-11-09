@@ -31,8 +31,9 @@ pub struct TagFilter {
 /// `clerk log` filters.
 #[derive(Args)]
 pub struct LogArgs {
-    /// Only entries since then: `<n>s|m|h|d` ago, or unix milliseconds.
-    #[arg(long, value_name = "WHEN")]
+    /// Only entries since then: `<n>s|m|h|d` ago (e.g. `2h`), or an RFC 3339
+    /// timestamp (e.g. `2026-11-10T09:00:00Z`).
+    #[arg(long, value_name = "WHEN", allow_hyphen_values = true)]
     since: Option<String>,
     /// Only entries by this actor: `session:<id>`, `pid:<pid>` or
     /// `user:<tag>`.
@@ -254,19 +255,25 @@ pub async fn approve(ctx: &Ctx, promotion: String, new_id: Option<String>) -> an
     }))
 }
 
-/// `<n>s|m|h|d` ago, or unix milliseconds.
+/// `<n>s|m|h|d` ago (n a whole number, 0 or more), or an RFC 3339
+/// timestamp; unix milliseconds. Bare numbers and negative spans are
+/// refused: `--since 5` reads too easily as "5 minutes".
 fn parse_since(s: &str, now_ms: i64) -> Result<i64, UsageError> {
     let bad = || {
         UsageError(format!(
-            "--since {s:?} is not a time: use <n>s, <n>m, <n>h or <n>d (how long ago), or unix \
-             milliseconds."
+            "--since {s:?} is not a time: use <n>s|m|h|d for how long ago (e.g. 2h), or an \
+             RFC 3339 timestamp (e.g. 2026-11-10T09:00:00Z)."
         ))
     };
-    if let Ok(ms) = s.parse::<i64>() {
+    if let Some(ms) = parse_rfc3339(s) {
         return Ok(ms);
     }
     let unit = s.chars().last().ok_or_else(bad)?;
-    let n: i64 = s[..s.len() - unit.len_utf8()].parse().map_err(|_| bad())?;
+    let digits = &s[..s.len() - unit.len_utf8()];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: i64 = digits.parse().map_err(|_| bad())?;
     let secs = match unit {
         's' => 1,
         'm' => 60,
@@ -274,10 +281,85 @@ fn parse_since(s: &str, now_ms: i64) -> Result<i64, UsageError> {
         'd' => 86_400,
         _ => return Err(bad()),
     };
-    if n < 0 {
-        return Err(bad());
-    }
     Ok(now_ms.saturating_sub(n.saturating_mul(secs * 1000)))
+}
+
+/// An RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`) as unix
+/// milliseconds; `None` for anything else.
+fn parse_rfc3339(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let part = bytes.get(from..from + len)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(part).ok()?.parse().ok())?
+    };
+    let at = |idx: usize, set: &[u8]| bytes.get(idx).is_some_and(|x| set.contains(x));
+    if !(at(4, b"-") && at(7, b"-") && at(10, b"Tt ") && at(13, b":") && at(16, b":")) {
+        return None;
+    }
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hour, minute, second) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    // Optional fraction: milliseconds from its first three digits.
+    let mut pos = 19;
+    let mut millis = 0;
+    if at(pos, b".") {
+        let digits = bytes[pos + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return None;
+        }
+        let frac = std::str::from_utf8(&bytes[pos + 1..pos + 1 + digits.min(3)]).ok()?;
+        millis = frac.parse::<i64>().ok()? * 10_i64.pow(3 - u32::try_from(frac.len()).ok()?);
+        pos += 1 + digits;
+    }
+    let offset_secs = match bytes.get(pos..)? {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), ..] if bytes.len() == pos + 6 && at(pos + 3, b":") => {
+            let (off_h, off_m) = (num(pos + 1, 2)?, num(pos + 4, 2)?);
+            if off_h > 23 || off_m > 59 {
+                return None;
+            }
+            let secs = off_h * 3600 + off_m * 60;
+            if *sign == b'+' { secs } else { -secs }
+        }
+        _ => return None,
+    };
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
+    Some(secs * 1000 + millis)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Days from 1970-01-01 to the given proleptic Gregorian date (Howard
+/// Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 // ---------------------------------------------------------------------------
@@ -673,7 +755,7 @@ fn promotions_text(v: &Value) -> String {
         return "No pending promotions.".to_owned();
     }
     let mut rows = vec![
-        ["ID", "RESOURCE", "REQUESTER", "REASON"]
+        ["ID", "RESOURCE", "DESCRIPTION", "REQUESTER", "REASON"]
             .map(str::to_owned)
             .to_vec(),
     ];
@@ -681,6 +763,7 @@ fn promotions_text(v: &Value) -> String {
         rows.push(vec![
             text(&p["id"]),
             text(&p["resource"]),
+            text(&p["description"]),
             text(&p["requester"]),
             text(&p["reason"]),
         ]);
@@ -700,15 +783,44 @@ mod tests {
     }
 
     #[test]
-    fn since_takes_unix_milliseconds() {
-        assert_eq!(parse_since("1234", 1_000_000).unwrap(), 1234);
+    fn since_takes_an_rfc3339_timestamp() {
+        assert_eq!(parse_since("1970-01-01T00:00:01Z", 0).unwrap(), 1000);
+        assert_eq!(
+            parse_since("2026-11-10T09:00:00.25+01:00", 0).unwrap(),
+            1_794_297_600_250
+        );
+        assert_eq!(
+            parse_since("2000-02-29t00:00:00z", 0).unwrap(),
+            951_782_400_000
+        );
+    }
+
+    #[test]
+    fn since_refuses_bare_numbers_and_negatives() {
+        for bad in ["1234", "5", "-5m", "+5m", "-1"] {
+            let message = parse_since(bad, 1_000_000).unwrap_err().0;
+            assert!(message.contains("<n>s|m|h|d"), "{bad}: {message}");
+            assert!(message.contains("RFC 3339"), "{bad}: {message}");
+        }
     }
 
     #[test]
     fn since_refuses_anything_else() {
-        assert!(parse_since("soon", 0).unwrap_err().0.contains("<n>m"));
-        assert!(parse_since("5w", 0).is_err());
-        assert!(parse_since("", 0).is_err());
+        for bad in [
+            "soon",
+            "5w",
+            "",
+            "m",
+            "2026-13-01T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-11-10T24:00:00Z",
+            "2026-11-10T09:00:00",
+            "2026-11-10T09:00:00.Z",
+            "2026-11-10T09:00:00+0100",
+            "2026-11-10",
+        ] {
+            assert!(parse_since(bad, 0).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -743,6 +743,79 @@ mod cli_admin {
             }
 
             #[test]
+            fn export_out_creates_the_file_readable_by_its_owner_only() {
+                use std::os::unix::fs::PermissionsExt;
+                let env = Env::new();
+                seed(&env, "board", &["u1"]);
+                let file = env.home().join("inventory.json");
+                let out = clerk(&env, &["admin", "export", "--out", file.to_str().unwrap()]);
+                assert!(out.status.success(), "{out:?}");
+                let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{mode:o}");
+            }
+
+            #[test]
+            fn export_out_refuses_an_existing_file_exit_4() {
+                let env = Env::new();
+                seed(&env, "board", &["u1"]);
+                let file = env.home().join("inventory.json");
+                fs::write(&file, "keep me").unwrap();
+                let error = failed(
+                    &env,
+                    &["admin", "export", "--out", file.to_str().unwrap()],
+                    4,
+                );
+                assert_eq!(error["code"], "already_exists", "{error}");
+                assert_eq!(fs::read_to_string(&file).unwrap(), "keep me");
+            }
+
+            #[test]
+            fn export_out_with_force_overwrites_an_existing_file() {
+                use std::os::unix::fs::PermissionsExt;
+                let env = Env::new();
+                seed(&env, "board", &["u1"]);
+                let file = env.home().join("inventory.json");
+                fs::write(&file, "old").unwrap();
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+                let out = clerk(
+                    &env,
+                    &[
+                        "admin",
+                        "export",
+                        "--out",
+                        file.to_str().unwrap(),
+                        "--force",
+                    ],
+                );
+                assert!(out.status.success(), "{out:?}");
+                let doc: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+                assert_eq!(doc["resources"][0]["id"], "board", "{doc}");
+                let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{mode:o}");
+            }
+
+            #[test]
+            fn import_of_a_missing_file_exits_2_before_the_gate() {
+                let env = Env::new();
+                let error = failed(&env, &["admin", "import", "--in", "/no/such/file.json"], 2);
+                assert_eq!(error["code"], "usage_error", "{error}");
+                assert!(!env.paths().socket.exists(), "a daemon was started");
+            }
+
+            #[test]
+            fn import_of_malformed_json_exits_2_before_the_gate() {
+                let env = Env::new();
+                let file = env.home().join("bad.json");
+                fs::write(&file, "{ nope").unwrap();
+                let error = failed(
+                    &env,
+                    &["admin", "import", "--in", file.to_str().unwrap()],
+                    2,
+                );
+                assert_eq!(error["code"], "usage_error", "{error}");
+            }
+
+            #[test]
             fn import_of_malformed_json_exits_2() {
                 let env = Env::new();
                 let file = env.home().join("bad.json");
@@ -754,6 +827,55 @@ mod cli_admin {
                 );
                 assert_eq!(error["code"], "usage_error", "{error}");
             }
+        }
+    }
+
+    /// `clerk release --force <lease>`: `admin release` by another name.
+    mod release_force {
+        use super::*;
+
+        #[test]
+        fn ends_the_lease_and_marks_the_unit_dirty() {
+            let env = Env::new();
+            let lease = board_held(&env, "x");
+            let out = clerk(&env, &["release", "--force", &lease, "--yes"]);
+            assert!(out.status.success(), "{out:?}");
+            let unit = unit_status(&env, "board");
+            assert!(
+                unit["dirty"].is_object() || unit["dirty"].is_string(),
+                "{unit}"
+            );
+            assert_eq!(audit(&env, "admin_release").len(), 1);
+        }
+
+        #[test]
+        fn without_yes_off_a_terminal_is_refused_and_changes_nothing() {
+            let env = Env::new();
+            let lease = board_held(&env, "x");
+            let error = failed(&env, &["release", "--force", &lease], 4);
+            assert_eq!(error["code"], "confirmation_required", "{error}");
+            assert_eq!(unit_status(&env, "board")["occupancy"]["state"], "held");
+        }
+
+        #[test]
+        fn agent_without_override_is_refused() {
+            let env = Env::new();
+            let lease = board_held(&env, "x");
+            let out = clerk_with(
+                &env,
+                &["release", "--force", &lease, "--yes"],
+                &[(SESSION_VAR, "sess-1")],
+            );
+            assert_eq!(out.status.code(), Some(4), "{out:?}");
+            let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(body["error"]["code"], "override_required", "{body}");
+        }
+
+        #[test]
+        fn yes_without_force_is_a_usage_error() {
+            let env = Env::new();
+            let error = failed(&env, &["release", "lse_x", "--yes"], 2);
+            assert_eq!(error["code"], "usage_error", "{error}");
         }
     }
 }
