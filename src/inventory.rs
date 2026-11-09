@@ -17,8 +17,8 @@ use crate::dedup::{self, DEFAULT_SYSFS, Identity, Match};
 use crate::error::ErrorCode;
 use crate::model::{
     Caller, Description, HealthSpec, IdError, InvalidSettings, LeaseId, ProjectKey, PromotionId,
-    Resource, ResourceId, ResourceType, Scope, TextError, Unit, UnitId, UnitSettings,
-    UsageTemplate,
+    Resource, ResourceId, ResourceType, Scope, Tag, TagError, TagSet, TextError, Unit, UnitId,
+    UnitSettings, UsageTemplate,
 };
 use crate::store::inventory::{
     self as sql, Candidate, LinkOrigin, NewResourceRow, NewUnitRow, ScopeFilter,
@@ -45,6 +45,8 @@ pub struct NewResource {
     pub usage: String,
     /// `None` means the type default.
     pub health: Option<HealthSpec>,
+    /// Search tags, as given; validated on create.
+    pub tags: Vec<String>,
 }
 
 /// Changes to a resource. `None` leaves a field alone.
@@ -55,6 +57,13 @@ pub struct ResourcePatch {
     pub usage: Option<String>,
     /// `Some(None)` clears the spec back to the type default.
     pub health: Option<Option<HealthSpec>>,
+    /// Replaces the whole tag set; `Some(vec![])` clears it. Not combinable
+    /// with `add_tags` or `remove_tags`.
+    pub tags: Option<Vec<String>>,
+    /// Tags to add to the current set.
+    pub add_tags: Vec<String>,
+    /// Tags to remove from the current set; absent ones are ignored.
+    pub remove_tags: Vec<String>,
 }
 
 /// A unit to add.
@@ -130,6 +139,17 @@ pub enum InventoryError {
     /// A description or usage template breaks its rules.
     #[error(transparent)]
     InvalidText(#[from] TextError),
+    /// A tag breaks the format, or the set is too large.
+    #[error(transparent)]
+    InvalidTag(#[from] TagError),
+    /// A tag edit contradicts itself.
+    #[error("conflicting tag edit: {reason}")]
+    ConflictingTagEdit {
+        /// `replace_with_add_or_remove` or `added_and_removed`.
+        reason: &'static str,
+        /// The tag in both lists, for `added_and_removed`.
+        tag: Option<String>,
+    },
     /// The caller may not create in that scope.
     #[error("you may only create resources in user scope or your own project")]
     ScopeNotAllowed,
@@ -187,6 +207,8 @@ impl ErrorCode for InventoryError {
             InventoryError::AlreadyExists => "already_exists",
             InventoryError::InvalidSettings { .. } => "invalid_settings",
             InventoryError::InvalidText(e) => e.code(),
+            InventoryError::InvalidTag(e) => e.code(),
+            InventoryError::ConflictingTagEdit { .. } => "conflicting_tag_edit",
             InventoryError::ScopeNotAllowed => "scope_not_allowed",
             InventoryError::Busy => "busy",
             InventoryError::DuplicateInScope { .. } => "duplicate_in_scope",
@@ -210,6 +232,11 @@ impl ErrorCode for InventoryError {
                 "unit_description": unit_description,
             })),
             InventoryError::InvalidText(e) => e.details(),
+            InventoryError::InvalidTag(e) => e.details(),
+            InventoryError::ConflictingTagEdit { reason, tag } => Some(match tag {
+                Some(tag) => json!({ "reason": reason, "tag": tag }),
+                None => json!({ "reason": reason }),
+            }),
             InventoryError::AmbiguousDuplicate { units } => Some(json!({ "units": units })),
             InventoryError::LinkConflict { leases, .. } => Some(json!({ "leases": leases })),
             _ => None,
@@ -600,8 +627,9 @@ impl Inventory {
     /// [`InventoryError::ScopeNotAllowed`] for a project scope other than the
     /// caller's, [`InventoryError::InvalidSettings`] (field `health`) when the health
     /// spec does not fit the type, [`InventoryError::InvalidText`] for a bad
-    /// description or usage template, [`InventoryError::AlreadyExists`] when the
-    /// id is taken in that scope.
+    /// description or usage template, [`InventoryError::InvalidTag`] for a bad
+    /// or too large tag set, [`InventoryError::AlreadyExists`] when the id is
+    /// taken in that scope.
     pub fn create_resource(
         &self,
         tx: &Tx,
@@ -621,6 +649,7 @@ impl Inventory {
         }
         Description::parse(&new.description)?;
         UsageTemplate::parse(&new.usage, new.ty)?;
+        let tags = TagSet::parse(&new.tags)?;
         if sql::find_in_scope(tx, &new.scope, &new.id)?.is_some() {
             return Err(InventoryError::AlreadyExists);
         }
@@ -636,6 +665,7 @@ impl Inventory {
                 created_at: self.clock.now_ms(),
             },
         )?;
+        sql::set_tags(tx, row, &tags)?;
         let mut warnings = Vec::new();
         match &new.scope {
             Scope::Project(_) => {
@@ -661,7 +691,7 @@ impl Inventory {
             tx,
             who,
             "resource_created",
-            &json!({ "id": new.id, "type": new.ty, "scope": new.scope }),
+            &json!({ "id": new.id, "type": new.ty, "scope": new.scope, "tags": tags }),
         )?;
         Ok(Created {
             value: sql::load_resource(tx, row)?,
@@ -675,7 +705,11 @@ impl Inventory {
     /// [`InventoryError::NotFound`] when invisible;
     /// [`InventoryError::InvalidSettings`] (field `health`) on a bad spec;
     /// [`InventoryError::InvalidText`] for a bad description, or a usage
-    /// template that breaks the rules of the resource's type.
+    /// template that breaks the rules of the resource's type;
+    /// [`InventoryError::InvalidTag`] for a bad tag or a resulting set over
+    /// the limit; [`InventoryError::ConflictingTagEdit`] for `tags` together
+    /// with `add_tags` or `remove_tags`, or a tag both added and removed.
+    /// Nothing is written on any refusal.
     pub fn update_resource(
         &self,
         tx: &Tx,
@@ -685,6 +719,7 @@ impl Inventory {
     ) -> Result<Resource, InventoryError> {
         let row = Self::visible_row(tx, who, id)?;
         let current = sql::load_resource(tx, row)?;
+        let new_tags = Self::edited_tags(&current.tags, &patch)?;
         let health = match patch.health {
             Some(h) => h,
             None => current.health.clone(),
@@ -702,13 +737,63 @@ impl Inventory {
         let description = patch.description.unwrap_or(current.description);
         let usage = patch.usage.unwrap_or(current.usage);
         sql::update_resource(tx, row, &description, &usage, health.as_ref())?;
+        let tags = match new_tags {
+            Some(tags) => {
+                sql::set_tags(tx, row, &tags)?;
+                tags
+            }
+            None => current.tags,
+        };
         self.audit(
             tx,
             who,
             "resource_updated",
-            &json!({ "id": id, "scope": current.scope }),
+            &json!({ "id": id, "scope": current.scope, "tags": tags }),
         )?;
         Ok(sql::load_resource(tx, row)?)
+    }
+
+    /// The tag set `patch` leaves, or `None` when it touches no tags. All
+    /// checks happen here, before anything is written.
+    fn edited_tags(
+        current: &TagSet,
+        patch: &ResourcePatch,
+    ) -> Result<Option<TagSet>, InventoryError> {
+        let editing = !patch.add_tags.is_empty() || !patch.remove_tags.is_empty();
+        if patch.tags.is_some() && editing {
+            return Err(InventoryError::ConflictingTagEdit {
+                reason: "replace_with_add_or_remove",
+                tag: None,
+            });
+        }
+        if let Some(tags) = &patch.tags {
+            return Ok(Some(TagSet::parse(tags)?));
+        }
+        if !editing {
+            return Ok(None);
+        }
+        if let Some(tag) = patch
+            .add_tags
+            .iter()
+            .find(|t| patch.remove_tags.contains(t))
+        {
+            return Err(InventoryError::ConflictingTagEdit {
+                reason: "added_and_removed",
+                tag: Some(tag.clone()),
+            });
+        }
+        let added = TagSet::parse(&patch.add_tags)?;
+        let removed = patch
+            .remove_tags
+            .iter()
+            .map(|t| Tag::parse(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        let kept = current
+            .iter()
+            .chain(added.iter())
+            .filter(|t| !removed.contains(t))
+            .map(Tag::as_str);
+        Ok(Some(TagSet::parse(kept)?))
     }
 
     /// Delete a visible resource and its units.
@@ -736,21 +821,28 @@ impl Inventory {
         )
     }
 
-    /// List resources in `view`, ordered by id.
+    /// List resources in `view`, ordered by id, keeping those that carry
+    /// every one of `tags` (all of them when `tags` is empty). The view is
+    /// applied first, so no other project's resource can match.
     ///
     /// # Errors
+    /// [`InventoryError::InvalidTag`] for a malformed filter tag;
     /// [`InventoryError::Store`] on storage failure.
     pub fn list_resources(
         &self,
         tx: &Tx,
         who: &Caller,
         view: View,
+        tags: &[String],
     ) -> Result<Vec<Resource>, InventoryError> {
+        let wanted = TagSet::parse(tags)?;
         let filter = match view {
             View::All => ScopeFilter::All,
             View::Caller => ScopeFilter::Visible(who.project.as_ref()),
         };
-        Ok(sql::list_resources(tx, filter)?)
+        let mut resources = sql::list_resources(tx, filter)?;
+        resources.retain(|r| r.tags.contains_all(&wanted));
+        Ok(resources)
     }
 
     /// The resource `id` resolves to for the caller.

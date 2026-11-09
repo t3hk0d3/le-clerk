@@ -12,7 +12,8 @@ use serde_json::Value;
 use crate::inventory::{Created, Promotion, Warning};
 use crate::model::{
     DirtyInfo, EndCause, HealthSpec, HolderRef, LeaseId, LeaseState, Priority, ProjectKey,
-    PromotionId, RequestId, Resource, ResourceId, ResourceType, Scope, Unit, UnitId, UnitSettings,
+    PromotionId, RequestId, Resource, ResourceId, ResourceType, Scope, TagSet, Unit, UnitId,
+    UnitSettings,
 };
 use crate::scheduler::{AcquireOutcome, Grant, Lease, MyLeases, MyRequest};
 use crate::store::audit::AuditEntry;
@@ -34,6 +35,8 @@ pub struct ResourceView {
     pub usage: String,
     /// `None` means the type default.
     pub health: Option<HealthSpec>,
+    /// Search tags, sorted.
+    pub tags: TagSet,
     pub created_at: i64,
     /// True when this project resource hides a user resource of the same id.
     pub shadows_user: bool,
@@ -49,6 +52,7 @@ impl From<Resource> for ResourceView {
             description: r.description,
             usage: r.usage,
             health: r.health,
+            tags: r.tags,
             created_at: r.created_at,
             shadows_user: r.shadows_user,
             units: r.units.into_iter().map(UnitView::from).collect(),

@@ -103,6 +103,7 @@ impl Fixture {
                         description: String::new(),
                         usage: String::new(),
                         health: None,
+                        tags: Vec::new(),
                     },
                 )?;
                 self.inv.add_unit(

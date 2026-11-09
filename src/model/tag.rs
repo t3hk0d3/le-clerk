@@ -121,13 +121,6 @@ impl TagSet {
     /// Only for text that passed [`Tag::parse`] when stored; no check is
     /// repeated here.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the store reads tags through it from the next task"
-        )
-    )]
     pub(crate) fn from_stored(tags: Vec<String>) -> Self {
         Self(tags.into_iter().map(Tag).collect())
     }

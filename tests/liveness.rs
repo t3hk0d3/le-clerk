@@ -113,6 +113,7 @@ impl Fixture {
                         description: String::new(),
                         usage: String::new(),
                         health: None,
+                        tags: Vec::new(),
                     },
                 )?;
                 for u in units {

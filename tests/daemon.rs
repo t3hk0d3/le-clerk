@@ -1316,6 +1316,7 @@ mod restart_grace {
                         description: String::new(),
                         usage: String::new(),
                         health: None,
+                        tags: Vec::new(),
                     },
                 )?;
                 inv.add_unit(

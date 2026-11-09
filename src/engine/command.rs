@@ -86,6 +86,9 @@ pub struct CreateResourceArgs {
     /// Absent means the type default.
     #[serde(default)]
     pub health: Option<HealthSpec>,
+    /// Search tags; checked by the inventory.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// `update_resource`. Absent fields are left alone; `"health": null`
@@ -100,6 +103,13 @@ pub struct UpdateResourceArgs {
     pub usage: Option<String>,
     #[serde(default, deserialize_with = "present")]
     pub health: Option<Option<HealthSpec>>,
+    /// Replaces the whole tag set; `[]` clears it.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub add_tags: Vec<String>,
+    #[serde(default)]
+    pub remove_tags: Vec<String>,
 }
 
 /// `get_resource`, `delete_resource`.
@@ -109,12 +119,22 @@ pub struct ResourceArgs {
     pub id: ResourceId,
 }
 
-/// `list_resources`, `status`.
+/// `status`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewArgs {
     #[serde(default)]
     pub view: ViewArg,
+}
+
+/// `list_resources`: a view, narrowed to resources carrying every tag.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListResourcesArgs {
+    #[serde(default)]
+    pub view: ViewArg,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// `add_unit`.
@@ -412,7 +432,7 @@ commands! {
     /// Delete a free resource.
     DeleteResource(ResourceArgs) = "delete_resource", read_only: false;
     /// List resources.
-    ListResources(ViewArgs) = "list_resources", read_only: true;
+    ListResources(ListResourcesArgs) = "list_resources", read_only: true;
     /// One resource with its units.
     GetResource(ResourceArgs) = "get_resource", read_only: true;
     /// Add a unit.
@@ -545,6 +565,7 @@ impl Command {
                     description: a.description,
                     usage: a.usage,
                     health: a.health,
+                    tags: a.tags,
                 };
                 encode(CreatedResource::from(inv.create_resource(tx, &who, &new)?))
             }
@@ -553,6 +574,9 @@ impl Command {
                     description: a.description,
                     usage: a.usage,
                     health: a.health,
+                    tags: a.tags,
+                    add_tags: a.add_tags,
+                    remove_tags: a.remove_tags,
                 };
                 let updated = inv.update_resource(tx, &who, &a.id, patch)?;
                 let rows: Vec<i64> = updated.units.iter().map(|u| u.row).collect();
@@ -564,7 +588,7 @@ impl Command {
                 Ok(Value::Null)
             }
             Self::ListResources(who, a) => encode(
-                inv.list_resources(tx, &who, a.view.into())?
+                inv.list_resources(tx, &who, a.view.into(), &a.tags)?
                     .into_iter()
                     .map(ResourceView::from)
                     .collect::<Vec<_>>(),

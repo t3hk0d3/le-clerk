@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::dedup::Identity;
 use crate::model::{
     Caller, DirtyInfo, HealthSpec, ProjectKey, PromotionId, Resource, ResourceId, ResourceType,
-    Scope, Unit, UnitId, UnitSettings,
+    Scope, TagSet, Unit, UnitId, UnitSettings,
 };
 use crate::store::{StoreError, Tx, audit, enum_text, parse_enum};
 
@@ -101,10 +101,37 @@ fn build_resource(tx: &Tx, raw: RawResource) -> Result<Resource, StoreError> {
         description: raw.description,
         usage: raw.usage,
         health: raw.health.map(|h| serde_json::from_str(&h)).transpose()?,
+        tags: load_tags(tx, raw.row)?,
         created_at: raw.created_at,
         shadows_user: raw.shadows_user,
         units: load_units(tx, raw.row)?,
     })
+}
+
+/// The tags of a resource, sorted.
+fn load_tags(tx: &Tx, row: i64) -> Result<TagSet, StoreError> {
+    let tags = tx
+        .conn()
+        .prepare("SELECT tag FROM resource_tags WHERE resource_row = ?1 ORDER BY tag")?
+        .query_map([row], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(TagSet::from_stored(tags))
+}
+
+/// Replace the tags of a resource with `tags`.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure.
+pub fn set_tags(tx: &Tx, row: i64, tags: &TagSet) -> Result<(), StoreError> {
+    tx.conn()
+        .execute("DELETE FROM resource_tags WHERE resource_row = ?1", [row])?;
+    let mut insert = tx
+        .conn()
+        .prepare("INSERT INTO resource_tags (resource_row, tag) VALUES (?1, ?2)")?;
+    for tag in tags.iter() {
+        insert.execute(rusqlite::params![row, tag.as_str()])?;
+    }
+    Ok(())
 }
 
 /// Insert a resource; returns its row id.

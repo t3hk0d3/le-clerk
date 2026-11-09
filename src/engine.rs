@@ -164,7 +164,9 @@ impl From<InventoryError> for ApiError {
             | InventoryError::LinkConflict { .. } => ErrorKind::Conflict,
             InventoryError::InvalidId(_)
             | InventoryError::InvalidSettings { .. }
-            | InventoryError::InvalidText(_) => ErrorKind::Invalid,
+            | InventoryError::InvalidText(_)
+            | InventoryError::InvalidTag(_)
+            | InventoryError::ConflictingTagEdit { .. } => ErrorKind::Invalid,
             InventoryError::Store(_) => ErrorKind::Internal,
         };
         Self::domain(kind, &e)

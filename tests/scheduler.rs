@@ -150,6 +150,7 @@ impl Fixture {
                         description: String::new(),
                         usage: String::new(),
                         health: None,
+                        tags: Vec::new(),
                     },
                 )?;
                 for u in units {
@@ -350,6 +351,7 @@ impl Fixture {
                         description: "ESP32 rig".into(),
                         usage: FLASH_USAGE.into(),
                         health: None,
+                        tags: Vec::new(),
                     },
                 )?;
                 self.inv.add_unit(

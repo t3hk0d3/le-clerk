@@ -1623,3 +1623,260 @@ mod brief {
         }
     }
 }
+
+mod wire_tags {
+    use super::*;
+
+    async fn err(h: &EngineHandle, method: &str, who: &Caller, args: Value) -> ApiError {
+        match rpc(h, method, who, args).await {
+            Ok(v) => panic!("{method} unexpectedly succeeded: {v}"),
+            Err(e) => e,
+        }
+    }
+
+    async fn create(h: &EngineHandle, who: &Caller, id: &str, scope: Value, tags: Value) -> Value {
+        ok(
+            h,
+            "create_resource",
+            who,
+            json!({"id": id, "type": "generic", "scope": scope, "tags": tags}),
+        )
+        .await
+    }
+
+    mod resource_view {
+        use super::*;
+
+        mod on_create_with_tags {
+            use super::*;
+
+            #[tokio::test]
+            async fn the_result_get_and_list_show_the_tags_sorted() {
+                let (h, _clock) = spawn();
+                let created = create(
+                    &h,
+                    &user("a"),
+                    "board",
+                    json!("user"),
+                    json!(["zigbee", "esp32"]),
+                )
+                .await;
+                assert_eq!(created["resource"]["tags"], json!(["esp32", "zigbee"]));
+                let got = ok(&h, "get_resource", &user("a"), json!({"id": "board"})).await;
+                assert_eq!(got["tags"], json!(["esp32", "zigbee"]));
+                let list = ok(&h, "list_resources", &user("a"), json!({})).await;
+                assert_eq!(list[0]["tags"], json!(["esp32", "zigbee"]));
+            }
+        }
+
+        mod on_create_without_tags {
+            use super::*;
+
+            #[tokio::test]
+            async fn shows_an_empty_array() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &[]).await;
+                let got = ok(&h, "get_resource", &user("a"), json!({"id": "board"})).await;
+                assert_eq!(got["tags"], json!([]));
+            }
+        }
+    }
+
+    mod update_resource {
+        use super::*;
+
+        mod on_tags_add_tags_and_remove_tags {
+            use super::*;
+
+            #[tokio::test]
+            async fn replaces_adds_and_removes_over_the_wire() {
+                let (h, _clock) = spawn();
+                create(&h, &user("a"), "board", json!("user"), json!(["esp32"])).await;
+                let who = user("a");
+                let added = ok(
+                    &h,
+                    "update_resource",
+                    &who,
+                    json!({"id": "board", "add_tags": ["thread"], "remove_tags": ["esp32"]}),
+                )
+                .await;
+                assert_eq!(added["tags"], json!(["thread"]));
+                let replaced = ok(
+                    &h,
+                    "update_resource",
+                    &who,
+                    json!({"id": "board", "tags": ["c6", "zigbee"]}),
+                )
+                .await;
+                assert_eq!(replaced["tags"], json!(["c6", "zigbee"]));
+                let cleared = ok(
+                    &h,
+                    "update_resource",
+                    &who,
+                    json!({"id": "board", "tags": []}),
+                )
+                .await;
+                assert_eq!(cleared["tags"], json!([]));
+            }
+        }
+
+        mod on_tags_with_add_tags {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_conflicting_tag_edit_with_details() {
+                let (h, _clock) = spawn();
+                create(&h, &user("a"), "board", json!("user"), json!(["esp32"])).await;
+                let e = err(
+                    &h,
+                    "update_resource",
+                    &user("a"),
+                    json!({"id": "board", "tags": [], "add_tags": ["x"]}),
+                )
+                .await;
+                assert_eq!(e.code, "conflicting_tag_edit");
+                assert_eq!(
+                    e.details,
+                    Some(json!({"reason": "replace_with_add_or_remove"}))
+                );
+            }
+        }
+    }
+
+    mod create_resource {
+        use super::*;
+
+        mod on_a_malformed_tag {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_invalid_tag_naming_it() {
+                let (h, _clock) = spawn();
+                let e = err(
+                    &h,
+                    "create_resource",
+                    &user("a"),
+                    json!({"id": "board", "type": "generic", "scope": "user",
+                           "tags": ["zigbee,thread"]}),
+                )
+                .await;
+                assert_eq!(e.code, "invalid_tag");
+                assert_eq!(e.details, Some(json!({"tag": "zigbee,thread"})));
+            }
+        }
+
+        mod on_17_tags {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_too_many_tags_with_details() {
+                let (h, _clock) = spawn();
+                let tags: Vec<String> = (0..17).map(|i| format!("t{i:02}")).collect();
+                let e = err(
+                    &h,
+                    "create_resource",
+                    &user("a"),
+                    json!({"id": "board", "type": "generic", "scope": "user", "tags": tags}),
+                )
+                .await;
+                assert_eq!(e.code, "too_many_tags");
+                assert_eq!(e.details, Some(json!({"max": 16, "count": 17})));
+            }
+        }
+    }
+
+    mod list_resources {
+        use super::*;
+
+        async fn seeded(h: &EngineHandle) {
+            create(
+                h,
+                &user("a"),
+                "one",
+                json!("user"),
+                json!(["esp32", "thread"]),
+            )
+            .await;
+            create(h, &user("a"), "two", json!("user"), json!(["esp32"])).await;
+        }
+
+        fn ids(list: &Value) -> Vec<&str> {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap())
+                .collect()
+        }
+
+        mod on_tags {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_the_resources_carrying_all_of_them() {
+                let (h, _clock) = spawn();
+                seeded(&h).await;
+                let who = user("a");
+                let both = ok(&h, "list_resources", &who, json!({"tags": ["esp32"]})).await;
+                assert_eq!(ids(&both), ["one", "two"]);
+                let one = ok(
+                    &h,
+                    "list_resources",
+                    &who,
+                    json!({"tags": ["esp32", "thread"], "view": "all"}),
+                )
+                .await;
+                assert_eq!(ids(&one), ["one"]);
+            }
+        }
+
+        mod on_a_tag_in_another_project {
+            use super::*;
+
+            #[tokio::test]
+            async fn is_not_returned() {
+                let (h, _clock) = spawn();
+                let (a, b) = (in_project("a", "/p/a"), in_project("b", "/p/b"));
+                create(
+                    &h,
+                    &b,
+                    "theirs",
+                    json!({"project": "/p/b"}),
+                    json!(["thread"]),
+                )
+                .await;
+                let list = ok(&h, "list_resources", &a, json!({"tags": ["thread"]})).await;
+                assert_eq!(list, json!([]));
+            }
+        }
+
+        mod on_a_malformed_filter_tag {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_invalid_tag() {
+                let (h, _clock) = spawn();
+                seeded(&h).await;
+                let e = err(
+                    &h,
+                    "list_resources",
+                    &user("a"),
+                    json!({"tags": ["Thread"]}),
+                )
+                .await;
+                assert_eq!(e.code, "invalid_tag");
+                assert_eq!(e.details, Some(json!({"tag": "Thread"})));
+            }
+        }
+
+        mod on_status_args {
+            use super::*;
+
+            #[tokio::test]
+            async fn status_does_not_accept_tags() {
+                let (h, _clock) = spawn();
+                let e = err(&h, "status", &user("a"), json!({"tags": ["x"]})).await;
+                assert_eq!(e.code, "invalid_request");
+            }
+        }
+    }
+}

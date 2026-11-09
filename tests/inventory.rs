@@ -53,6 +53,7 @@ fn new_device(id: &str, scope: Scope) -> NewResource {
         description: "a board".into(),
         usage: String::new(),
         health: None,
+        tags: Vec::new(),
     }
 }
 
@@ -374,7 +375,7 @@ mod inventory {
                 assert!(matches!(err, InventoryError::ScopeNotAllowed));
                 let all = f
                     .store
-                    .tx(|tx| f.inv.list_resources(tx, &who, View::All))
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::All, &[]))
                     .unwrap();
                 assert_eq!(all.len(), 0);
                 assert_eq!(f.audit_actions().len(), 0);
@@ -455,7 +456,7 @@ mod inventory {
                 let _ = f.store.tx(|tx| f.inv.create_resource(tx, &who, &n));
                 let all = f
                     .store
-                    .tx(|tx| f.inv.list_resources(tx, &who, View::All))
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::All, &[]))
                     .unwrap();
                 assert_eq!(all.len(), 0);
             }
@@ -555,7 +556,7 @@ mod inventory {
                 let who = caller(Some("/p/a"));
                 let list = f
                     .store
-                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller))
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller, &[]))
                     .unwrap();
                 assert_eq!(ids(&list), ["a-board", "shared", "shared", "user-board"]);
             }
@@ -566,7 +567,7 @@ mod inventory {
                 let who = caller(Some("/p/a"));
                 let list = f
                     .store
-                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller))
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller, &[]))
                     .unwrap();
                 let flagged: Vec<(&str, bool)> = list
                     .iter()
@@ -613,7 +614,7 @@ mod inventory {
                 let who = caller(None);
                 let list = f
                     .store
-                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller))
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller, &[]))
                     .unwrap();
                 assert_eq!(ids(&list), ["shared", "user-board"]);
                 assert!(list.iter().all(|r| r.scope == Scope::User));
@@ -629,7 +630,7 @@ mod inventory {
                 let who = caller(None);
                 let list = f
                     .store
-                    .tx(|tx| f.inv.list_resources(tx, &who, View::All))
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::All, &[]))
                     .unwrap();
                 assert_eq!(
                     ids(&list),
@@ -658,6 +659,7 @@ mod inventory {
                     health: Some(Some(HealthSpec {
                         checks: vec![Check::Builtin(BuiltinCheck::Accessible)],
                     })),
+                    ..ResourcePatch::default()
                 };
                 let updated = f
                     .store
@@ -2392,7 +2394,7 @@ mod text_fields {
     fn resource_count(f: &mut Fixture) -> usize {
         let who = caller(None);
         f.store
-            .tx(|tx| f.inv.list_resources(tx, &who, View::All))
+            .tx(|tx| f.inv.list_resources(tx, &who, View::All, &[]))
             .unwrap()
             .len()
     }
@@ -3139,6 +3141,703 @@ mod store_migration_0010 {
             let conn = migrated();
             assert!(conn.prepare("SELECT notes FROM resources").is_err());
             assert!(conn.prepare("SELECT notes FROM units").is_err());
+        }
+    }
+}
+
+mod resource_tags {
+    use leclerk::error::ErrorCode;
+    use leclerk::model::{Tag, TagError};
+    use leclerk::store::StoreError;
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    const ESP32: [&str; 2] = ["esp32", "zigbee"];
+
+    fn strings(tags: &[&str]) -> Vec<String> {
+        tags.iter().map(|t| (*t).to_owned()).collect()
+    }
+
+    fn tagged(id: &str, scope: Scope, tags: &[&str]) -> NewResource {
+        NewResource {
+            tags: strings(tags),
+            ..new_generic(id, scope)
+        }
+    }
+
+    fn names(resource: &Resource) -> Vec<&str> {
+        resource.tags.iter().map(Tag::as_str).collect()
+    }
+
+    fn create(
+        f: &mut Fixture,
+        who: &Caller,
+        new: &NewResource,
+    ) -> Result<Resource, InventoryError> {
+        f.store
+            .tx(|tx| f.inv.create_resource(tx, who, new))
+            .map(|c| c.value)
+    }
+
+    fn get(f: &mut Fixture, who: &Caller, id: &str) -> Resource {
+        f.store
+            .tx(|tx| f.inv.get_resource(tx, who, &rid(id)))
+            .unwrap()
+    }
+
+    fn update(
+        f: &mut Fixture,
+        who: &Caller,
+        id: &str,
+        patch: ResourcePatch,
+    ) -> Result<Resource, InventoryError> {
+        f.store
+            .tx(|tx| f.inv.update_resource(tx, who, &rid(id), patch))
+    }
+
+    fn last_detail(f: &mut Fixture, action: &str) -> Value {
+        f.store
+            .tx(audit::all)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| e.action == action)
+            .unwrap()
+            .detail
+    }
+
+    fn list(f: &mut Fixture, who: &Caller, view: View, tags: &[&str]) -> Vec<String> {
+        let tags = strings(tags);
+        f.store
+            .tx(|tx| f.inv.list_resources(tx, who, view, &tags))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id.to_string())
+            .collect()
+    }
+
+    /// A user resource `a` tagged esp32, zigbee.
+    fn seeded() -> (Fixture, Caller) {
+        let mut f = fixture();
+        let who = caller(None);
+        create(&mut f, &who, &tagged("a", Scope::User, &ESP32)).unwrap();
+        (f, who)
+    }
+
+    mod create_resource {
+        use super::*;
+
+        mod on_valid_tags {
+            use super::*;
+
+            #[test]
+            fn stores_them_and_get_resource_returns_them_sorted_and_deduplicated() {
+                let mut f = fixture();
+                let who = caller(None);
+                let new = tagged("a", Scope::User, &["zigbee", "esp32", "zigbee"]);
+                create(&mut f, &who, &new).unwrap();
+                assert_eq!(names(&get(&mut f, &who, "a")), ["esp32", "zigbee"]);
+            }
+        }
+
+        mod on_a_malformed_tag {
+            use super::*;
+
+            #[test]
+            fn returns_invalid_tag_naming_it_and_stores_nothing() {
+                let mut f = fixture();
+                let who = caller(None);
+                let err =
+                    create(&mut f, &who, &tagged("a", Scope::User, &["ok", "Thread"])).unwrap_err();
+                assert!(matches!(
+                    &err,
+                    InventoryError::InvalidTag(TagError::Invalid { tag }) if tag == "Thread"
+                ));
+                assert_eq!(err.code(), "invalid_tag");
+                assert_eq!(err.details(), Some(json!({"tag": "Thread"})));
+                assert!(
+                    f.store
+                        .tx(|tx| f.inv.get_resource(tx, &who, &rid("a")))
+                        .is_err()
+                );
+                assert_eq!(f.audit_actions(), Vec::<String>::new());
+            }
+
+            #[test]
+            fn refuses_an_agent_guess_at_the_format() {
+                let mut f = fixture();
+                let who = caller(None);
+                let long = "x".repeat(33);
+                for bad in ["esp32 c6", "zigbee,thread", "-x", long.as_str(), ""] {
+                    let err = create(&mut f, &who, &tagged("a", Scope::User, &[bad])).unwrap_err();
+                    assert_eq!(err.code(), "invalid_tag", "{bad:?}");
+                    assert_eq!(err.details(), Some(json!({"tag": bad})));
+                }
+            }
+        }
+
+        mod on_17_tags {
+            use super::*;
+
+            #[test]
+            fn returns_too_many_tags_and_stores_nothing() {
+                let mut f = fixture();
+                let who = caller(None);
+                let many: Vec<String> = (0..17).map(|i| format!("t{i:02}")).collect();
+                let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+                let err = create(&mut f, &who, &tagged("a", Scope::User, &refs)).unwrap_err();
+                assert!(matches!(
+                    err,
+                    InventoryError::InvalidTag(TagError::TooMany { max: 16, count: 17 })
+                ));
+                assert_eq!(err.code(), "too_many_tags");
+                assert!(
+                    f.store
+                        .tx(|tx| f.inv.get_resource(tx, &who, &rid("a")))
+                        .is_err()
+                );
+            }
+        }
+
+        mod on_success {
+            use super::*;
+
+            #[test]
+            fn the_resource_created_audit_entry_carries_the_tags() {
+                let (mut f, _) = seeded();
+                let detail = last_detail(&mut f, "resource_created");
+                assert_eq!(detail["tags"], json!(["esp32", "zigbee"]));
+            }
+        }
+    }
+
+    mod update_resource {
+        use super::*;
+
+        fn patch() -> ResourcePatch {
+            ResourcePatch::default()
+        }
+
+        mod on_tags_replace {
+            use super::*;
+
+            #[test]
+            fn the_stored_set_equals_the_new_one() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    tags: Some(strings(&["thread", "c6", "thread"])),
+                    ..patch()
+                };
+                let updated = update(&mut f, &who, "a", p).unwrap();
+                assert_eq!(names(&updated), ["c6", "thread"]);
+                assert_eq!(names(&get(&mut f, &who, "a")), ["c6", "thread"]);
+            }
+        }
+
+        mod on_tags_empty {
+            use super::*;
+
+            #[test]
+            fn clears_all_tags() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    tags: Some(Vec::new()),
+                    ..patch()
+                };
+                update(&mut f, &who, "a", p).unwrap();
+                assert!(get(&mut f, &who, "a").tags.is_empty());
+            }
+        }
+
+        mod on_add_tags {
+            use super::*;
+
+            #[test]
+            fn keeps_the_existing_tags_and_adds_the_new_ones() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    add_tags: strings(&["thread"]),
+                    ..patch()
+                };
+                let updated = update(&mut f, &who, "a", p).unwrap();
+                assert_eq!(names(&updated), ["esp32", "thread", "zigbee"]);
+                assert_eq!(
+                    names(&get(&mut f, &who, "a")),
+                    ["esp32", "thread", "zigbee"]
+                );
+            }
+        }
+
+        mod on_remove_tags_including_one_not_present {
+            use super::*;
+
+            #[test]
+            fn removes_the_present_ones_and_the_absent_one_is_a_no_op() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    remove_tags: strings(&["zigbee", "thread"]),
+                    ..patch()
+                };
+                let updated = update(&mut f, &who, "a", p).unwrap();
+                assert_eq!(names(&updated), ["esp32"]);
+            }
+        }
+
+        mod on_add_beyond_the_limit {
+            use super::*;
+
+            #[test]
+            fn returns_too_many_tags_and_the_stored_set_is_unchanged() {
+                let mut f = fixture();
+                let who = caller(None);
+                let sixteen: Vec<String> = (0..16).map(|i| format!("t{i:02}")).collect();
+                let refs: Vec<&str> = sixteen.iter().map(String::as_str).collect();
+                create(&mut f, &who, &tagged("a", Scope::User, &refs)).unwrap();
+                let p = ResourcePatch {
+                    add_tags: strings(&["one-more"]),
+                    description: Some("changed".into()),
+                    ..patch()
+                };
+                let err = update(&mut f, &who, "a", p).unwrap_err();
+                assert_eq!(err.code(), "too_many_tags");
+                assert_eq!(err.details(), Some(json!({"max": 16, "count": 17})));
+                let after = get(&mut f, &who, "a");
+                assert_eq!(after.tags.len(), 16);
+                assert_eq!(after.description, "a board");
+            }
+        }
+
+        mod on_tags_together_with_add_or_remove {
+            use super::*;
+
+            fn assert_conflict(f: &mut Fixture, who: &Caller, p: ResourcePatch) {
+                let err = update(f, who, "a", p).unwrap_err();
+                assert!(matches!(
+                    err,
+                    InventoryError::ConflictingTagEdit {
+                        reason: "replace_with_add_or_remove",
+                        tag: None
+                    }
+                ));
+                assert_eq!(err.code(), "conflicting_tag_edit");
+                assert_eq!(
+                    err.details(),
+                    Some(json!({"reason": "replace_with_add_or_remove"}))
+                );
+                assert_eq!(names(&get(f, who, "a")), ["esp32", "zigbee"]);
+            }
+
+            #[test]
+            fn tags_with_add_tags_returns_conflicting_tag_edit_and_changes_nothing() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    tags: Some(strings(&["x"])),
+                    add_tags: strings(&["y"]),
+                    ..patch()
+                };
+                assert_conflict(&mut f, &who, p);
+            }
+
+            #[test]
+            fn tags_with_remove_tags_returns_conflicting_tag_edit_and_changes_nothing() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    tags: Some(Vec::new()),
+                    remove_tags: strings(&["esp32"]),
+                    ..patch()
+                };
+                assert_conflict(&mut f, &who, p);
+            }
+        }
+
+        mod on_a_tag_in_both_add_and_remove {
+            use super::*;
+
+            #[test]
+            fn returns_conflicting_tag_edit_naming_the_tag_and_changes_nothing() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    add_tags: strings(&["thread", "new"]),
+                    remove_tags: strings(&["thread"]),
+                    ..patch()
+                };
+                let err = update(&mut f, &who, "a", p).unwrap_err();
+                assert!(matches!(
+                    &err,
+                    InventoryError::ConflictingTagEdit {
+                        reason: "added_and_removed",
+                        tag: Some(tag)
+                    } if tag == "thread"
+                ));
+                assert_eq!(
+                    err.details(),
+                    Some(json!({"reason": "added_and_removed", "tag": "thread"}))
+                );
+                assert_eq!(names(&get(&mut f, &who, "a")), ["esp32", "zigbee"]);
+            }
+        }
+
+        mod on_a_malformed_tag {
+            use super::*;
+
+            #[test]
+            fn returns_invalid_tag_and_changes_nothing() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    add_tags: strings(&["fine", "Thread"]),
+                    description: Some("changed".into()),
+                    ..patch()
+                };
+                let err = update(&mut f, &who, "a", p).unwrap_err();
+                assert_eq!(err.code(), "invalid_tag");
+                assert_eq!(err.details(), Some(json!({"tag": "Thread"})));
+                let after = get(&mut f, &who, "a");
+                assert_eq!(names(&after), ["esp32", "zigbee"]);
+                assert_eq!(after.description, "a board");
+            }
+
+            #[test]
+            fn a_malformed_removal_is_refused_too() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    remove_tags: strings(&["esp32 c6"]),
+                    ..patch()
+                };
+                let err = update(&mut f, &who, "a", p).unwrap_err();
+                assert_eq!(err.code(), "invalid_tag");
+            }
+        }
+
+        mod on_no_tag_fields {
+            use super::*;
+
+            #[test]
+            fn leaves_the_tags_unchanged() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    description: Some("changed".into()),
+                    ..patch()
+                };
+                let updated = update(&mut f, &who, "a", p).unwrap();
+                assert_eq!(names(&updated), ["esp32", "zigbee"]);
+            }
+        }
+
+        mod on_success {
+            use super::*;
+
+            #[test]
+            fn the_resource_updated_audit_entry_carries_the_resulting_tags() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    add_tags: strings(&["thread"]),
+                    ..patch()
+                };
+                update(&mut f, &who, "a", p).unwrap();
+                let detail = last_detail(&mut f, "resource_updated");
+                assert_eq!(detail["tags"], json!(["esp32", "thread", "zigbee"]));
+            }
+
+            #[test]
+            fn the_audit_tags_are_the_unchanged_set_when_no_tag_field_is_given() {
+                let (mut f, who) = seeded();
+                let p = ResourcePatch {
+                    description: Some("changed".into()),
+                    ..patch()
+                };
+                update(&mut f, &who, "a", p).unwrap();
+                let detail = last_detail(&mut f, "resource_updated");
+                assert_eq!(detail["tags"], json!(["esp32", "zigbee"]));
+            }
+        }
+    }
+
+    mod list_resources {
+        use super::*;
+
+        /// User resources a (esp32, zigbee), b (esp32, thread), c (none).
+        fn listed() -> (Fixture, Caller) {
+            let (mut f, who) = seeded();
+            create(
+                &mut f,
+                &who,
+                &tagged("b", Scope::User, &["esp32", "thread"]),
+            )
+            .unwrap();
+            create(&mut f, &who, &tagged("c", Scope::User, &[])).unwrap();
+            (f, who)
+        }
+
+        mod on_no_tags {
+            use super::*;
+
+            #[test]
+            fn returns_every_resource_in_the_view() {
+                let (mut f, who) = listed();
+                assert_eq!(list(&mut f, &who, View::Caller, &[]), ["a", "b", "c"]);
+            }
+        }
+
+        mod on_one_tag {
+            use super::*;
+
+            #[test]
+            fn returns_only_resources_carrying_it() {
+                let (mut f, who) = listed();
+                assert_eq!(list(&mut f, &who, View::Caller, &["esp32"]), ["a", "b"]);
+            }
+        }
+
+        mod on_several_tags {
+            use super::*;
+
+            #[test]
+            fn returns_only_resources_carrying_all_of_them() {
+                let (mut f, who) = listed();
+                assert_eq!(
+                    list(&mut f, &who, View::Caller, &["esp32", "thread"]),
+                    ["b"]
+                );
+            }
+        }
+
+        mod on_a_tag_nobody_has {
+            use super::*;
+
+            #[test]
+            fn returns_an_empty_list() {
+                let (mut f, who) = listed();
+                assert_eq!(
+                    list(&mut f, &who, View::Caller, &["matter"]),
+                    Vec::<String>::new()
+                );
+            }
+        }
+
+        mod on_match_in_another_project {
+            use super::*;
+
+            #[test]
+            fn the_other_projects_resource_is_not_returned() {
+                let mut f = fixture();
+                let (a, b) = (caller(Some("/p/a")), caller(Some("/p/b")));
+                create(
+                    &mut f,
+                    &b,
+                    &tagged("theirs", Scope::Project(project("/p/b")), &["thread"]),
+                )
+                .unwrap();
+                create(
+                    &mut f,
+                    &a,
+                    &tagged("mine", Scope::Project(project("/p/a")), &["thread"]),
+                )
+                .unwrap();
+                assert_eq!(list(&mut f, &a, View::Caller, &["thread"]), ["mine"]);
+                assert_eq!(list(&mut f, &b, View::Caller, &["thread"]), ["theirs"]);
+            }
+
+            #[test]
+            fn a_caller_without_a_project_sees_no_project_match() {
+                let mut f = fixture();
+                let b = caller(Some("/p/b"));
+                create(
+                    &mut f,
+                    &b,
+                    &tagged("theirs", Scope::Project(project("/p/b")), &["thread"]),
+                )
+                .unwrap();
+                assert_eq!(
+                    list(&mut f, &caller(None), View::Caller, &["thread"]),
+                    Vec::<String>::new()
+                );
+            }
+        }
+
+        mod on_view_all {
+            use super::*;
+
+            #[test]
+            fn filters_across_every_scope() {
+                let mut f = fixture();
+                let (a, b) = (caller(Some("/p/a")), caller(Some("/p/b")));
+                create(&mut f, &a, &tagged("user", Scope::User, &["thread"])).unwrap();
+                create(
+                    &mut f,
+                    &b,
+                    &tagged("theirs", Scope::Project(project("/p/b")), &["thread"]),
+                )
+                .unwrap();
+                create(
+                    &mut f,
+                    &b,
+                    &tagged("other", Scope::Project(project("/p/b")), &["zigbee"]),
+                )
+                .unwrap();
+                assert_eq!(
+                    list(&mut f, &caller(None), View::All, &["thread"]),
+                    ["theirs", "user"]
+                );
+            }
+        }
+
+        mod on_a_malformed_filter_tag {
+            use super::*;
+
+            #[test]
+            fn returns_invalid_tag_and_no_listing() {
+                let (mut f, who) = listed();
+                let tags = strings(&["esp32", "Thread"]);
+                let err = f
+                    .store
+                    .tx(|tx| f.inv.list_resources(tx, &who, View::Caller, &tags))
+                    .unwrap_err();
+                assert_eq!(err.code(), "invalid_tag");
+                assert_eq!(err.details(), Some(json!({"tag": "Thread"})));
+            }
+        }
+    }
+
+    mod duplicate_warnings {
+        use super::*;
+
+        mod on_add_unit_and_update_unit_duplicate_payloads {
+            use super::*;
+
+            fn tagged_with_unit(
+                f: &mut Fixture,
+                who: &Caller,
+                id: &str,
+                scope: Scope,
+                key: &str,
+            ) -> Result<leclerk::inventory::Created<leclerk::model::Unit>, InventoryError>
+            {
+                create(f, who, &tagged(id, scope, &["secret-tag"]))?;
+                f.store.tx(|tx| {
+                    f.inv.add_unit(
+                        tx,
+                        who,
+                        &rid(id),
+                        &NewUnit {
+                            id: uid("u1"),
+                            settings: generic_settings(key),
+                            description: String::new(),
+                        },
+                    )
+                })
+            }
+
+            #[test]
+            fn duplicate_in_scope_carries_no_tags() {
+                let mut f = fixture();
+                let who = caller(None);
+                tagged_with_unit(&mut f, &who, "a", Scope::User, "k").unwrap();
+                let err = tagged_with_unit(&mut f, &who, "b", Scope::User, "k").unwrap_err();
+                assert!(matches!(err, InventoryError::DuplicateInScope { .. }));
+                assert!(!format!("{err:?} {:?}", err.details()).contains("secret-tag"));
+            }
+
+            #[test]
+            fn warnings_for_other_scopes_carry_no_tags() {
+                let mut f = fixture();
+                let (a, b) = (caller(Some("/p/a")), caller(Some("/p/b")));
+                tagged_with_unit(&mut f, &caller(None), "u", Scope::User, "k").unwrap();
+                let in_a =
+                    tagged_with_unit(&mut f, &a, "mine", Scope::Project(project("/p/a")), "k")
+                        .unwrap();
+                let in_b =
+                    tagged_with_unit(&mut f, &b, "theirs", Scope::Project(project("/p/b")), "k")
+                        .unwrap();
+                for warnings in [in_a.warnings, in_b.warnings] {
+                    assert_ne!(warnings.len(), 0);
+                    let text =
+                        format!("{warnings:?} {}", serde_json::to_string(&warnings).unwrap());
+                    assert!(!text.contains("secret-tag"), "{text}");
+                }
+            }
+
+            #[test]
+            fn update_unit_duplicate_errors_carry_no_tags() {
+                let mut f = fixture();
+                let who = caller(None);
+                tagged_with_unit(&mut f, &who, "a", Scope::User, "k1").unwrap();
+                tagged_with_unit(&mut f, &who, "b", Scope::User, "k2").unwrap();
+                let err = f
+                    .store
+                    .tx(|tx| {
+                        f.inv.update_unit(
+                            tx,
+                            &who,
+                            &rid("b"),
+                            &uid("u1"),
+                            UnitPatch {
+                                settings: Some(generic_settings("k1")),
+                                ..UnitPatch::default()
+                            },
+                        )
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, InventoryError::DuplicateInScope { .. }));
+                assert!(!format!("{err:?} {:?}", err.details()).contains("secret-tag"));
+            }
+        }
+    }
+
+    mod store_resource_delete {
+        use super::*;
+
+        mod on_resource_delete {
+            use super::*;
+
+            #[test]
+            fn its_resource_tags_rows_are_gone() {
+                let (mut f, who) = seeded();
+                create(&mut f, &who, &tagged("keep", Scope::User, &["x"])).unwrap();
+                f.store
+                    .tx(|tx| f.inv.delete_resource(tx, &who, &rid("a")))
+                    .unwrap();
+                let rows: Vec<String> = f
+                    .store
+                    .tx(|tx| -> Result<_, StoreError> {
+                        let mut stmt = tx.conn().prepare("SELECT tag FROM resource_tags")?;
+                        Ok(stmt
+                            .query_map([], |r| r.get(0))?
+                            .collect::<Result<_, _>>()?)
+                    })
+                    .unwrap();
+                assert_eq!(rows, ["x"]);
+            }
+        }
+    }
+
+    mod migration_0011 {
+        use leclerk::store::migrations;
+        use rusqlite::Connection;
+
+        mod on_a_database_at_version_10_with_resources {
+            use super::*;
+
+            #[test]
+            fn those_resources_have_no_tags_after_migrating() {
+                let mut conn = Connection::open_in_memory().unwrap();
+                conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+                migrations().to_version(&mut conn, 10).unwrap();
+                conn.execute(
+                    "INSERT INTO resources (id, scope_kind, type, description, usage, created_at) \
+                     VALUES ('board', 'user', 'generic', 'boards', '', 1)",
+                    [],
+                )
+                .unwrap();
+                migrations().to_latest(&mut conn).unwrap();
+                let tags: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM resource_tags", [], |r| r.get(0))
+                    .unwrap();
+                let resources: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM resources", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!((resources, tags), (1, 0));
+            }
         }
     }
 }

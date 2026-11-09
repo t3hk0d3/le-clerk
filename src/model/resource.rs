@@ -1,6 +1,8 @@
 //! Stored inventory records.
 
-use crate::model::{DirtyInfo, HealthSpec, ResourceId, ResourceType, Scope, UnitId, UnitSettings};
+use crate::model::{
+    DirtyInfo, HealthSpec, ResourceId, ResourceType, Scope, TagSet, UnitId, UnitSettings,
+};
 
 /// One leasable unit of a resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +46,8 @@ pub struct Resource {
     pub usage: String,
     /// Health checks; `None` means the type default.
     pub health: Option<HealthSpec>,
+    /// Search tags, sorted.
+    pub tags: TagSet,
     /// Creation time, unix milliseconds.
     pub created_at: i64,
     /// True when this project resource hides a user resource of the same id.

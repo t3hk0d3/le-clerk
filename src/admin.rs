@@ -334,6 +334,9 @@ pub struct ExportResource {
     /// `null` means the type default.
     #[serde(default)]
     pub health: Option<HealthSpec>,
+    /// Search tags, sorted; absent in exports made before tags existed.
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub units: Vec<ExportUnit>,
 }
@@ -995,6 +998,7 @@ impl<'a> Admin<'a> {
                     description: r.description,
                     usage: r.usage,
                     health: r.health,
+                    tags: r.tags.iter().map(|t| t.as_str().to_owned()).collect(),
                     units: r
                         .units
                         .into_iter()
@@ -1141,6 +1145,7 @@ impl<'a> Admin<'a> {
                     description: r.description.clone(),
                     usage: r.usage.clone(),
                     health: r.health.clone(),
+                    tags: r.tags.clone(),
                 },
             )?;
             for u in &r.units {

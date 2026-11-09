@@ -1874,6 +1874,7 @@ mod admin_ops {
                                 "description": "boards",
                                 "usage": "n",
                                 "health": [{"builtin": "none"}],
+                                "tags": [],
                                 "units": [{
                                     "id": "u1",
                                     "settings": {"type": "generic", "identity_key": "k1"},
@@ -1887,6 +1888,7 @@ mod admin_ops {
                                 "description": "",
                                 "usage": "",
                                 "health": null,
+                                "tags": [],
                                 "units": [{
                                     "id": "m1",
                                     "settings": {"type": "generic", "identity_key": "k1"},
@@ -2379,6 +2381,177 @@ mod export_text {
                 let unit = resource["units"][0].as_object().unwrap();
                 assert!(unit.contains_key("description"));
                 assert!(!unit.contains_key("notes"));
+            }
+        }
+    }
+}
+
+mod resource_tags {
+    use super::*;
+
+    async fn tagged(h: &EngineHandle, who: &Caller, id: &str, scope: Value, tags: &[&str]) {
+        ok(
+            h,
+            "create_resource",
+            who,
+            json!({"id": id, "type": "generic", "scope": scope, "tags": tags}),
+        )
+        .await;
+    }
+
+    async fn tags_of(h: &EngineHandle, who: &Caller, id: &str) -> Value {
+        ok(h, "get_resource", who, json!({"id": id})).await["tags"].clone()
+    }
+
+    mod admin_rename {
+        use super::*;
+
+        #[tokio::test]
+        async fn the_resource_keeps_its_tags() {
+            let (h, _clock) = spawn();
+            tagged(&h, &user("o"), "board", json!("user"), &["zigbee", "esp32"]).await;
+            ok(
+                &h,
+                "admin_rename",
+                &admin(),
+                json!({"resource": "board", "new_id": "plank"}),
+            )
+            .await;
+            assert_eq!(
+                tags_of(&h, &user("o"), "plank").await,
+                json!(["esp32", "zigbee"])
+            );
+        }
+    }
+
+    mod admin_move {
+        use super::*;
+
+        #[tokio::test]
+        async fn the_resource_keeps_its_tags() {
+            let (h, _clock) = spawn();
+            let owner = in_project("o", "/p");
+            tagged(&h, &owner, "mine", json!({"project": "/p"}), &["thread"]).await;
+            ok(
+                &h,
+                "admin_move",
+                &admin(),
+                json!({"resource": "mine", "scope": "project:/p", "to": "user"}),
+            )
+            .await;
+            assert_eq!(tags_of(&h, &user("x"), "mine").await, json!(["thread"]));
+        }
+    }
+
+    mod approve_promotion {
+        use super::*;
+
+        #[tokio::test]
+        async fn the_promoted_resource_keeps_its_tags() {
+            let (h, _clock) = spawn();
+            let (a, b) = (in_project("a", "/p/a"), in_project("b", "/p/b"));
+            tagged(&h, &b, "theirs", json!({"project": "/p/b"}), &["thread"]).await;
+            ok(
+                &h,
+                "add_unit",
+                &b,
+                json!({"resource": "theirs", "id": "t1",
+                       "settings": {"type": "generic", "identity_key": "same"}}),
+            )
+            .await;
+            seed(
+                &h,
+                &a,
+                "mine",
+                json!({"project": "/p/a"}),
+                &[("m1", "same")],
+            )
+            .await;
+            let promos = ok(&h, "list_promotions", &admin(), json!({})).await;
+            ok(
+                &h,
+                "approve_promotion",
+                &admin(),
+                json!({"id": promos[0]["id"]}),
+            )
+            .await;
+            assert_eq!(tags_of(&h, &user("x"), "theirs").await, json!(["thread"]));
+        }
+    }
+
+    mod admin_export {
+        use super::*;
+
+        #[tokio::test]
+        async fn writes_tags_per_resource_sorted() {
+            let (h, _clock) = spawn();
+            tagged(&h, &user("o"), "board", json!("user"), &["zigbee", "esp32"]).await;
+            tagged(&h, &user("o"), "bare", json!("user"), &[]).await;
+            let got = export(&h).await;
+            let tags: Vec<Value> = got["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["tags"].clone())
+                .collect();
+            assert_eq!(tags, [json!([]), json!(["esp32", "zigbee"])]);
+        }
+    }
+
+    mod admin_import {
+        use super::*;
+
+        fn doc(resource: &Value) -> Value {
+            json!({"version": 1, "resources": [resource], "links": []})
+        }
+
+        mod on_a_current_export {
+            use super::*;
+
+            #[tokio::test]
+            async fn round_trips_tags_identically() {
+                let (h, _clock) = spawn();
+                tagged(&h, &user("o"), "board", json!("user"), &["zigbee", "esp32"]).await;
+                let p = in_project("o", "/p");
+                tagged(&h, &p, "mine", json!({"project": "/p"}), &["thread"]).await;
+                let before = export(&h).await;
+                let (h2, _clock2) = spawn();
+                ok(&h2, "admin_import", &admin(), json!({"doc": before})).await;
+                assert_eq!(export(&h2).await, before);
+                assert_eq!(
+                    tags_of(&h2, &user("x"), "board").await,
+                    json!(["esp32", "zigbee"])
+                );
+            }
+        }
+
+        mod on_an_export_without_tags_fields {
+            use super::*;
+
+            #[tokio::test]
+            async fn imports_resources_with_no_tags() {
+                let (h, _clock) = spawn();
+                let old = doc(&json!({"id": "board", "type": "generic", "scope": "user"}));
+                ok(&h, "admin_import", &admin(), json!({"doc": old})).await;
+                assert_eq!(tags_of(&h, &user("x"), "board").await, json!([]));
+            }
+        }
+
+        mod on_an_imported_malformed_tag {
+            use super::*;
+
+            #[tokio::test]
+            async fn fails_with_invalid_tag_and_imports_nothing() {
+                let (h, _clock) = spawn();
+                let bad = json!({"version": 1, "links": [], "resources": [
+                    {"id": "good", "type": "generic", "scope": "user", "tags": ["fine"]},
+                    {"id": "board", "type": "generic", "scope": "user", "tags": ["Thread"]},
+                ]});
+                let before = export(&h).await;
+                let e = err(&h, "admin_import", &admin(), json!({"doc": bad})).await;
+                assert_eq!(e.code, "invalid_tag");
+                assert_eq!(e.details, Some(json!({"tag": "Thread"})));
+                assert_eq!(export(&h).await, before);
             }
         }
     }
