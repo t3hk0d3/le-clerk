@@ -1777,6 +1777,673 @@ mod cli {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Leasing
+    // -----------------------------------------------------------------------
+
+    /// The board from [`seed`], with a usage template naming the unit's key.
+    fn seed_with_usage(env: &Env) {
+        seed(env, "board", "k1");
+        env.ok(&[
+            "resource",
+            "update",
+            "board",
+            "--usage",
+            "Flash with key {unit.identity_key}",
+        ]);
+    }
+
+    /// User `who` holds board's unit; returns the lease id.
+    fn hold(env: &Env, who: &str) -> String {
+        let grant = acquire(env, &user(who), "board");
+        assert_eq!(grant["outcome"], "granted", "{grant}");
+        grant["lease_id"].as_str().unwrap().to_owned()
+    }
+
+    /// User `who` releases `lease` and confirms its cleanup.
+    fn free(env: &Env, who: &str, lease: &str) {
+        env.rpc("release", &user(who), json!({ "lease_id": lease }))
+            .unwrap();
+        env.rpc("confirm", &user(who), json!({ "lease_id": lease }))
+            .unwrap();
+    }
+
+    /// Board's first unit in the status view.
+    fn unit_status(env: &Env) -> Value {
+        env.ok(&["status"])["resources"][0]["units"][0].clone()
+    }
+
+    /// Audit entries of `action`, newest first.
+    fn audit(env: &Env, action: &str) -> Vec<Value> {
+        env.ok(&["log", "--action", action])
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    /// The lease id of a grant or lease view.
+    fn lease_of(body: &Value) -> String {
+        body["lease_id"].as_str().unwrap().to_owned()
+    }
+
+    /// clerk `args` in the background as the user (or agent `session`):
+    /// stdin a pipe that stays open, stdout and stderr piped.
+    fn spawn(env: &Env, args: &[&str], session: Option<&str>) -> std::process::Child {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"));
+        cmd.args(args)
+            .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
+            .env("CLERK_HOME", env.home())
+            .env_remove(SESSION_VAR)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(session) = session {
+            cmd.env(SESSION_VAR, session);
+        }
+        cmd.spawn().unwrap()
+    }
+
+    /// The lines `child` prints on stdout, as they come.
+    fn lines(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<String> {
+        use std::io::BufRead;
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
+    /// Everything `child` printed on stdout, once it exited.
+    fn stdout_of(child: &mut std::process::Child) -> String {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut text).unwrap();
+        text
+    }
+
+    /// Exit code of `child`, which must end within [`PATIENCE`].
+    fn code_of(child: &mut std::process::Child) -> i32 {
+        let status = wait_within(child, PATIENCE).expect("clerk ended in time");
+        status
+            .code()
+            .unwrap_or_else(|| panic!("killed by a signal: {status:?}"))
+    }
+
+    fn now_ms() -> i64 {
+        use leclerk::clock::Clock;
+        leclerk::clock::SystemClock.now_ms()
+    }
+
+    mod acquire {
+        use super::*;
+
+        mod on_stdin_not_tty {
+            use super::*;
+
+            #[test]
+            fn prints_queued_and_exits_6_without_reading_stdin() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                hold(&env, "x");
+                let mut child = spawn(&env, &["acquire", "board", "--for", "10m"], None);
+                let _open_stdin = child.stdin.take();
+                assert_eq!(code_of(&mut child), 6);
+                let body: Value = serde_json::from_str(&stdout_of(&mut child)).unwrap();
+                assert_eq!(body["outcome"], "queued");
+                assert_eq!(body["position"], 1);
+            }
+
+            #[test]
+            fn prints_granted_and_exits_0_without_reading_stdin() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let mut child = spawn(&env, &["acquire", "board", "--for", "10m"], None);
+                let _open_stdin = child.stdin.take();
+                assert_eq!(code_of(&mut child), 0);
+                let body: Value = serde_json::from_str(&stdout_of(&mut child)).unwrap();
+                assert_eq!(body["outcome"], "granted");
+                assert_eq!(body["unit"], "u1");
+            }
+
+            #[test]
+            fn lease_held_by_a_fresh_user_holder() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                env.ok(&["acquire", "board", "--for", "10m"]);
+                let occupancy = unit_status(&env)["occupancy"].clone();
+                assert_eq!(occupancy["holder"]["kind"], "user", "{occupancy}");
+            }
+        }
+
+        mod on_wait_flag {
+            use super::*;
+
+            #[test]
+            fn blocks_until_granted_then_prints_and_exits_0() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let theirs = hold(&env, "x");
+                let mut child = spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
+                let _open_stdin = child.stdin.take();
+                std::thread::sleep(Duration::from_millis(500));
+                assert!(child.try_wait().unwrap().is_none(), "returned while queued");
+                free(&env, "x", &theirs);
+                assert_eq!(code_of(&mut child), 0);
+                let body: Value = serde_json::from_str(&stdout_of(&mut child)).unwrap();
+                assert_eq!(body["state"], "held", "{body}");
+                assert_ne!(lease_of(&body), theirs);
+            }
+        }
+
+        mod on_invalid_for {
+            use super::*;
+
+            #[test]
+            fn exits_2_for_each_of_0_neg_abc_100000d() {
+                let env = Env::new();
+                for bad in ["0", "-5m", "abc", "100000d"] {
+                    let error = error_of(env.cmd().args(["acquire", "board", "--for", bad]), 2);
+                    assert_eq!(error["code"], "usage_error", "{bad}");
+                    let message = error["message"].as_str().unwrap();
+                    assert!(message.contains("<n>s|m|h|d"), "{bad}: {message}");
+                }
+                assert!(!env.daemon_started());
+            }
+        }
+
+        mod on_no_units {
+            use super::*;
+
+            #[test]
+            fn exits_4_code_no_units() {
+                let env = Env::new();
+                env.ok(&["resource", "create", "empty", "--type", "generic"]);
+                let error = error_of(env.cmd().args(["acquire", "empty", "--for", "10m"]), 4);
+                assert_eq!(error["code"], "no_units");
+                assert!(
+                    error["message"].as_str().unwrap().contains("add"),
+                    "{error}"
+                );
+            }
+        }
+
+        mod on_grant {
+            use super::*;
+
+            #[test]
+            fn prints_brief() {
+                let env = Env::new();
+                seed_with_usage(&env);
+                let body = env.ok(&["acquire", "board", "--for", "10m"]);
+                assert_eq!(body["resource_description"], "A test board");
+                assert_eq!(body["unit_description"], "The left one");
+                assert_eq!(body["resource_tags"], json!(["esp32", "thread"]));
+                assert_eq!(body["usage"], "Flash with key k1");
+            }
+        }
+
+        mod on_session_env {
+            use super::*;
+
+            #[test]
+            fn lease_owned_by_agent_session() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let dir = env.dir("alpha");
+                json_of(
+                    env.agent("sess-1", &dir)
+                        .args(["acquire", "board", "--for", "10m"]),
+                );
+                assert_eq!(
+                    unit_status(&env)["occupancy"]["holder"],
+                    json!({"kind": "agent_session", "session_id": "sess-1"})
+                );
+            }
+        }
+    }
+
+    mod acquire_override {
+        use super::*;
+
+        mod on_empty_reason {
+            use super::*;
+
+            #[test]
+            fn refused_exit_2() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let error = error_of(
+                    env.agent("sess-1", &dir).args([
+                        "acquire",
+                        "board",
+                        "--for",
+                        "10m",
+                        "--override",
+                        "",
+                    ]),
+                    2,
+                );
+                assert_eq!(error["code"], "usage_error");
+                assert!(!env.daemon_started());
+            }
+        }
+    }
+
+    mod attach {
+        use super::*;
+
+        #[test]
+        fn prints_the_brief_from_get_lease() {
+            let env = Env::new();
+            seed_with_usage(&env);
+            let lease = lease_of(&env.ok(&["acquire", "board", "--for", "10m"]));
+            let body = env.ok(&["attach", &lease]);
+            assert_eq!(lease_of(&body), lease);
+            assert_eq!(body["resource_description"], "A test board");
+            assert_eq!(body["unit_description"], "The left one");
+            assert_eq!(body["resource_tags"], json!(["esp32", "thread"]));
+            assert_eq!(body["usage"], "Flash with key k1");
+        }
+
+        mod on_ended_lease {
+            use super::*;
+
+            #[test]
+            fn exits_3() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let lease = lease_of(&env.ok(&["acquire", "board", "--for", "10m"]));
+                env.ok(&["release", &lease]);
+                let error = error_of(env.cmd().args(["attach", &lease]), 3);
+                assert_eq!(error["code"], "not_found");
+            }
+        }
+
+        mod on_unknown_lease {
+            use super::*;
+
+            #[test]
+            fn exits_3() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let ghost = leclerk::model::LeaseId::new();
+                let error = error_of(env.cmd().args(["attach", ghost.as_str()]), 3);
+                assert_eq!(error["code"], "not_found");
+            }
+        }
+
+        mod on_someone_elses_lease {
+            use super::*;
+
+            #[test]
+            fn exits_3_and_nothing_changes() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let dir = env.dir("alpha");
+                let lease = lease_of(&json_of(
+                    env.agent("sess-1", &dir)
+                        .args(["acquire", "board", "--for", "10m"]),
+                ));
+                let before = unit_status(&env);
+                let error = error_of(env.cmd().args(["attach", &lease]), 3);
+                assert_eq!(error["code"], "not_found");
+                assert_eq!(unit_status(&env), before);
+            }
+        }
+    }
+
+    mod release {
+        use super::*;
+
+        #[test]
+        fn starts_cleanup_and_confirms_clean() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let lease = lease_of(&env.ok(&["acquire", "board", "--for", "10m"]));
+            let body = env.ok(&["release", &lease]);
+            assert_eq!(body["state"], "ended", "{body}");
+            assert_eq!(body["end_cause"], "released");
+            let ended = &audit(&env, "lease_ended")[0]["detail"];
+            assert_eq!(ended["lease"], lease.as_str());
+            assert_eq!(ended["cleanup_confirmed"], true);
+            assert_eq!(unit_status(&env)["dirty"], Value::Null);
+        }
+    }
+
+    mod extend {
+        use super::*;
+
+        #[test]
+        fn new_end_is_now_plus_duration() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let lease = lease_of(&env.ok(&["acquire", "board", "--for", "10m"]));
+            let before = now_ms();
+            let body = env.ok(&["extend", &lease, "--for", "1h"]);
+            let after = now_ms();
+            let ends = body["ends_at"].as_i64().unwrap();
+            assert!(
+                (before + 3_600_000..=after + 3_600_000).contains(&ends),
+                "{before} {ends} {after}"
+            );
+        }
+
+        mod on_higher_priority_waiter {
+            use super::*;
+
+            #[test]
+            fn exits_4_showing_the_waiting_purpose() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let lease = lease_of(&env.ok(&["acquire", "board", "--for", "10m"]));
+                env.rpc(
+                    "acquire",
+                    &user("w"),
+                    json!({
+                        "target": {"resource": "board"},
+                        "duration_ms": 60_000,
+                        "priority": "high",
+                        "purpose": "urgent flash",
+                    }),
+                )
+                .unwrap();
+                let error = error_of(env.cmd().args(["extend", &lease, "--for", "1h"]), 4);
+                assert_eq!(error["code"], "extend_refused");
+                assert_eq!(error["details"]["waiting_purpose"], "urgent flash");
+            }
+        }
+    }
+
+    mod run {
+        use super::*;
+
+        mod on_cmd {
+            use super::*;
+
+            #[test]
+            fn receives_clerk_unit_env() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let out = env
+                    .cmd()
+                    .args([
+                        "run",
+                        "board",
+                        "--for",
+                        "10m",
+                        "--",
+                        "sh",
+                        "-c",
+                        "echo \"$CLERK_LEASE_ID|$CLERK_RESOURCE|$CLERK_UNIT|$CLERK_UNIT_IDENTITY_KEY\"",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+                let text = String::from_utf8(out.stdout).unwrap();
+                let fields: Vec<&str> = text.trim().split('|').collect();
+                assert_eq!(fields.len(), 4, "{text}");
+                assert!(!fields[0].is_empty(), "{text}");
+                assert_eq!(&fields[1..], ["board", "u1", "k1"]);
+            }
+
+            #[test]
+            fn lease_held_by_this_cli_process() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let out = env
+                    .cmd()
+                    .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
+                    .args([
+                        "run",
+                        "board",
+                        "--for",
+                        "10m",
+                        "--",
+                        "sh",
+                        "-c",
+                        "\"$CLERK\" status --json",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+                let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+                let holder = &status["resources"][0]["units"][0]["occupancy"]["holder"];
+                assert_eq!(holder["kind"], "cli_process", "{status}");
+            }
+        }
+
+        mod on_queued {
+            use super::*;
+
+            #[test]
+            fn waits_and_claims_then_runs_cmd() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let theirs = hold(&env, "x");
+                let mut child = spawn(
+                    &env,
+                    &["run", "board", "--for", "10m", "--", "echo", "ran"],
+                    None,
+                );
+                std::thread::sleep(Duration::from_millis(500));
+                assert!(child.try_wait().unwrap().is_none(), "ran while queued");
+                free(&env, "x", &theirs);
+                assert_eq!(code_of(&mut child), 0);
+                assert_eq!(stdout_of(&mut child).trim(), "ran");
+            }
+        }
+
+        mod on_cmd_exit_0 {
+            use super::*;
+
+            #[test]
+            fn releases_with_confirm_clean_and_exits_0() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                env.cmd()
+                    .args(["run", "board", "--for", "10m", "--", "true"])
+                    .assert()
+                    .code(0);
+                let ended = &audit(&env, "lease_ended")[0]["detail"];
+                assert_eq!(ended["cause"], "released");
+                assert_eq!(ended["cleanup_confirmed"], true);
+                assert_eq!(unit_status(&env)["dirty"], Value::Null);
+            }
+        }
+
+        mod on_cmd_exit_3 {
+            use super::*;
+
+            #[test]
+            fn unit_dirty_command_failed_and_exit_3() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                env.cmd()
+                    .args(["run", "board", "--for", "10m", "--", "sh", "-c", "exit 3"])
+                    .assert()
+                    .code(3);
+                let unit = unit_status(&env);
+                assert_eq!(unit["dirty"]["reason"], "command_failed", "{unit}");
+                assert_eq!(unit["occupancy"]["kind"], "free", "{unit}");
+            }
+        }
+
+        /// A command that says "started", then on SIGTERM says
+        /// "terminated" and exits 7.
+        const PATIENT: &str =
+            "trap 'echo terminated; exit 7' TERM; echo started; while :; do sleep 0.1; done";
+
+        mod on_override {
+            use super::*;
+
+            #[test]
+            fn sigterms_cmd_at_the_cleanup_deadline() {
+                let env = Env::new();
+                let config = env.paths().config;
+                fs::create_dir_all(config.parent().unwrap()).unwrap();
+                fs::write(&config, "cleanup_window = 2\n").unwrap();
+                seed(&env, "board", "k1");
+                let mut child = spawn(
+                    &env,
+                    &["run", "board", "--for", "10m", "--", "sh", "-c", PATIENT],
+                    None,
+                );
+                let out = lines(&mut child);
+                assert_eq!(out.recv_timeout(PATIENCE).unwrap(), "started");
+                let dir = env.dir("alpha");
+                let mut agent = agent_caller("sess-1", &dir);
+                agent.override_reason = Some("the user asked".to_owned());
+                let overridden = Instant::now();
+                env.rpc(
+                    "acquire",
+                    &agent,
+                    json!({
+                        "target": {"resource": "board"},
+                        "duration_ms": 60_000,
+                        "purpose": "take it",
+                        "override_reason": "the user asked",
+                    }),
+                )
+                .unwrap();
+                assert_eq!(out.recv_timeout(PATIENCE).unwrap(), "terminated");
+                assert!(
+                    overridden.elapsed() >= Duration::from_millis(1500),
+                    "{:?}",
+                    overridden.elapsed()
+                );
+                assert_eq!(code_of(&mut child), 7);
+            }
+        }
+
+        mod on_admin_release {
+            use super::*;
+
+            #[test]
+            fn sigterms_cmd() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let mut child = spawn(
+                    &env,
+                    &["run", "board", "--for", "10m", "--", "sh", "-c", PATIENT],
+                    None,
+                );
+                let out = lines(&mut child);
+                assert_eq!(out.recv_timeout(PATIENCE).unwrap(), "started");
+                let lease = unit_status(&env)["occupancy"]["lease_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                env.rpc(
+                    "admin_release",
+                    &user("admin"),
+                    json!({ "lease_id": lease }),
+                )
+                .unwrap();
+                assert_eq!(out.recv_timeout(PATIENCE).unwrap(), "terminated");
+                assert_eq!(code_of(&mut child), 7);
+            }
+        }
+
+        mod on_sigint {
+            use super::*;
+
+            #[test]
+            fn forwards_it_to_cmd() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let mut child = spawn(
+                    &env,
+                    &[
+                        "run",
+                        "board",
+                        "--for",
+                        "10m",
+                        "--",
+                        "sh",
+                        "-c",
+                        "trap 'echo interrupted; exit 9' INT; echo started; while :; do sleep 0.1; done",
+                    ],
+                    None,
+                );
+                let out = lines(&mut child);
+                assert_eq!(out.recv_timeout(PATIENCE).unwrap(), "started");
+                let pid = libc::pid_t::try_from(child.id()).unwrap();
+                // SAFETY: plain kill(2) on our own child.
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+                assert_eq!(out.recv_timeout(PATIENCE).unwrap(), "interrupted");
+                assert_eq!(code_of(&mut child), 9);
+            }
+        }
+    }
+
+    mod wait {
+        use super::*;
+
+        #[test]
+        fn prints_notices_as_they_arrive() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let theirs = hold(&env, "x");
+            let dir = env.dir("alpha");
+            env.agent("sess-1", &dir)
+                .args(["acquire", "board", "--for", "10m"])
+                .assert()
+                .code(6);
+            let mut child = spawn(&env, &["wait"], Some("sess-1"));
+            let out = lines(&mut child);
+            free(&env, "x", &theirs);
+            let line = out.recv_timeout(PATIENCE).unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            let notice: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(notice["kind"], "offered", "{notice}");
+        }
+
+        mod on_once {
+            use super::*;
+
+            #[test]
+            fn returns_after_the_first_batch() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let theirs = hold(&env, "x");
+                let dir = env.dir("alpha");
+                env.agent("sess-1", &dir)
+                    .args(["acquire", "board", "--for", "10m"])
+                    .assert()
+                    .code(6);
+                free(&env, "x", &theirs);
+                let body = json_of(env.agent("sess-1", &dir).args(["wait", "--once"]));
+                let kinds = strings(&body, "kind");
+                assert!(kinds.contains(&"offered".to_owned()), "{body}");
+            }
+        }
+
+        mod on_user {
+            use super::*;
+
+            #[test]
+            fn sees_the_notices_of_its_detached_requests() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let theirs = hold(&env, "x");
+                env.cmd()
+                    .args(["acquire", "board", "--for", "10m"])
+                    .assert()
+                    .code(6);
+                free(&env, "x", &theirs);
+                let body = env.ok(&["wait", "--once"]);
+                let kinds = strings(&body, "kind");
+                assert!(kinds.contains(&"offered".to_owned()), "{body}");
+            }
+        }
+    }
 }
 
 /// Wait up to `limit` for `child`; kill it when it overruns.

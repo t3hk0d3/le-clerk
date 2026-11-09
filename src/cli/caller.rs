@@ -18,12 +18,8 @@ pub enum CallerKind {
     /// A command the person or agent waits on: this process holds.
     Interactive,
     /// A lease that outlives this process: a fresh user holder.
-    // Used by the leasing commands (acquire without a TTY, detach).
-    #[allow(dead_code)]
     Detached,
     /// `clerk run`: this process holds while the child runs.
-    // Used by the leasing commands.
-    #[allow(dead_code)]
     Run,
 }
 

@@ -12,6 +12,7 @@ use leclerk::client::{ApiError, DaemonError};
 use leclerk::error::ErrorCode;
 use serde::Serialize;
 use serde_json::{Value, json};
+use thiserror::Error;
 
 use super::UsageError;
 use super::gate::GateRefusal;
@@ -27,6 +28,16 @@ const EXIT_NOT_FOUND: u8 = 3;
 pub const EXIT_REFUSED: u8 = 4;
 /// Exit code: the daemon is unavailable, unresponsive or another version.
 const EXIT_DAEMON: u8 = 5;
+/// Exit code: the request is queued (`--no-wait`).
+pub const EXIT_QUEUED: u8 = 6;
+/// Exit code: an interactive `acquire` or `attach` ended by Ctrl+C.
+pub const EXIT_INTERRUPTED: u8 = 130;
+
+/// End the command with this exit code; whatever needed saying was
+/// already printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("exit status {0}")]
+pub struct Exit(pub u8);
 
 /// How results are printed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +236,12 @@ impl Output {
     #[must_use]
     pub fn new(mode: Mode) -> Self {
         Self { mode }
+    }
+
+    /// How this output prints.
+    #[must_use]
+    pub fn mode(self) -> Mode {
+        self.mode
     }
 
     /// Print `value` on stdout.

@@ -9,6 +9,8 @@ mod caller;
 mod gate;
 mod input;
 mod inventory;
+mod lease;
+mod live;
 mod output;
 mod views;
 
@@ -23,7 +25,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use self::caller::CallerKind;
-use self::output::{Failure, Mode, Output, View};
+use self::output::{Exit, Failure, Mode, Output, View};
 
 /// A command line that parses but does not make sense; exit 2, nothing
 /// reaches the daemon.
@@ -82,6 +84,29 @@ enum Command {
     Log(views::LogArgs),
     /// Pending promotions of project resources to user scope.
     Promotions,
+    /// Ask for a unit and hold it. On a terminal: a live view (Ctrl+C
+    /// releases, Ctrl+] detaches). Otherwise: print the grant, or the queued
+    /// request and exit 6 (or with --wait, wait for the grant).
+    Acquire(lease::AcquireArgs),
+    /// Re-attach the live view to a lease (Ctrl+C releases, Ctrl+]
+    /// detaches again); without a terminal, print its brief.
+    Attach {
+        /// The lease id.
+        lease: String,
+    },
+    /// Give a lease back: its cleanup is confirmed at once.
+    Release {
+        /// The lease id.
+        lease: String,
+    },
+    /// Move a lease's end to now plus --for.
+    Extend(lease::ExtendArgs),
+    /// Hold a unit while a command runs; the unit's settings are in its
+    /// environment (`CLERK_LEASE_ID`, `CLERK_RESOURCE`, `CLERK_UNIT`,
+    /// `CLERK_UNIT_<SETTING>`).
+    Run(lease::RunArgs),
+    /// Print your notices as they arrive.
+    Wait(lease::WaitArgs),
     /// Approve a promotion: the resource moves to user scope.
     Approve {
         /// The promotion id, from `clerk promotions`.
@@ -144,7 +169,10 @@ pub fn run() -> ExitCode {
     init_logging();
     match execute(cli, out) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => out.fail(Failure::from(e)),
+        Err(e) => match e.downcast::<Exit>() {
+            Ok(Exit(code)) => ExitCode::from(code),
+            Err(e) => out.fail(Failure::from(e)),
+        },
     }
 }
 
@@ -208,6 +236,12 @@ async fn dispatch(ctx: &Ctx, command: Command) -> anyhow::Result<()> {
         Command::Log(args) => views::log(ctx, args).await,
         Command::Promotions => views::promotions(ctx).await,
         Command::Approve { promotion, new_id } => views::approve(ctx, promotion, new_id).await,
+        Command::Acquire(args) => lease::acquire(ctx, args).await,
+        Command::Attach { lease } => lease::attach(ctx, lease).await,
+        Command::Release { lease } => lease::release(ctx, lease).await,
+        Command::Extend(args) => lease::extend(ctx, args).await,
+        Command::Run(args) => lease::run(ctx, args).await,
+        Command::Wait(args) => lease::wait(ctx, args).await,
     }
 }
 

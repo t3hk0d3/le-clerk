@@ -344,7 +344,7 @@ fn tags_text(tags: &Value) -> String {
 }
 
 /// `in 4m 10s` or `5m ago`, from unix milliseconds.
-fn relative(at_ms: i64, now_ms: i64) -> String {
+pub fn relative(at_ms: i64, now_ms: i64) -> String {
     let delta = at_ms - now_ms;
     let secs = delta.unsigned_abs() / 1000;
     let span = match secs {
@@ -586,13 +586,7 @@ fn my_leases_text(v: &Value) -> String {
         if let Some(at) = l["ends_at"].as_i64() {
             let _ = write!(t, ", ends {}", relative(at, now));
         }
-        let _ = write!(t, "\n  resource: {}", text(&l["resource_description"]));
-        let _ = write!(t, "\n  unit: {}", text(&l["unit_description"]));
-        let _ = write!(t, "\n  tags: {}", tags_text(&l["resource_tags"]));
-        let _ = write!(t, "\n  settings: {}", settings_text(&l["settings"]));
-        if let Some(usage) = l["usage"].as_str().filter(|u| !u.is_empty()) {
-            let _ = write!(t, "\n  usage:\n{usage}");
-        }
+        let _ = write!(t, "\n{}", brief_text(l));
         out.push(t);
     }
     for q in &requests {
@@ -605,6 +599,25 @@ fn my_leases_text(v: &Value) -> String {
         ));
     }
     out.join("\n\n")
+}
+
+/// The brief of a grant or lease: both descriptions, the resource's tags,
+/// the unit's settings, the rendered usage and, when handed over dirty, why.
+pub fn brief_text(l: &Value) -> String {
+    let mut t = format!("  resource: {}", text(&l["resource_description"]));
+    let _ = write!(t, "\n  unit: {}", text(&l["unit_description"]));
+    let _ = write!(t, "\n  tags: {}", tags_text(&l["resource_tags"]));
+    let _ = write!(t, "\n  settings: {}", settings_text(&l["settings"]));
+    if let Some(usage) = l["usage"].as_str().filter(|u| !u.is_empty()) {
+        let _ = write!(t, "\n  usage:\n{usage}");
+    }
+    if let Some(reason) = l["dirty"]["reason"].as_str() {
+        let _ = write!(
+            t,
+            "\n  dirty: the last holder did not confirm cleanup ({reason}); expect a messy state"
+        );
+    }
+    t
 }
 
 fn queue_text(v: &Value) -> String {
