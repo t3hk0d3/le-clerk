@@ -5,6 +5,7 @@
 //! logs go to stderr. Stdin is never read unless it is a terminal, except
 //! for `-f -` on the inventory commands.
 
+mod admin;
 mod caller;
 mod gate;
 mod input;
@@ -107,6 +108,10 @@ enum Command {
     Run(lease::RunArgs),
     /// Print your notices as they arrive.
     Wait(lease::WaitArgs),
+    /// Hard management tools: forced releases, evictions, queue surgery,
+    /// repairs, export and import. Each asks for confirmation (or
+    /// `--yes`); agents also need `--override`.
+    Admin(admin::AdminArgs),
     /// Approve a promotion: the resource moves to user scope.
     Approve {
         /// The promotion id, from `clerk promotions`.
@@ -235,6 +240,7 @@ async fn dispatch(ctx: &Ctx, command: Command) -> anyhow::Result<()> {
         Command::Queue { resource } => views::queue(ctx, &resource).await,
         Command::Log(args) => views::log(ctx, args).await,
         Command::Promotions => views::promotions(ctx).await,
+        Command::Admin(args) => admin::run(ctx, args).await,
         Command::Approve { promotion, new_id } => views::approve(ctx, promotion, new_id).await,
         Command::Acquire(args) => lease::acquire(ctx, args).await,
         Command::Attach { lease } => lease::attach(ctx, lease).await,

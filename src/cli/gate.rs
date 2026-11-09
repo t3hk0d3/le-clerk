@@ -61,8 +61,6 @@ pub fn require_override(effect: &str, caller: &Caller) -> Result<(), GateRefusal
 ///
 /// # Errors
 /// [`GateRefusal`] naming why.
-// Used by the admin commands.
-#[allow(dead_code)]
 pub fn require(effect: &str, yes: bool, caller: &Caller) -> Result<(), GateRefusal> {
     require_override(effect, caller)?;
     if yes {

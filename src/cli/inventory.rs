@@ -707,7 +707,7 @@ async fn remove_unit(ctx: &Ctx, r: UnitRef, method: &'static str) -> anyhow::Res
 }
 
 /// One `warning: …` line per warning, each on a new line.
-fn warnings(list: &Value) -> String {
+pub fn warnings(list: &Value) -> String {
     let mut text = String::new();
     for w in list.as_array().into_iter().flatten() {
         let t = views::text;

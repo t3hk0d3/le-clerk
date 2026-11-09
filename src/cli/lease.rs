@@ -88,14 +88,14 @@ pub fn parse_duration(s: &str) -> Result<Duration, DurationError> {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum PriorityArg {
+pub enum PriorityArg {
     Low,
     Normal,
     High,
 }
 
 impl PriorityArg {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Normal => "normal",
