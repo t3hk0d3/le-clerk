@@ -759,10 +759,15 @@ agent, a command acts for the agent (§7.3), never prompts, and prints JSON.
 - `clerk wait`: blocks until notices exist, then prints them and exits (§6).
 
 **Results** are short and structured, and always state the next step the clerk
-expects: every JSON result has `summary` (what happened, in words, including
-what to tell the user) and `next` (the command the clerk expects, e.g.
-"`clerk confirm lse_… clean` when the board is clean"); errors end with it.
-Agents shouldn't need the skill loaded to do the right thing.
+expects: `summary` (what happened, in words, including what to tell the user)
+and `next` (the command the clerk expects, e.g. "`clerk confirm lse_… clean`
+when the board is clean"); errors end with it. Agents shouldn't need the
+skill loaded to do the right thing.
+- **Agents read Markdown** (user decision, 2026-11-10; Appendix C item 14):
+  the JSON rendered as labelled fields, times as local date and time plus
+  how far away, usage as a section, a heading for grants, queued requests,
+  leases and notices, and `Next: …` last. `--json` (or
+  `CLERK_AGENT_FORMAT=json`) prints the JSON, for scripts.
 
 ### 8.2 Notice content
 
@@ -1425,3 +1430,14 @@ private tmux server, model haiku). Scripts and screens:
       summary now says the cleanup is confirmed.
     - Not run: registration by the skill (checklist item 6), the desktop app
       and VS Code.
+14. **Markdown vs JSON for agents, Haiku A/B (plan Task 16)**, isolated, three
+    runs per format (`ab-md-json.sh`; `evidence/ab/`): two sessions on one
+    board (lease, queue, Monitor wake, release), then registering two boards
+    on a fake hub. Both formats: every run leased, queued, woke and claimed
+    (6/6); no failed `clerk` command beyond one in 108 calls, no `--help`
+    lookups. Registration: JSON 3/3 added both hub boards to the existing
+    user-scope resource; Markdown 2/3, the third asked the user which hub
+    port the existing unit was (the scenario's seeded unit points elsewhere,
+    a fair question). The skill still said "JSON" during the Markdown runs.
+    Verdict: Markdown is no worse, so it is the agents' default; a grant is
+    76 % of the JSON's bytes.

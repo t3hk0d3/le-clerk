@@ -1,0 +1,24 @@
+
+
+● You now hold c6-a on the c6-boards resource. I haven't flashed anything.      
+                                                                           
+  - Lease: lse_01M72V547KPCP002NSZ8WJKV8E, 30 minutes, not interruptible. It   
+    ends at about 19:59 (ms timestamp 1794319976502) and expiry is hard, so    
+    extend it with clerk extend lse_01M72V547KPCP002NSZ8WJKV8E --for 15m if the 
+    flash runs long.                                          
+  - Flash command: idf.py -p /tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c
+    55-8c65-c9833449d6cc/scratchpad/sp/ab-json-3/board-a flash              
+  - Cleanup: the board's usage says "clean" means erasing flash. Erase it before
+    you release the lease, then run clerk release                              
+    lse_01M72V547KPCP002NSZ8WJKV8E.                                             
+  - Wait: the clerk wait is still armed.                                        
+                                                                                
+  Tell me when the firmware is ready, or when you want me to run the flash,     
+  erase and release.                                                            
+
+✻ Baked for 6s · done 14:43 · 1 monitor still running                           
+                                                                              
+────────────────────────────────────────────────────────────────────────────────
+❯ flash the firmware on c6-a now   
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 monitor · ← 1 agent · ↓ to manage                   

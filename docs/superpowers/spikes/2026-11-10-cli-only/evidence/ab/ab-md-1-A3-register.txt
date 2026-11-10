@@ -1,0 +1,24 @@
+  - The hub has two ports: usb-Espressif_USB_JTAG_serial_debug_unit_AA-if00 and
+    usb-Espressif_USB_JTAG_serial_debug_unit_BB-if00.                          
+                                                                                
+  Adding both ports as new units would duplicate the physical boards, and the  
+  clerk skill says to avoid that. Retiring c6-a would change a unit I can't     
+  verify. I don't know which hub port c6-a was meant to be, so I'd rather not   
+  guess.                                                                        
+                                                                               
+  What I need from you: which should I do?                                     
+  1. Repoint c6-a to one hub port and add the other as c6-b. Tell me which port
+     is c6-a, for example AA or BB. I'll update c6-a's path and add the other 
+     port as c6-b, with the existing usage kept.                                
+  2. Retire c6-a and register both hub ports as new units. Use this if board-a  
+     is stale and the boards are the two hub ports.                             
+  3. Leave the registration as it is. Use this if c6-a is already the right     
+     board and only the second board is missing. Then I'd add the other hub port
+     as c6-b, and I'd need you to confirm which port that is.                   
+                                                                                
+✻ Sautéed for 13s · done 14:24                                                  
+                                                                              
+────────────────────────────────────────────────────────────────────────────────
+❯                              
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

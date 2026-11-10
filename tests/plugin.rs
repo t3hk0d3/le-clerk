@@ -294,6 +294,16 @@ mod plugin {
         }
 
         #[test]
+        fn says_results_are_markdown_ending_with_next_and_never_json() {
+            let text = skill_file("SKILL.md");
+            assert!(text.contains("Markdown") && text.contains("Next:"), "SKILL.md");
+            for file in SKILL_FILES {
+                let text = skill_file(file);
+                assert!(!text.contains("Every result is JSON"), "{file}");
+            }
+        }
+
+        #[test]
         fn is_the_only_skill_and_there_is_no_mcp_server() {
             let dirs: Vec<String> = fs::read_dir(plugin_path("skills"))
                 .unwrap()

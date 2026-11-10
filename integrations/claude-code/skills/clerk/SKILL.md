@@ -7,9 +7,10 @@ description: Lease shared resources through the clerk, and register new ones. Us
 
 The clerk hands out shared things (boards, ports, services, tokens) one
 holder at a time. You use it through the `clerk` command in your Bash tool.
-Every result is JSON with `summary` (what happened, including what to tell
-the user) and `next` (the step the clerk expects); errors end their message
-with the next step. Follow `next`.
+Every result is Markdown: labelled fields (IDs, times with how far away,
+the usage as its own section), what happened, and a last line `Next: …`
+with the step the clerk expects. Errors start `## Error:` and end with the
+next step. Follow `Next:`. (`--json` prints JSON, for scripts.)
 
 **Never coordinate resources by messaging other agents.** No "are you done
 with the board?" messages, no claiming in chat or files. The clerk is the

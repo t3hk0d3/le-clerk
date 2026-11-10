@@ -1,0 +1,24 @@
+    it_AA-if00                                                                  
+  - c6-bb: .../ab-json-3/hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_un
+    it_BB-if00
+                                                                                
+  I added them to the existing user-scope resource rather than creating a new   
+  one, since it's the same kind of hardware. Neither unit is leased. The clerk  
+  reported no warnings.                                                         
+                                                                                
+  Two things need your decision:                                                
+                                                                                
+  - Stale c6-a: it still points at sp/ab-json-3/board-a, an empty placeholder   
+    file that isn't a real port. It's still in the resource, so the clerk could 
+    hand it out as if it were a board. I left it alone. Say the word and I'll   
+    retire it with clerk unit retire c6-boards c6-a.                            
+  - Old memory entry: my note about c6-aa/c6-bb referenced an earlier ab-md-3
+    hub path that the clerk no longer has. I updated the memory note to the     
+    current paths.                                                              
+
+✻ Cogitated for 24s · done 14:44                                               
+                                                                              
+────────────────────────────────────────────────────────────────────────────────
+❯ retire c6-a                   
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

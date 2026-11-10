@@ -137,11 +137,15 @@ other's mistakes, not from a hostile process under your account.
 
 ### What the model sees
 
-Every JSON object a `clerk` command prints in an agent session carries
-`summary` (what happened, including "tell the user" lines such as a
-`clerk approve` command) and `next` (the step the clerk expects); error
-messages end with the next step. List commands (`clerk resources`) print
-plain arrays.
+In an agent session (stdout not a terminal) every `clerk` command prints
+**labelled Markdown** rendered from its JSON: every field, times as local
+date and time plus how far away, the usage as its own section, a heading
+for grants, queued requests, leases and notices, then what happened
+(including "tell the user" lines such as a `clerk approve` command) and a
+last line `Next: …`. Errors print `## Error: <code>` and a message ending
+with the next step, on stdout. `--json` or `CLERK_AGENT_FORMAT=json` prints
+the JSON instead (with `summary` and `next`). The format is described in
+`docs/cli-output.md`, "Agent sessions".
 
 ## Manual checklist
 

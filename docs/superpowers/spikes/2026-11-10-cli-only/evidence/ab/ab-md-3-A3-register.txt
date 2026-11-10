@@ -1,0 +1,24 @@
+                                                                                
+  - c6-aa: .../scratchpad/sp/ab-md-3/hub/serial/by-id/usb-Espressif_USB_JTAG_ser
+    ial_debug_unit_AA-if00                                                      
+  - c6-bb: .../scratchpad/sp/ab-md-3/hub/serial/by-id/usb-Espressif_USB_JTAG_ser
+    ial_debug_unit_BB-if00                                                      
+                                                                                
+  I didn't flash or lease anything.                                             
+                                                                                
+  Two things to check:                                                          
+  - c6-a is still registered. It points at an empty placeholder file            
+    (sp/ab-md-3/board-a), not a hub port, so it's probably stale. I haven't     
+    retired it because you hadn't answered that question before. Say the word   
+    and I'll retire it.                                                         
+  - My memory notes were out of date. They listed c6-aa and c6-bb as already   
+    registered under a different scratchpad path (ab-json-2), but the clerk had 
+    only c6-a. I re-registered them under the current ab-md-3/hub path and   
+    updated the memory file to match.                                           
+
+✻ Cogitated for 22s · done 14:40                                               
+                                                                              
+────────────────────────────────────────────────────────────────────────────────
+❯ retire c6-a                    
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

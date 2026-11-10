@@ -1,7 +1,7 @@
 # Leasing in detail
 
-Read with the clerk skill's SKILL.md. Every command prints JSON with
-`summary` and `next`; follow `next`.
+Read with the clerk skill's SKILL.md. Every command prints Markdown ending
+with a `Next:` line; follow it.
 
 ## Asking
 
