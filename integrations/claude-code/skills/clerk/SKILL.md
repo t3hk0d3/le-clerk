@@ -9,8 +9,9 @@ The clerk hands out shared things (boards, ports, services, tokens) one
 holder at a time. You use it through the `clerk` command in your Bash tool.
 Every result is Markdown: labelled fields (IDs, times with how far away,
 the usage as its own section), what happened, and a last line `Next: …`
-with the step the clerk expects. Errors start `## Error:` and end with the
-next step. Follow `Next:`. (`--json` prints JSON, for scripts.)
+with the step the clerk expects. Errors start `## Error: <code>`, then a
+message ending with the next step, then their details (e.g. who is
+waiting). Follow `Next:`. (`--json` prints JSON, for scripts.)
 
 **Never coordinate resources by messaging other agents.** No "are you done
 with the board?" messages, no claiming in chat or files. The clerk is the
@@ -39,9 +40,10 @@ reach you through a wait. Arm exactly one:
 
 - **With the Monitor tool (preferred):** command `clerk wait --follow`,
   `timeout_ms` 1800000, description "clerk notices". Each notice arrives as
-  a Monitor event with its own `summary` and `next`; offers are already
-  claimed for you (`claimed` holds the grant). When the monitor expires,
-  arm it again if you still hold or wait for anything.
+  a Monitor event: a `## Notice: <kind>` block, then for an offer the
+  `## Lease <id>` you now hold (already claimed for you, with its usage),
+  then its own `Next:`. When the monitor expires, arm it again if you still
+  hold or wait for anything.
 - **Without Monitor:** run `clerk wait` with the Bash tool's
   `run_in_background` (`timeout` 7200000). When it completes, read its
   output file, act on each notice, and start it again.
