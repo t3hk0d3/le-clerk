@@ -10,6 +10,11 @@
 //! - Results carry the engine's JSON as structured content (always an
 //!   object) plus one text block. Engine errors become tool errors whose
 //!   structured content is `{"error": {"code", "message", "details"}}`.
+//! - Claude Code shows the model only the structured content, so every
+//!   result, task result and tool error also carries the text block's parts
+//!   there: `summary` (its lines) and `next` (its last sentence, the next
+//!   step). `lease_wait` results and completed `lease_acquire` task results
+//!   carry `ack`: exactly the notice ids to pass to the next `lease_wait`.
 //! - `lease_wait`, and `lease_acquire` when it queues, may answer with a
 //!   task instead (see [`crate::mcp::wait`]).
 
@@ -35,30 +40,79 @@ use crate::model::{
 };
 use crate::store::notices::{Notice, NoticeKind};
 
-/// What a tool produced: structured content and the text block.
+/// What a tool produced: structured content, the summary lines and the
+/// next step (the text block is the lines followed by the next step).
 struct Outcome {
     structured: Value,
-    text: String,
+    summary: Vec<String>,
+    next: String,
+    /// The notice ids to pass as `ack` to the next `lease_wait`.
+    ack: Option<Vec<String>>,
 }
 
 impl Outcome {
     /// `structured`, described by `summary` lines and ending in `next`.
     fn new(structured: Value, summary: &[String], next: &str) -> Self {
-        let mut text = String::new();
-        for line in summary {
-            text.push_str(line);
-            text.push(' ');
+        Self {
+            structured,
+            summary: summary.to_vec(),
+            next: next.to_owned(),
+            ack: None,
         }
-        text.push_str(next);
-        Self { structured, text }
+    }
+
+    /// The same, telling the agent to acknowledge `ids` next.
+    fn with_ack(mut self, ids: Vec<String>) -> Self {
+        self.ack = Some(ids);
+        self
+    }
+
+    /// The text block: the summary lines, then the next step.
+    fn text(&self) -> String {
+        text_block(&self.summary, &self.next)
     }
 
     /// The tool result.
     fn into_result(self) -> CallToolResult {
-        let mut result = CallToolResult::success(vec![ContentBlock::text(self.text)]);
-        result.structured_content = Some(self.structured);
+        let mut result = CallToolResult::success(vec![ContentBlock::text(self.text())]);
+        result.structured_content = Some(structured(
+            self.structured,
+            &self.summary,
+            &self.next,
+            self.ack,
+        ));
         result
     }
+}
+
+/// The summary lines and the next step as one text block.
+fn text_block(summary: &[String], next: &str) -> String {
+    let mut text = String::new();
+    for line in summary {
+        text.push_str(line);
+        text.push(' ');
+    }
+    text.push_str(next);
+    text
+}
+
+/// `content` (an object; anything else is put under `result`) with the
+/// text block's parts added as `summary` and `next`, and `ack` when given.
+fn structured(content: Value, summary: &[String], next: &str, ack: Option<Vec<String>>) -> Value {
+    let mut map = match content {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("result".to_owned(), other);
+            map
+        }
+    };
+    map.insert("summary".to_owned(), json!(summary));
+    map.insert("next".to_owned(), json!(next));
+    if let Some(ack) = ack {
+        map.insert("ack".to_owned(), json!(ack));
+    }
+    Value::Object(map)
 }
 
 /// What a tool answers: a result now, or a task to poll.
@@ -203,18 +257,34 @@ fn tool_error(e: &ApiError) -> CallToolResult {
     tool_error_then(e, None)
 }
 
-/// [`tool_error`] whose text ends in `next`, when given.
+/// [`tool_error`] whose next step is `next`, or else the one
+/// [`error_next`] gives for its code.
 fn tool_error_then(e: &ApiError, next: Option<&str>) -> CallToolResult {
-    let mut text = format!("{}: {}", e.code, e.message);
+    let mut line = format!("{}: {}", e.code, e.message);
     if let Some(details) = &e.details {
-        let _ = write!(text, " ({details})");
+        let _ = write!(line, " ({details})");
     }
-    if let Some(next) = next {
-        let _ = write!(text, ". {next}");
-    }
-    let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
-    result.structured_content = Some(json!({ "error": e }));
+    line.push('.');
+    let summary = [line];
+    let next = next.unwrap_or_else(|| error_next(e.code));
+    let mut result = CallToolResult::error(vec![ContentBlock::text(text_block(&summary, next))]);
+    result.structured_content = Some(structured(json!({ "error": e }), &summary, next, None));
     result
+}
+
+/// The next step after an error with `code`.
+fn error_next(code: &str) -> &'static str {
+    match code {
+        "invalid_request" | "invalid_argument" => {
+            "Call the tool again with the arguments fixed as the message says."
+        }
+        "not_found" => "Call lease_status or resource_list to see what exists for this session.",
+        "engine_unavailable" | "internal_error" | "storage_error" => {
+            "Call lease_status in a moment; if it fails too, tell the user the clerk is not \
+             working."
+        }
+        _ => "Call lease_status to see where this session stands, then act on the message.",
+    }
 }
 
 /// The tool `name` taking `A`.
@@ -881,8 +951,13 @@ async fn queued_outcome(ctx: &Ctx<'_>, request: &RequestId) -> Result<CallToolRe
             &[format!("Request {request} is still queued.")],
             QUEUED_NEXT,
         )
+        .with_ack(Vec::new())
         .into_result());
     };
+    // The notice that ended the wait stays pending; the agent acknowledges
+    // it with its next `lease_wait`, which then does not report it again.
+    let ack = vec![notice.id.as_str().to_owned()];
+    let list = serde_json::to_string(&ack).unwrap_or_default();
     let outcome = match (notice.kind, &notice.lease_id) {
         (NoticeKind::Offered, Some(lease)) => {
             let lease = claim_offer(ctx, lease).await.map_err(|error| Failure {
@@ -890,15 +965,25 @@ async fn queued_outcome(ctx: &Ctx<'_>, request: &RequestId) -> Result<CallToolRe
                 next: Some(CLAIM_FAILED_NEXT),
             })?;
             let brief = grant_brief(&lease, ctx.engine.now_ms());
-            Outcome::new(lease, &[brief], HELD_NEXT)
+            Outcome::new(
+                lease,
+                &[brief],
+                &format!(
+                    "Call lease_wait with ack={list} and keep it running, and call \
+                     lease_release when you are done with the unit."
+                ),
+            )
         }
         _ => Outcome::new(
             json!({ "outcome": "dropped", "request_id": request, "notice": notice }),
             std::slice::from_ref(&notice.action),
-            "Call lease_acquire again if you still need it.",
+            &format!(
+                "Call lease_acquire again if you still need it, and pass ack={list} to your \
+                 next lease_wait."
+            ),
         ),
     };
-    Ok(outcome.into_result())
+    Ok(outcome.with_ack(ack).into_result())
 }
 
 async fn lease_status(ctx: &Ctx<'_>, NoArgs {}: NoArgs) -> Result<Outcome, ApiError> {
@@ -1078,16 +1163,22 @@ async fn lease_claim(ctx: &Ctx<'_>, a: LeaseIdArgs) -> Result<Outcome, ApiError>
 }
 
 async fn lease_wait(ctx: &Ctx<'_>, a: LeaseWaitArgs) -> Result<Answer, ApiError> {
-    let ack = a
-        .ack
-        .iter()
-        .map(|id| NoticeId::parse(id).map_err(|e| ApiError::invalid_argument(e.to_string())))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut ack = Vec::new();
+    let mut ignored = Vec::new();
+    for id in a.ack {
+        match NoticeId::parse(&id) {
+            Ok(id) => ack.push(id),
+            Err(_) => ignored.push(id),
+        }
+    }
     let holder = ctx.identity.caller().holder;
-    let acknowledged = if ack.is_empty() {
-        0
-    } else {
-        ctx.engine.ack_notices(holder.clone(), ack).await?
+    let acknowledged = Acknowledged {
+        count: if ack.is_empty() {
+            0
+        } else {
+            ctx.engine.ack_notices(holder.clone(), ack).await?
+        },
+        ignored,
     };
     if let Some(tasks) = ctx.live.tasks() {
         let (engine, identity) = (ctx.engine.clone(), ctx.identity.clone());
@@ -1098,16 +1189,24 @@ async fn lease_wait(ctx: &Ctx<'_>, a: LeaseWaitArgs) -> Result<Answer, ApiError>
                 identity: &identity,
                 live: &live,
             };
-            task_result(wait_outcome(&ctx, acknowledged).await)
+            task_result(wait_outcome(&ctx, &acknowledged).await)
         };
         return Ok(Answer::Task(tasks.spawn(ctx.engine, ctx.identity, work)));
     }
     let _open = ctx.engine.open_wait(&holder);
-    wait_outcome(ctx, acknowledged).await.map(Answer::from)
+    wait_outcome(ctx, &acknowledged).await.map(Answer::from)
+}
+
+/// What a `lease_wait`'s `ack` did.
+struct Acknowledged {
+    /// Notices marked delivered.
+    count: usize,
+    /// Ids that are not notice ids, left alone.
+    ignored: Vec<String>,
 }
 
 /// One `lease_wait` batch, with its offers claimed.
-async fn wait_outcome(ctx: &Ctx<'_>, acknowledged: usize) -> Result<Outcome, ApiError> {
+async fn wait_outcome(ctx: &Ctx<'_>, acknowledged: &Acknowledged) -> Result<Outcome, ApiError> {
     let holder = ctx.identity.caller().holder;
     let (notices, timed_out) = match wait::next_batch(ctx.engine, &holder, ctx.live).await? {
         Batch::Notices(n) => (n, false),
@@ -1119,6 +1218,13 @@ async fn wait_outcome(ctx: &Ctx<'_>, acknowledged: usize) -> Result<Outcome, Api
     let mut summary = Vec::new();
     let mut grants = Vec::new();
     let mut claim_errors = Vec::new();
+    if !acknowledged.ignored.is_empty() {
+        let list = serde_json::to_string(&acknowledged.ignored).unwrap_or_default();
+        summary.push(format!(
+            "Ignored ack entries that are not notice ids: {list}; pass only the ids from the \
+             previous result's ack."
+        ));
+    }
     if notices.is_empty() {
         summary.push("No notices arrived.".to_owned());
     } else {
@@ -1146,12 +1252,13 @@ async fn wait_outcome(ctx: &Ctx<'_>, acknowledged: usize) -> Result<Outcome, Api
             "notices": notices,
             "grants": grants,
             "claim_errors": claim_errors,
-            "acknowledged": acknowledged,
+            "acknowledged": acknowledged.count,
             "timed_out": timed_out,
         }),
         &summary,
         &re_arm(&ids),
-    ))
+    )
+    .with_ack(ids))
 }
 
 /// One notice as a text line, naming its id.
@@ -1303,11 +1410,9 @@ mod tests {
     #[test]
     fn reclaiming_outcome_names_the_lease_and_lease_wait() {
         let o = reclaiming_outcome(json!({"outcome": "reclaiming", "lease_id": "lse_1"}));
-        assert!(o.text.contains("lease lse_1 comes back"), "{}", o.text);
-        assert!(
-            o.text
-                .ends_with("Call lease_wait to hear when the unit is back.")
-        );
+        let text = o.text();
+        assert!(text.contains("lease lse_1 comes back"), "{text}");
+        assert_eq!(o.next, "Call lease_wait to hear when the unit is back.");
     }
 
     #[test]
@@ -1317,17 +1422,24 @@ mod tests {
             next: Some(CLAIM_FAILED_NEXT),
         };
         let result = failure.into_result();
-        let text = serde_json::to_value(&result.content).unwrap()[0]["text"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(text.ends_with(CLAIM_FAILED_NEXT), "{text}");
-        assert!(text.starts_with("internal_error: gone"), "{text}");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["next"], json!(CLAIM_FAILED_NEXT));
+        assert_eq!(structured["summary"], json!(["internal_error: gone."]));
     }
 
     #[test]
     fn outcome_text_ends_in_the_next_step() {
         let o = Outcome::new(Value::Null, &["One.".into(), "Two.".into()], "Call x.");
-        assert_eq!(o.text, "One. Two. Call x.");
+        assert_eq!(o.text(), "One. Two. Call x.");
+    }
+
+    #[test]
+    fn structured_content_adds_summary_next_and_ack() {
+        let o = Outcome::new(json!({"a": 1}), &["One.".into()], "Call x.").with_ack(vec![]);
+        let got = o.into_result().structured_content.unwrap();
+        assert_eq!(
+            got,
+            json!({"a": 1, "summary": ["One."], "next": "Call x.", "ack": []})
+        );
     }
 }

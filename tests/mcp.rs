@@ -433,6 +433,49 @@ fn initialize_params() -> Value {
     })
 }
 
+/// Poll `tasks/get` until the task leaves `working`; its result.
+async fn finished(s: &Raw, task: &str) -> Value {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let reply = s.request("tasks/get", json!({"taskId": task})).await;
+        let got = reply.message["result"].clone();
+        if got["status"] != json!("working") {
+            return got;
+        }
+        assert!(Instant::now() < until, "task {task} never finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The structured `next` of a tool result (Claude Code shows the model
+/// only the structured content).
+fn next_of(result: &Value) -> String {
+    result["structuredContent"]["next"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no structured next in {result}"))
+        .to_owned()
+}
+
+/// The structured `summary` lines of a tool result.
+fn summary_of(result: &Value) -> Vec<String> {
+    result["structuredContent"]["summary"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no structured summary in {result}"))
+        .iter()
+        .map(|l| l.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The structured `ack` of a tool result.
+fn ack_of(result: &Value) -> Vec<String> {
+    result["structuredContent"]["ack"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no structured ack in {result}"))
+        .iter()
+        .map(|l| l.as_str().unwrap().to_owned())
+        .collect()
+}
+
 /// The text block of a tool result.
 fn text_of(result: &Value) -> String {
     result["content"]
@@ -807,6 +850,168 @@ mod server {
             }
         }
 
+        /// Every tool's result (each tool at least once, `lease_reclaim` as
+        /// a tool error), plus a completed `lease_acquire` task's result.
+        // One scripted session through every tool; splitting it would only
+        // scatter the script.
+        #[allow(clippy::too_many_lines)]
+        async fn every_result(d: &Daemon) -> Vec<(String, Value)> {
+            let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+            let mut got: Vec<(String, Value)> = Vec::new();
+            macro_rules! run {
+                ($s:expr, $tool:literal, $args:expr) => {{
+                    let r = $s.call($tool, $args).await;
+                    got.push(($tool.to_owned(), r.clone()));
+                    let structured = r["structuredContent"].clone();
+                    structured
+                }};
+            }
+            run!(s1, "type_list", json!({}));
+            run!(
+                s1,
+                "resource_create",
+                json!({"id": "board", "type": "generic"})
+            );
+            run!(
+                s1,
+                "resource_create",
+                json!({"id": "spare", "type": "generic"})
+            );
+            run!(
+                s1,
+                "resource_update",
+                json!({"id": "board", "description": "a board"})
+            );
+            run!(s1, "resource_list", json!({}));
+            run!(s1, "resource_delete", json!({"id": "spare"}));
+            let unit = |id: &str, key: &str| {
+                json!({"resource": "board", "id": id,
+                       "settings": {"type": "generic", "identity_key": key}})
+            };
+            run!(s1, "unit_add", unit("u1", "k1"));
+            run!(s1, "unit_add", unit("gone", "k2"));
+            run!(s1, "unit_add", unit("old", "k3"));
+            run!(
+                s1,
+                "unit_update",
+                json!({"resource": "board", "unit": "u1", "description": "left"})
+            );
+            run!(
+                s1,
+                "unit_remove",
+                json!({"resource": "board", "unit": "gone"})
+            );
+            run!(
+                s1,
+                "unit_retire",
+                json!({"resource": "board", "unit": "old"})
+            );
+            run!(s1, "resource_get", json!({"id": "board"}));
+            let grant = run!(
+                s1,
+                "lease_acquire",
+                json!({"target": {"resource": "board"}, "for": "1h", "purpose": "long",
+                       "interruptible": true})
+            );
+            let lease = grant["lease_id"].clone();
+            run!(s1, "lease_status", json!({}));
+            run!(s1, "lease_extend", json!({"lease_id": lease, "for": "2h"}));
+            run!(
+                s1,
+                "lease_set_interruptible",
+                json!({"lease_id": lease, "interruptible": true})
+            );
+            let urgent = run!(
+                s2,
+                "lease_acquire",
+                json!({"target": {"resource": "board"}, "for": "5m", "purpose": "urgent",
+                       "priority": "high"})
+            );
+            run!(s1, "lease_yield_refuse", json!({"lease_id": lease}));
+            run!(
+                s2,
+                "lease_cancel",
+                json!({"request_id": urgent["request_id"]})
+            );
+            run!(
+                s2,
+                "lease_acquire",
+                json!({"target": {"resource": "board"}, "for": "1h", "purpose": "next"})
+            );
+            run!(s1, "lease_reclaim", json!({"lease_id": lease}));
+            run!(s1, "lease_release", json!({"lease_id": lease}));
+            run!(s1, "lease_confirm", json!({"lease_id": lease}));
+            let offered = d
+                .engine
+                .pending_notices(agent("s2"))
+                .await
+                .unwrap()
+                .into_iter()
+                .find_map(|n| n.lease_id)
+                .unwrap();
+            let held = run!(s2, "lease_claim", json!({"lease_id": offered.as_str()}));
+            run!(s2, "lease_wait", json!({}));
+            // A queued acquire as a task, completed by s2's hand-over.
+            let t = d.session("s3", "a").with_tasks();
+            let handle = t
+                .call(
+                    "lease_acquire",
+                    json!({"target": {"resource": "board"}, "for": "1h", "purpose": "x"}),
+                )
+                .await;
+            assert_eq!(handle["resultType"], json!("task"), "{handle}");
+            hand_over(&s2, held["lease_id"].as_str().unwrap()).await;
+            let done = finished(&t, handle["taskId"].as_str().unwrap()).await;
+            got.push(("lease_acquire task".to_owned(), done["result"].clone()));
+            let mut seen: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+            seen.sort_unstable();
+            seen.dedup();
+            for name in TOOL_NAMES {
+                assert!(seen.contains(name), "{name} was not exercised");
+            }
+            assert!(
+                got.iter()
+                    .any(|(n, r)| n == "lease_reclaim" && r["isError"] == json!(true)),
+                "no tool error among {got:?}"
+            );
+            got
+        }
+
+        mod on_any_result {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn structured_content_carries_next_equal_to_the_texts_last_sentence() {
+                let d = Daemon::start();
+                for (tool, result) in every_result(&d).await {
+                    let next = next_of(&result);
+                    assert!(
+                        next.starts_with("Call ") || next.starts_with("Keep "),
+                        "{tool}: {next}"
+                    );
+                    assert!(text_of(&result).ends_with(&next), "{tool}: {result}");
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn structured_content_carries_the_summary_lines_of_the_text() {
+                let d = Daemon::start();
+                for (tool, result) in every_result(&d).await {
+                    let summary = summary_of(&result);
+                    assert_ne!(summary, Vec::<String>::new(), "{tool}: {result}");
+                    let text = text_of(&result);
+                    let next = next_of(&result);
+                    let lines = text.strip_suffix(&next).unwrap_or(&text);
+                    for line in &summary {
+                        assert!(
+                            lines.contains(line.as_str()),
+                            "{tool}: {line:?} not in {text}"
+                        );
+                    }
+                }
+            }
+        }
+
         mod on_success {
             use super::*;
 
@@ -905,6 +1110,15 @@ mod tools {
                 let text = text_of(&add_similar(&d).await);
                 assert!(text.contains("Tell the user"), "{text}");
                 assert!(text.contains("clerk approve"), "{text}");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn structured_summary_says_to_tell_the_user() {
+                let d = Daemon::start();
+                let result = add_similar(&d).await;
+                let summary = summary_of(&result).join(" ");
+                assert!(summary.contains("Tell the user"), "{result}");
+                assert!(summary.contains("clerk approve"), "{result}");
             }
         }
     }
@@ -1198,8 +1412,7 @@ mod leasing {
                 assert_eq!(got["usage"], json!("Flash u1 of board."));
                 let text = text_of(&result);
                 assert!(text.contains("Flash u1 of board."), "{text}");
-                let next = text.rsplit(". ").next().unwrap();
-                assert!(next.contains("lease_release"), "{text}");
+                assert!(next_of(&result).contains("lease_release"), "{result}");
             }
         }
 
@@ -1221,9 +1434,7 @@ mod leasing {
                 let got = &result["structuredContent"];
                 assert_eq!(got["outcome"], json!("queued"), "{result}");
                 assert_eq!(got["position"], json!(1));
-                let text = text_of(&result);
-                let next = text.rsplit(". ").next().unwrap();
-                assert!(next.contains("lease_wait"), "{text}");
+                assert!(next_of(&result).contains("lease_wait"), "{result}");
             }
         }
 
@@ -1317,6 +1528,52 @@ mod leasing {
                 let again = notice_ids(&s.ok("lease_wait", json!({"ack": acked})).await);
                 assert_eq!(again, kept);
                 assert_eq!(pending_ids(&d, "s1").await, kept);
+            }
+        }
+
+        mod on_any_result {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn structured_ack_lists_exactly_its_notice_ids() {
+                let d = Daemon::start_with(quick());
+                let s = d.session("s1", "a");
+                let empty = s.call("lease_wait", json!({})).await;
+                assert_eq!(ack_of(&empty), Vec::<String>::new(), "{empty}");
+                seed(&s, "board", "k", &[]).await;
+                ended_notice(&d, &s, "board").await;
+                let full = s.call("lease_wait", json!({})).await;
+                let ids = notice_ids(&full["structuredContent"]);
+                assert_ne!(ids, Vec::<String>::new());
+                assert_eq!(ack_of(&full), ids, "{full}");
+            }
+        }
+
+        mod on_a_malformed_ack_id {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn ignores_it_and_acknowledges_the_valid_ones() {
+                let d = Daemon::start_with(quick());
+                let s = d.session("s1", "a");
+                seed(&s, "board", "k", &[]).await;
+                ended_notice(&d, &s, "board").await;
+                let ids = notice_ids(&s.ok("lease_wait", json!({})).await);
+                let mut ack = ids.clone();
+                ack.push("not-a-notice".to_owned());
+                let got = s.ok("lease_wait", json!({"ack": ack})).await;
+                assert_eq!(got["acknowledged"], json!(ids.len()), "{got}");
+                assert_eq!(pending_ids(&d, "s1").await, Vec::<String>::new());
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn reports_it_in_the_summary() {
+                let d = Daemon::start_with(quick());
+                let s = d.session("s1", "a");
+                let result = s.call("lease_wait", json!({"ack": ["not-a-notice"]})).await;
+                assert_ne!(result["isError"], json!(true), "{result}");
+                let summary = summary_of(&result).join(" ");
+                assert!(summary.contains("not-a-notice"), "{result}");
             }
         }
 
@@ -1528,11 +1785,6 @@ mod leasing {
     mod lease_lifecycle {
         use super::*;
 
-        /// The last sentence of a tool result's text block.
-        fn next_step(result: &Value) -> String {
-            text_of(result).rsplit(". ").next().unwrap().to_owned()
-        }
-
         #[tokio::test(flavor = "multi_thread")]
         async fn lease_extend_moves_the_end_from_now_next_step_lease_release() {
             let d = Daemon::start();
@@ -1547,7 +1799,7 @@ mod leasing {
                 json!(T0 + 2 * 3_600_000),
                 "{result}"
             );
-            assert!(next_step(&result).contains("lease_release"), "{result}");
+            assert!(next_of(&result).contains("lease_release"), "{result}");
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1562,7 +1814,7 @@ mod leasing {
                 json!("cleaning"),
                 "{result}"
             );
-            assert!(next_step(&result).contains("lease_confirm"), "{result}");
+            assert!(next_of(&result).contains("lease_confirm"), "{result}");
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1575,7 +1827,7 @@ mod leasing {
                 .call("lease_release", json!({"lease_id": lease, "failed": true}))
                 .await;
             assert_eq!(result["structuredContent"]["state"], json!("ended"));
-            assert!(next_step(&result).contains("lease_status"), "{result}");
+            assert!(next_of(&result).contains("lease_status"), "{result}");
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1589,7 +1841,7 @@ mod leasing {
             assert_ne!(result["isError"], json!(true), "{result}");
             let now = d.lease_of("s1", &lease).await;
             assert_eq!(now["state"], json!("ended"));
-            assert!(next_step(&result).contains("lease_status"), "{result}");
+            assert!(next_of(&result).contains("lease_status"), "{result}");
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1605,7 +1857,7 @@ mod leasing {
                 )
                 .await;
             assert_eq!(result["structuredContent"]["interruptible"], json!(true));
-            assert!(next_step(&result).contains("lease_wait"), "{result}");
+            assert!(next_of(&result).contains("lease_wait"), "{result}");
         }
 
         /// `s1` holds `board` interruptibly; `s2` asks for it at high
@@ -1641,7 +1893,7 @@ mod leasing {
             assert_ne!(result["isError"], json!(true), "{result}");
             let now = d.lease_of("s1", &lease).await;
             assert_eq!(now["yield_deadline"], json!(null), "{now}");
-            assert!(next_step(&result).contains("lease_release"), "{result}");
+            assert!(next_of(&result).contains("lease_release"), "{result}");
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1683,7 +1935,7 @@ mod leasing {
                 "{result}"
             );
             assert!(text_of(&result).contains("comes back to you"), "{result}");
-            assert!(next_step(&result).contains("lease_wait"), "{result}");
+            assert!(next_of(&result).contains("lease_wait"), "{result}");
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1697,7 +1949,7 @@ mod leasing {
             assert_ne!(result["isError"], json!(true), "{result}");
             let status = s2.ok("lease_status", json!({})).await;
             assert_eq!(status["requests"], json!([]), "{status}");
-            assert!(next_step(&result).contains("lease_status"), "{result}");
+            assert!(next_of(&result).contains("lease_status"), "{result}");
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -1722,26 +1974,12 @@ mod leasing {
                 json!("held"),
                 "{result}"
             );
-            assert!(next_step(&result).contains("lease_release"), "{result}");
+            assert!(next_of(&result).contains("lease_release"), "{result}");
         }
     }
 
     mod tasks {
         use super::*;
-
-        /// Poll `tasks/get` until the task leaves `working`; its result.
-        async fn finished(s: &Raw, task: &str) -> Value {
-            let until = Instant::now() + Duration::from_secs(5);
-            loop {
-                let reply = s.request("tasks/get", json!({"taskId": task})).await;
-                let got = reply.message["result"].clone();
-                if got["status"] != json!("working") {
-                    return got;
-                }
-                assert!(Instant::now() < until, "task {task} never finished");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
 
         mod on_a_request_whose_client_capabilities_declare_tasks {
             use super::*;
@@ -1857,6 +2095,56 @@ mod leasing {
             }
         }
 
+        mod on_an_acquire_task_completed_by_an_offer {
+            use super::*;
+
+            /// s2's queued `lease_acquire` task, completed by s1's
+            /// hand-over; its result.
+            async fn completed(d: &Daemon, s2: &Raw) -> Value {
+                let s1 = d.session("s1", "a");
+                seed(&s1, "board", "k", &[]).await;
+                let lease = acquire(&s1, "board").await["lease_id"].clone();
+                let handle = s2
+                    .call(
+                        "lease_acquire",
+                        json!({"target": {"resource": "board"}, "for": "1h", "purpose": "x"}),
+                    )
+                    .await;
+                assert_eq!(handle["resultType"], json!("task"), "{handle}");
+                hand_over(&s1, lease.as_str().unwrap()).await;
+                let done = finished(s2, handle["taskId"].as_str().unwrap()).await;
+                assert_eq!(done["status"], json!("completed"), "{done}");
+                done["result"].clone()
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn structured_ack_names_the_offered_notice() {
+                let d = Daemon::start();
+                let s2 = d.session("s2", "a").with_tasks();
+                let result = completed(&d, &s2).await;
+                let pending = d.engine.pending_notices(agent("s2")).await.unwrap();
+                let offered: Vec<String> = pending
+                    .iter()
+                    .filter(|n| serde_json::to_value(n.kind).unwrap() == json!("offered"))
+                    .map(|n| n.id.as_str().to_owned())
+                    .collect();
+                assert_eq!(offered.len(), 1, "{pending:?}");
+                assert_eq!(ack_of(&result), offered, "{result}");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn passing_that_ack_to_lease_wait_returns_no_second_grant() {
+                let d = Daemon::start_with(quick());
+                let s2 = d.session("s2", "a").with_tasks();
+                let result = completed(&d, &s2).await;
+                let got = d
+                    .session("s2", "a")
+                    .ok("lease_wait", json!({"ack": ack_of(&result)}))
+                    .await;
+                assert_eq!(got["grants"], json!([]), "{got}");
+            }
+        }
+
         mod on_an_acquire_task_whose_offer_cannot_be_claimed {
             use super::*;
 
@@ -1885,9 +2173,10 @@ mod leasing {
                 let done = finished(&s2, handle["taskId"].as_str().unwrap()).await;
                 assert_eq!(done["status"], json!("completed"), "{done}");
                 assert_eq!(done["result"]["isError"], json!(true), "{done}");
-                let text = text_of(&done["result"]);
-                let next = text.rsplit(". ").next().unwrap();
-                assert!(next.starts_with("Call lease_wait"), "{text}");
+                assert!(
+                    next_of(&done["result"]).starts_with("Call lease_wait"),
+                    "{done}"
+                );
             }
         }
 
