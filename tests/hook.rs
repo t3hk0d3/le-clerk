@@ -191,7 +191,10 @@ impl Slow {
             let app = Router::new()
                 .route(
                     "/v1/version",
-                    get(|| async { axum::Json(json!({"version": leclerk::VERSION, "pid": 1})) }),
+                    get(|| async {
+                        axum::Json(json!({"version": leclerk::VERSION,
+                                          "protocol": leclerk::PROTOCOL, "pid": 1}))
+                    }),
                 )
                 .route(
                     "/v1/rpc/{method}",
@@ -627,6 +630,25 @@ mod cli {
                     let lease = board_held_by(&mut old);
                     old.kill();
                     wait_disconnected(&env, "s1");
+                    let home = env.home().to_owned();
+                    let doc = input("session-start", "s1", &json!({"source": "resume"}));
+                    let hook = thread::spawn(move || run_hook(&home, "session-start", &doc, me()));
+                    thread::sleep(Duration::from_millis(300));
+                    let mut new = Proxy::spawn(&env, "s2");
+                    new.tool("resource_list", &json!({}));
+                    let (out, took) = hook.join().unwrap();
+                    assert_silent_within(&out, took, BUDGET, "session-start");
+                    assert_eq!(leases_of(&env, "s2"), vec![lease]);
+                }
+
+                #[test]
+                fn aliases_once_the_proxy_starts_the_daemon_shortly_after_the_hook_starts() {
+                    let env = Env::new();
+                    let mut old = Proxy::spawn(&env, "s1");
+                    let lease = board_held_by(&mut old);
+                    old.kill();
+                    wait_disconnected(&env, "s1");
+                    env.cmd().args(["daemon", "stop"]).assert().success();
                     let home = env.home().to_owned();
                     let doc = input("session-start", "s1", &json!({"source": "resume"}));
                     let hook = thread::spawn(move || run_hook(&home, "session-start", &doc, me()));

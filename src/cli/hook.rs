@@ -15,7 +15,8 @@
 //! - session-start, `source: "resume"`: the proxy session takes the resumed
 //!   one over. The hook may run before the proxy's liveness stream opens;
 //!   it retries every [`RETRY`] while the budget lasts, then gives up
-//!   silently. The daemon remembers the pending resume, and the next stop
+//!   silently. Likewise it waits for a daemon that is not answering yet
+//!   (the proxy may be starting it), without starting one itself. The daemon remembers the pending resume, and the next stop
 //!   or pre-tool-use hook (whose brief makes it) finishes it.
 //! - stop: a block decision telling the agent to call `lease_wait`, when
 //!   the session holds a live lease or a queued request, has no open wait,
@@ -36,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::ValueEnum;
-use leclerk::client::{self, Client, PROBE_TIMEOUT};
+use leclerk::client::{self, Client, DaemonError, PROBE_TIMEOUT};
 use leclerk::config::Paths;
 use leclerk::model::Caller;
 use serde::Deserialize;
@@ -210,7 +211,23 @@ impl Hook {
         if self.input.source.as_deref() != Some("resume") || self.claude_pid.is_none() {
             return Ok(None);
         }
-        let session = self.client().await?;
+        // The proxy, started alongside this hook, may be starting the
+        // daemon: wait for it within the budget (never start one here).
+        let session = loop {
+            match self.client().await {
+                Ok(session) => break session,
+                Err(e)
+                    if self.left() >= RETRY * 2
+                        && matches!(
+                            e.downcast_ref::<DaemonError>(),
+                            Some(DaemonError::Unavailable | DaemonError::Unresponsive { .. })
+                        ) =>
+                {
+                    tokio::time::sleep(RETRY).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         loop {
             let outcome = session
                 .call("session_start", json!({ "source": "resume" }), self.left())
