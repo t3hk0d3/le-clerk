@@ -985,3 +985,144 @@ stops the MVP):
 - **Idle-timeout control:** `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=60000` did not
   shorten the idle limit (a 100 s call without progress succeeded), so whether
   progress notifications keep a call alive remains unverified (§11.2).
+
+## Appendix B: phase 3 verify-first findings (2026-11-10, Claude Code 2.1.321)
+
+Spike code and logs: `docs/superpowers/spikes/2026-11-10-p3/` (own cargo
+project, not built by the crate). `spike-server` is an rmcp Streamable HTTP
+service nested at `/mcp` in an axum router on a Unix socket; `spike-relay` is a
+raw stdio relay; `spike-client` is rmcp's own Unix-socket client. Runs used
+`claude -p` and one interactive session in tmux, with a scrubbed environment
+(`clean-claude.sh`). Docs read on 2026-11-10: code.claude.com/docs/en
+`mcp.md`, `env-vars.md`, `hooks.md`, `plugins-reference.md`,
+`plugin-marketplaces.md`.
+
+**Results, one line per item:**
+
+- **Pins:** `rmcp = "=3.8.0"` (2026-10-26; 3.9.0 is under two weeks old),
+  with `rmcp-macros` held at 3.8.0 in `Cargo.lock`; features `server`,
+  `macros`, `transport-streamable-http-server`, `client`,
+  `transport-streamable-http-client-unix-socket`. `schemars = "1.2.3"`
+  (rmcp needs `^1.1`).
+- **§11.1 Tasks: verified.** rmcp 3.x implements the SEP-2663
+  `io.modelcontextprotocol/tasks` extension (`TaskManager`,
+  `CallToolResponse::Task`, `tasks/get|update|cancel`; SEP-1686 was replaced in
+  3.0.0-beta.1). Claude Code 2.1.321 declares the same extension and needs no
+  flag. In an interactive terminal session it got a task handle at once, polled
+  `tasks/get` every `pollIntervalMs` (rmcp default 1 s), showed `MCP task <id>
+  (spike/slow) completed.` and an idle session acted on the result unprompted
+  (`logs/server.log`). Per the MCP docs ("What a call needs to become an MCP
+  task"), tasks are **not** used for: one-shot `claude -p`, calls from
+  subagents, the desktop app and VS Code, third-party providers, or sessions
+  without feature-flag fetching. Those calls are plain blocking calls.
+- **§11.2 Progress past the idle limit: verified.** With
+  `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=20000` (applied as a 30 s window), a 40 s
+  call without progress aborted with "sent no response or progress for 30s",
+  and a 40 s call with progress every 5 s succeeded (`logs/run7-*.json`).
+  Appendix A's failed attempt most likely lost the variable before Claude Code
+  saw it. Documented defaults: 30 min for stdio, 5 min for HTTP.
+  Observation: on that abort Claude Code sent no `notifications/cancelled`; the
+  server call ran on and its result was dropped.
+- **§11.3 `CLAUDE_CODE_SESSION_ID`: verified, with a documented gap.** Set for
+  the stdio MCP process and equal to hook input `session_id` on a fresh start
+  and on `--resume <id>` (both `-p` and interactive). On `--continue` the MCP
+  process got a fresh start-up ID while hooks got the resumed ID (reproduced
+  twice; env-vars.md says the same). `/clear` gives hooks a new ID (SessionEnd
+  `reason: "clear"`, then SessionStart `source: "clear"`) while the running
+  MCP process keeps the old one. Subagents share the parent's MCP process and
+  ID; their hook input carries the parent `session_id` plus `agent_id` and
+  `agent_type`. The MCP process's parent PID equals `CLAUDE_PID`, which
+  Claude Code sets (documented) for hook commands but not for MCP servers.
+- **§11.4 Streamable HTTP over a Unix socket: verified, both sides.**
+  `StreamableHttpService` mounts with `Router::nest_service("/mcp", …)` served
+  by `axum::serve(UnixListener)`. Client side: rmcp's
+  `StreamableHttpClientTransport::from_unix_socket_with_config` with
+  `custom_headers` (`logs/run8-*.log`) and a raw hyper relay. Custom headers
+  reach handlers as `http::request::Parts` in `RequestContext::extensions`.
+  Requests need `Host: localhost` (rmcp's default host allowlist).
+- **MCP session and identity: plan assumption fails.** Claude Code 2.1.321
+  speaks protocol 2026-07-28 to stdio servers: it opens with `server/discover`,
+  sends no `initialize`, and every request carries `_meta`
+  (`io.modelcontextprotocol/protocolVersion`, `clientInfo`,
+  `clientCapabilities`, `progressToken`). Sessions were removed in that
+  revision (SEP-2567), so rmcp serves it statelessly and no `Mcp-Session-Id`
+  exists. Over HTTP rmcp also requires `MCP-Protocol-Version`, `Mcp-Method`
+  and `Mcp-Name` (SEP-2243), which the relay derives from each message.
+- **§11.5 Completed task while mid-turn: verified.** A task finished while a
+  second, blocking call was running in the same turn. Claude Code saw it
+  complete at once, but delivered it to the model only after the running call
+  returned, as the same `MCP task … completed.` notice, still within the turn.
+- **Documented schemas** (field names verbatim):
+  - Plugin manifest `.claude-plugin/plugin.json`: `name` (only required,
+    kebab-case, must not start with `claude-`), `version`, `description`,
+    `author{name,email,url}`, `homepage`, `repository`, `license`, `keywords`,
+    `skills`, `hooks`, `mcpServers`; components at the plugin root
+    (`skills/<name>/SKILL.md`, `hooks/hooks.json`, `.mcp.json`);
+    `${CLAUDE_PLUGIN_ROOT}` in commands. Check: `claude plugin validate <dir>`.
+    plugins-reference.md.
+  - Marketplace `.claude-plugin/marketplace.json`: `name`, `owner{name}`,
+    `plugins[{name, source: "./relative/path", description}]`; entry name
+    equals the manifest name; no `..` in `source`. Install:
+    `claude plugin marketplace add <dir>`,
+    `claude plugin install <plugin>@<marketplace>` (user scope by default).
+    plugin-marketplaces.md.
+  - Plugin `.mcp.json`: `{"mcpServers": {"<name>": {"command", "args",
+    "env"}}}`. mcp.md "Plugin-provided MCP servers".
+  - `hooks/hooks.json`: `{"hooks": {"<Event>": [{"matcher", "hooks": [{"type":
+    "command", "command", "timeout"}]}]}}`, `timeout` in seconds.
+    SessionEnd hooks get 1.5 s in total unless a settings-file hook raises it;
+    a plugin hook's `timeout` does not raise that budget. hooks.md.
+  - Hook input, common: `session_id`, `transcript_path`, `cwd`,
+    `permission_mode`, `hook_event_name`, plus `agent_id`/`agent_type` inside
+    subagents. Stop: `stop_hook_active`, `last_assistant_message`,
+    `background_tasks[{id,type,status,description,server,tool}]` (type
+    `"MCP task"` for tasks), `session_crons`. PreToolUse: `tool_name`,
+    `tool_input`, `tool_use_id` (observed `mcp_server` too). SessionEnd:
+    `reason` (`clear`, `resume`, `logout`, `prompt_input_exit`, `other`).
+    SessionStart: `source` (`startup`, `resume`, `clear`, `compact`, `fork`).
+    hooks.md.
+  - Hook output: Stop block is `{"decision": "block", "reason": "…"}`
+    (8-continuation cap); PreToolUse context is `{"hookSpecificOutput":
+    {"hookEventName": "PreToolUse", "additionalContext": "…"}}` (10,000
+    characters max). hooks.md.
+
+**Plan impact** (contradictions with the phase 3 plan; recommended rulings,
+for the user to decide):
+
+1. **No MCP session to bind identity to.** "Bound once at `initialize`" and
+   "later headers are ignored" cannot hold: Claude Code sends no `initialize`
+   and 2026-07-28 has no MCP session. Recommended: the proxy sends the
+   `X-Clerk-*` headers on every POST, and the daemon builds `McpIdentity` per
+   request from `http::request::Parts`. A request without `X-Clerk-Session` is
+   refused. Drop the "later requests with different headers" scenario. The
+   socket is user-only and only the proxy speaks to it, so nothing is lost.
+2. **The proxy must speak 2026-07-28 HTTP framing.** It must set
+   `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` from each message, relay
+   JSON and SSE responses, and send requests concurrently. The first message is
+   `server/discover`, not `initialize`. Task 2 tests should cover a
+   2026-07-28 client as well as rmcp's default client, which negotiates
+   2025-11-25 through `initialize`.
+3. **Tasks adopted, but the blocking path stays primary.** Tasks are
+   compatible, but subagents, the desktop app, VS Code and `-p` never get
+   them. Recommended: `lease_acquire` and `lease_wait` return a task only when
+   the per-request `clientCapabilities` declare the extension. Use a
+   `pollIntervalMs` of about 5 s. Count an open task as an open wait for the
+   Stop hook.
+4. **Hook `session_id` and proxy session can differ** (`--continue`, `/clear`).
+   Recommended: the proxy also sends `X-Clerk-Claude-Pid` (its parent PID).
+   Hooks send `CLAUDE_PID` alongside `session_id`, and the daemon resolves a
+   hook to the live proxy session with that PID before falling back to
+   `session_id`.
+   - Add a SessionStart hook (`clerk hook session-start`) that, for
+     `source: "resume"`, aliases the proxy's start-up ID to the resumed ID, so
+     `--continue` takes over leases inside the grace.
+   - SessionEnd with `reason` `clear` or `resume` must not end the session
+     while its proxy is connected: the Claude Code process lives on.
+5. **A dropped call is not cancelled.** After an idle abort the daemon's call
+   keeps running. If it then hands notices to a result the client threw away,
+   they are lost. Recommended: progress every 30 s, as planned. Optionally,
+   delivery stays pending until the next `lease_wait` (or a hook) acknowledges
+   it. At least, test that a disconnect mid-wait (Review Focus 5) and an
+   abandoned result both leave the notices pending.
+6. **SessionEnd hook budget:** the plugin's `clerk hook session-end` gets
+   1.5 s in total, not the plan's 2 s. Its RPC must finish in about 1 s.

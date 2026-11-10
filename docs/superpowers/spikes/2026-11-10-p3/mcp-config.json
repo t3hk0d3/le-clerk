@@ -1,0 +1,1 @@
+{"mcpServers":{"spike":{"type":"stdio","command":"/tmp/claude-1000/p3-spike-target/debug/spike-relay","args":["/tmp/claude-1000/p3-spike.sock","/home/tehkode/dev/leclerk/docs/superpowers/spikes/2026-11-10-p3/logs"]}}}

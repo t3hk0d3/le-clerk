@@ -1,0 +1,135 @@
+dict_keys(['__reqwest', 'auth', 'auth-client-credentials-jwt', 'auth-enterprise-managed', 'client', 'client-side-sse', 'default', 'elicitation', 'local', 'macros', 'request-state', 'reqwest', 'reqwest-native-tls', 'reqwest-tls-no-provider', 'schemars', 'server', 'server-side-http', 'tower', 'transport-async-rw', 'transport-child-process', 'transport-io', 'transport-streamable-http-client', 'transport-streamable-http-client-reqwest', 'transport-streamable-http-client-unix-socket', 'transport-streamable-http-server', 'transport-streamable-http-server-session', 'transport-worker', 'which-command'])
+{
+"__reqwest": [
+"dep:reqwest"
+],
+"auth": [
+"dep:async-trait",
+"dep:oauth2",
+"__reqwest",
+"dep:url"
+],
+"auth-client-credentials-jwt": [
+"auth",
+"dep:jsonwebtoken",
+"uuid"
+],
+"auth-enterprise-managed": [
+"auth",
+"base64"
+],
+"client": [
+"dep:tokio-stream"
+],
+"client-side-sse": [
+"dep:sse-stream",
+"dep:http",
+"dep:bytes",
+"base64"
+],
+"default": [
+"base64",
+"macros",
+"server"
+],
+"elicitation": [
+"dep:url"
+],
+"local": [
+"rmcp-macros?/local"
+],
+"macros": [
+"dep:rmcp-macros",
+"dep:pastey"
+],
+"request-state": [
+"dep:hmac",
+"dep:sha2",
+"dep:zeroize",
+"base64"
+],
+"reqwest": [
+"__reqwest",
+"reqwest?/rustls"
+],
+"reqwest-native-tls": [
+"__reqwest",
+"reqwest?/native-tls"
+],
+"reqwest-tls-no-provider": [
+"__reqwest",
+"reqwest?/rustls-no-provider"
+],
+"schemars": [
+"dep:schemars"
+],
+"server": [
+"transport-async-rw",
+"schemars",
+"dep:pastey",
+"uuid"
+],
+"server-side-http": [
+"uuid",
+"dep:rand",
+"dep:tokio-stream",
+"dep:http",
+"dep:http-body",
+"dep:http-body-util",
+"dep:bytes",
+"dep:sse-stream",
+"tower",
+"base64"
+],
+"tower": [
+"dep:tower-service"
+],
+"transport-async-rw": [
+"tokio/io-util",
+"tokio-util/codec"
+],
+"transport-child-process": [
+"transport-async-rw",
+"tokio/process",
+"dep:process-wrap"
+],
+"transport-io": [
+"transport-async-rw",
+"tokio/io-std",
+"tokio/net"
+],
+"transport-streamable-http-client": [
+"client-side-sse",
+"transport-worker"
+],
+"transport-streamable-http-client-reqwest": [
+"transport-streamable-http-client",
+"__reqwest"
+],
+"transport-streamable-http-client-unix-socket": [
+"transport-streamable-http-client",
+"dep:hyper",
+"dep:hyper-util",
+"dep:http-body-util",
+"dep:http",
+"dep:bytes",
+"tokio/net"
+],
+"transport-streamable-http-server": [
+"transport-streamable-http-server-session",
+"server-side-http",
+"transport-worker"
+],
+"transport-streamable-http-server-session": [
+"transport-async-rw",
+"dep:async-trait",
+"dep:tokio-stream"
+],
+"transport-worker": [
+"dep:tokio-stream"
+],
+"which-command": [
+"transport-child-process",
+"dep:which"
+]
+}

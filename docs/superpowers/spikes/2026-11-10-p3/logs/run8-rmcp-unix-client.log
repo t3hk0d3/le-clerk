@@ -1,0 +1,4 @@
+peer: Some(ProtocolVersion("2025-11-25"))
+tools: ["whoami", "slow"]
+whoami: {"content":[{"type":"text","text":"{\"client_capabilities\":{},\"client_info\":{\"name\":\"rmcp\",\"version\":\"3.8.0\"},\"headers\":{\"accept\":\"text/event-stream, application/json\",\"content-length\":\"101\",\"content-type\":\"application/json\",\"host\":\"localhost\",\"mcp-protocol-version\":\"2025-11-25\",\"x-clerk-connection\":\"01TESTCONN\",\"x-clerk-project\":\"%2Ftmp%2Fproj\",\"x-clerk-session\":\"test-session\"},\"protocol_version\":\"Some(ProtocolVersion(\\\"2025-11-25\\\"))\"}"}],"isError":false}
+slow: {"content":[{"type":"text","text":"done after 2s"}],"isError":false}

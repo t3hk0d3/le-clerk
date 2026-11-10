@@ -1,0 +1,38 @@
+[package]
+name = "p3-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Throwaway spike for phase 3 verify-first (spec Appendix B). Not part of the
+# leclerk crate; build with CARGO_TARGET_DIR=/tmp/claude-1000/p3-spike-target.
+[workspace]
+
+[[bin]]
+name = "spike-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "spike-relay"
+path = "src/relay.rs"
+
+[dependencies]
+rmcp = { version = "=3.8.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io", "transport-streamable-http-client-unix-socket", "client"] }
+schemars = "1.2"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+http = "1"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "spike-client"
+path = "src/client.rs"
