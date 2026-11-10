@@ -202,8 +202,6 @@ mcp::tools inventory (type_list, resource_*, unit_*)
             - creates in project scope
         On no project
             - creates in user scope
-        On a similar resource in another project
-            - result carries the similar_in_other_project warning and says to tell the user
     resource_list
         On tags
             - returns only visible resources carrying all of them
@@ -211,6 +209,12 @@ mcp::tools inventory (type_list, resource_*, unit_*)
             - never returned
     resource_get / unit_*
         - map to the engine command with view caller; other projects read as not_found
+    unit_add
+        On a similar unit in another project
+            - result carries the similar_in_other_project warning and says to tell the user
+    unit_add / unit_update
+        On an unknown key inside settings
+            - returns a tool error; nothing changes
 
 mcp::tools leasing
     lease_acquire
