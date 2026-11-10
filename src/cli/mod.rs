@@ -13,6 +13,7 @@ mod inventory;
 mod lease;
 mod live;
 mod output;
+mod render;
 mod views;
 
 use std::process::ExitCode;
@@ -41,6 +42,10 @@ struct Cli {
     /// Print JSON, even on a terminal.
     #[arg(long, global = true)]
     json: bool,
+    /// Print only ASCII: `#`, `.` and `!` for the unit glyphs (also the
+    /// default when the locale is not UTF-8).
+    #[arg(long, global = true)]
+    ascii: bool,
     /// Why an agent does this for the user (agents need it for `approve`
     /// and `admin`; the reason is recorded in the audit log).
     #[arg(long = "override", global = true, value_name = "REASON")]
@@ -177,6 +182,7 @@ pub fn run() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => return parse_failure(&e),
     };
+    render::Style::detect(cli.json, cli.ascii).install();
     let out = Output::new(Mode::detect(cli.json));
     if let Command::Daemon { action: None } = cli.command {
         // The daemon logs to its own file.
@@ -210,7 +216,12 @@ fn parse_failure(e: &clap::Error) -> ExitCode {
         e.exit();
     }
     let rendered = e.render().to_string();
-    let message = rendered.trim().trim_start_matches("error: ").to_owned();
+    // clap ends with "For more information, try '--help'.": not for JSON.
+    let body = rendered
+        .split("\n\nFor more information")
+        .next()
+        .unwrap_or_default();
+    let message = body.trim().trim_start_matches("error: ").to_owned();
     Output::new(Mode::Json).fail(UsageError(message))
 }
 

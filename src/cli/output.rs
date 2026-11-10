@@ -17,6 +17,7 @@ use thiserror::Error;
 use super::UsageError;
 use super::gate::GateRefusal;
 use super::input::InputError;
+use super::render::{self, Style};
 
 /// Exit code: an internal failure that fits no other class.
 const EXIT_INTERNAL: u8 = 1;
@@ -251,7 +252,7 @@ impl Output {
     pub fn emit<T: Serialize + HumanRender>(self, value: &T) -> anyhow::Result<()> {
         let text = match self.mode {
             Mode::Json => serde_json::to_string(value)?,
-            Mode::Human => value.render(),
+            Mode::Human => render::finish(&value.render(), Style::current()),
         };
         let mut stdout = io::stdout().lock();
         if text.is_empty() {
@@ -277,18 +278,33 @@ impl Output {
                 let mut stdout = io::stdout().lock();
                 let _ = writeln!(stdout, "{}", json!({ "error": error }));
             }
-            Mode::Human => {
-                let mut text = f.message.clone();
-                if let Some(Value::Object(details)) = &f.details {
-                    for (key, value) in details {
-                        let _ = write!(text, "\n  {key}: {}", plain(value));
-                    }
-                }
-                eprintln!("{text}");
-            }
+            Mode::Human => eprintln!("{}", render::finish(&human_failure(&f), Style::current())),
         }
         ExitCode::from(f.exit)
     }
+}
+
+/// A failure as people read it: the message (for `not_found` with
+/// details, `not found: <kind> "<id>"`), then one `  key: value` line per
+/// other detail.
+fn human_failure(f: &Failure) -> String {
+    let named = f.details.as_ref().and_then(|d| {
+        let kind = d.get("kind")?.as_str()?;
+        let id = d.get("id")?.as_str()?;
+        Some((kind, id))
+    });
+    if f.code == "not_found"
+        && let Some((kind, id)) = named
+    {
+        return format!("not found: {kind} \"{id}\"");
+    }
+    let mut text = f.message.clone();
+    if let Some(Value::Object(details)) = &f.details {
+        for (key, value) in details {
+            let _ = write!(text, "\n  {key}: {}", plain(value));
+        }
+    }
+    text
 }
 
 /// A JSON value as plain text: strings unquoted, lists of scalars joined
@@ -302,16 +318,6 @@ pub fn plain(value: &Value) -> String {
             items.iter().map(plain).collect::<Vec<_>>().join(", ")
         }
         other => other.to_string(),
-    }
-}
-
-/// The terminal's width in columns; 80 when unknown (a terminal that
-/// reports 0 columns, as a fresh pseudo-terminal does, counts as unknown).
-#[must_use]
-pub fn width() -> usize {
-    match crossterm::terminal::size() {
-        Ok((cols, _)) if cols > 0 => usize::from(cols.max(20)),
-        _ => 80,
     }
 }
 

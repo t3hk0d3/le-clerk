@@ -11,13 +11,14 @@ use clap::Args;
 use leclerk::admin::HolderSpec;
 use leclerk::client::ApiError;
 use leclerk::clock::{Clock, SystemClock};
-use leclerk::model::{Caller, HolderRef};
+use leclerk::model::{Caller, Check, HealthSpec, HolderRef, ProjectKey, ResourceType, ServiceMode};
 use serde_json::{Value, json};
 
 use super::admin::ScopeFlag;
 use super::caller::{self, CallerKind};
 use super::gate;
-use super::output::{self, View, plain, table, truncate};
+use super::output::{Mode, View, plain};
+use super::render::{self, ITEM, SEP, SUB, Style};
 use super::{Ctx, UsageError};
 
 /// `--tag TAG[,TAG…]`, repeatable: every tag must match.
@@ -45,6 +46,9 @@ pub struct LogArgs {
     /// At most this many entries.
     #[arg(long)]
     limit: Option<u32>,
+    /// Print ids whole instead of shortening them.
+    #[arg(long)]
+    wide: bool,
 }
 
 /// The view an agent session may have, or every scope for the user.
@@ -71,22 +75,29 @@ pub async fn status(ctx: &Ctx) -> anyhow::Result<()> {
         .await?
         .call("status", &caller, json!({ "view": view_of(&caller) }))
         .await?;
-    ctx.out.emit(&View::new(result, |v| fit(&status_text(v))))
+    ctx.out.emit(&View::new(result, status_text))
 }
 
 pub async fn resources(ctx: &Ctx, tags: Vec<String>) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Interactive)?;
-    let result = ctx
-        .client()
-        .await?
+    let client = ctx.client().await?;
+    let result = client
         .call(
             "list_resources",
             &caller,
             json!({ "view": view_of(&caller), "tags": tags }),
         )
         .await?;
+    // People see each resource's occupancy too; JSON stays the listing.
+    let status = if ctx.out.mode() == Mode::Human {
+        client
+            .call("status", &caller, json!({ "view": view_of(&caller) }))
+            .await?
+    } else {
+        Value::Null
+    };
     ctx.out
-        .emit(&View::new(result, |v| fit(&resources_text(v))))
+        .emit(&View::new(result, move |v| resources_text(v, &status)))
 }
 
 pub async fn show(ctx: &Ctx, id: &str, scope: &ScopeFlag) -> anyhow::Result<()> {
@@ -137,8 +148,7 @@ pub async fn leases(ctx: &Ctx, mine: bool) -> anyhow::Result<()> {
             }
         }
     }
-    ctx.out
-        .emit(&View::new(Value::Array(leases), |v| fit(&leases_text(v))))
+    ctx.out.emit(&View::new(Value::Array(leases), leases_text))
 }
 
 pub async fn queue(ctx: &Ctx, resource: &str) -> anyhow::Result<()> {
@@ -161,8 +171,7 @@ pub async fn queue(ctx: &Ctx, resource: &str) -> anyhow::Result<()> {
         ))
         .into());
     }
-    ctx.out
-        .emit(&View::new(Value::Array(queues), |v| fit(&queue_text(v))))
+    ctx.out.emit(&View::new(Value::Array(queues), queue_text))
 }
 
 pub async fn log(ctx: &Ctx, args: LogArgs) -> anyhow::Result<()> {
@@ -216,8 +225,9 @@ pub async fn log(ctx: &Ctx, args: LogArgs) -> anyhow::Result<()> {
         .take(args.limit.map_or(usize::MAX, |l| l as usize))
         .cloned()
         .collect();
+    let wide = args.wide;
     ctx.out.emit(&View::new(Value::Array(entries), move |v| {
-        fit(&log_text(v, now))
+        log_text(v, now, wide)
     }))
 }
 
@@ -230,8 +240,7 @@ pub async fn promotions(ctx: &Ctx) -> anyhow::Result<()> {
         .await?
         .call("list_promotions", &caller, json!({}))
         .await?;
-    ctx.out
-        .emit(&View::new(result, |v| fit(&promotions_text(v))))
+    ctx.out.emit(&View::new(result, promotions_text))
 }
 
 pub async fn approve(ctx: &Ctx, promotion: String, new_id: Option<String>) -> anyhow::Result<()> {
@@ -374,39 +383,18 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 // Human rendering
 // ---------------------------------------------------------------------------
 
-/// Every line cut to the terminal width.
-fn fit(text: &str) -> String {
-    let width = output::width();
-    text.lines()
-        .map(|l| truncate(l, width))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// A JSON value as plain text.
 pub fn text(v: &Value) -> String {
     plain(v)
 }
 
-/// `user` or `project:<path>`.
+/// `user` or `project <folder>`.
 pub fn scope_text(scope: &Value) -> String {
-    match scope.get("project") {
-        Some(path) => format!("project:{}", text(path)),
-        None => text(scope),
-    }
+    render::scope(scope)
 }
 
-/// `session:<id>`, `pid:<pid>` or `user:<tag>`.
-fn holder_text(h: &Value) -> String {
-    match h["kind"].as_str() {
-        Some("agent_session") => format!("session:{}", text(&h["session_id"])),
-        Some("cli_process") => format!("pid:{}", h["pid"]),
-        Some("user") => format!("user:{}", text(&h["tag"])),
-        _ => h.to_string(),
-    }
-}
-
-/// A unit's settings in one line.
+/// A unit's settings in one line: a device path, a service address or a
+/// generic key.
 pub fn settings_text(s: &Value) -> String {
     match s["type"].as_str() {
         Some("device") => text(&s["path"]),
@@ -420,111 +408,238 @@ pub fn settings_text(s: &Value) -> String {
                 t.push_str(" (listen)");
             }
             if let Some(id) = s["service_id"].as_str() {
-                let _ = write!(t, " id={id}");
+                let _ = write!(t, " id {id}");
             }
             t
         }
-        Some("generic") => format!("key={}", text(&s["identity_key"])),
+        Some("generic") => format!("key {}", text(&s["identity_key"])),
         _ => s.to_string(),
     }
 }
 
-fn tags_text(tags: &Value) -> String {
-    match tags.as_array() {
-        Some(list) if !list.is_empty() => plain(tags),
-        _ => "-".to_owned(),
+/// A unit's settings as a labelled line: `path: …`, `address: …` or
+/// `key: …`.
+fn settings_line(s: &Value) -> String {
+    match s["type"].as_str() {
+        Some("device") => format!("path: {}", text(&s["path"])),
+        Some("service") => format!("address: {}", settings_text(s)),
+        Some("generic") => format!("key: {}", text(&s["identity_key"])),
+        _ => format!("settings: {s}"),
     }
 }
 
-/// `in 4m 10s` or `5m ago`, from unix milliseconds.
-pub fn relative(at_ms: i64, now_ms: i64) -> String {
-    let delta = at_ms - now_ms;
-    let secs = delta.unsigned_abs() / 1000;
-    let span = match secs {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3600 => format!("{}m {}s", s / 60, s % 60),
-        s if s < 86_400 => format!("{}h {}m", s / 3600, (s % 3600) / 60),
-        s => format!("{}d {}h", s / 86_400, (s % 86_400) / 3600),
-    };
-    if delta >= 0 {
-        format!("in {span}")
+/// A non-empty string field.
+fn some_text(v: &Value) -> Option<&str> {
+    v.as_str().filter(|s| !s.trim().is_empty())
+}
+
+/// `resource/unit`, the resource bold.
+fn unit_ref(resource: &Value, unit: &Value, style: Style) -> String {
+    format!("{}/{}", style.id(&text(resource)), text(unit))
+}
+
+/// The message of a failed health check, from a unit's `last_health`.
+fn unhealthy_message(u: &Value) -> Option<String> {
+    u["last_health"]
+        .as_str()
+        .and_then(|h| h.strip_prefix("unhealthy"))
+        .map(|why| why.trim_start_matches(':').trim().to_owned())
+}
+
+/// Why a unit was handed over dirty, in words.
+fn dirty_explanation(reason: &str) -> &'static str {
+    match reason {
+        "window_passed" => "the last holder did not confirm cleanup in time",
+        "expired" => "the last lease expired before its cleanup was confirmed",
+        "holder_gone" => "the last holder went away",
+        "override" => "the last holder was overridden",
+        "command_failed" => "the last holder's command failed",
+        "admin_forced" => "an admin ended the last lease",
+        _ => "the last holder did not confirm cleanup",
+    }
+}
+
+/// `▮▯ 1/2 free` (free units first) with `⚠` when a unit is unhealthy.
+/// A unit counts as free when nobody holds it, it is healthy and it is not
+/// retiring.
+fn occupancy_bar(units: &[Value], style: Style) -> String {
+    let free = units
+        .iter()
+        .filter(|u| {
+            u["occupancy"]["kind"] == "free"
+                && unhealthy_message(u).is_none()
+                && u["retiring"] != true
+        })
+        .count();
+    let bar = format!(
+        "{}{}",
+        render::FREE.repeat(free),
+        render::BUSY.repeat(units.len() - free)
+    );
+    let mut t = if bar.is_empty() {
+        format!("{free}/{} free", units.len())
     } else {
-        format!("{span} ago")
+        format!("{bar} {free}/{} free", units.len())
+    };
+    if units.iter().any(|u| unhealthy_message(u).is_some()) {
+        let _ = write!(t, " {}", warn_glyph(style));
     }
+    t
 }
 
-fn occupancy_text(o: &Value, now_ms: i64) -> String {
-    match o["kind"].as_str() {
-        Some("free") => "free".to_owned(),
-        Some("held_in_another_project") => "held by an agent in another project".to_owned(),
-        Some("held") => {
-            let mut t = format!(
-                "held by {} ({}) for \"{}\", lease {}",
-                holder_text(&o["holder"]),
-                text(&o["state"]),
-                text(&o["purpose"]),
-                text(&o["lease_id"])
-            );
-            if let Some(at) = o["ends_at"].as_i64() {
-                let _ = write!(t, ", ends {}", relative(at, now_ms));
-            }
-            t
-        }
-        _ => o.to_string(),
+/// A yellow `⚠` alone.
+fn warn_glyph(style: Style) -> String {
+    style.warn("").trim_end().to_owned()
+}
+
+/// The header of a resource block: id, occupancy, type, scope and (with
+/// `tags`) its tags.
+fn resource_header(r: &Value, units: &[Value], tags: bool, style: Style) -> String {
+    let mut t = format!(
+        "{ITEM}{} {}{SEP}{}{SEP}{}",
+        style.id(&text(&r["id"])),
+        occupancy_bar(units, style),
+        text(&r["type"]),
+        render::scope(&r["scope"])
+    );
+    if tags && r["tags"].as_array().is_some_and(|t| !t.is_empty()) {
+        let _ = write!(t, "{SEP}{}", render::tags_of(&r["tags"], style));
     }
+    if r["shadows_user"] == true {
+        let _ = write!(t, "{SEP}hides the user resource of the same id");
+    }
+    t
+}
+
+/// One unit of the status view: its line, then its description and the
+/// holder's purpose on an indented line.
+fn unit_block(u: &Value, now_ms: i64, style: Style) -> String {
+    let id = text(&u["id"]);
+    let o = &u["occupancy"];
+    let mut t = format!("  {SUB}{id} ");
+    let mut details: Vec<String> = Vec::new();
+    if let Some(d) = some_text(&u["description"]) {
+        details.push(d.to_owned());
+    }
+    match o["kind"].as_str() {
+        Some("free") => {
+            if let Some(why) = unhealthy_message(u) {
+                let mut warning = format!("unhealthy: {why}");
+                if let Some(at) = u["last_health_at"].as_i64() {
+                    let _ = write!(warning, " (checked {})", render::when(at, now_ms));
+                }
+                let _ = write!(t, "{} {}", render::BUSY, style.warn(&warning));
+            } else {
+                let _ = write!(t, "{} free", render::FREE);
+                if let Some(reason) = u["dirty"]["reason"].as_str() {
+                    let mut warning = format!("dirty: {reason}");
+                    if let Some(at) = u["dirty"]["at"].as_i64() {
+                        let _ = write!(warning, " {}", render::when(at, now_ms));
+                    }
+                    let _ = write!(
+                        warning,
+                        " ({})",
+                        render::holder(&u["dirty"]["previous_holder"])
+                    );
+                    let _ = write!(t, "{SEP}{}", style.warn(&warning));
+                }
+            }
+        }
+        Some("held") => {
+            let holder = render::holder(&o["holder"]);
+            let state = text(&o["state"]);
+            let _ = write!(
+                t,
+                "{} {}",
+                render::BUSY,
+                match state.as_str() {
+                    "held" => format!("held by {holder}"),
+                    "offered" => format!("offered to {holder}"),
+                    other => format!("{other}, held by {holder}"),
+                }
+            );
+            if o["resource"] != u["resource"] || o["unit"] != u["id"] {
+                // Held through a linked unit: the same physical thing.
+                let _ = write!(t, " as {}", unit_ref(&o["resource"], &o["unit"], style));
+            }
+            if let Some(at) = o["ends_at"].as_i64() {
+                let _ = write!(t, "{SEP}ends {}", render::when(at, now_ms));
+            }
+            let _ = write!(t, "{SEP}{}", text(&o["lease_id"]));
+            if let Some(p) = some_text(&o["purpose"]) {
+                details.push(render::quoted(p));
+            }
+        }
+        _ => {
+            let _ = write!(t, "{} held by agent in another project", render::BUSY);
+        }
+    }
+    if u["retiring"] == true {
+        let _ = write!(t, "{SEP}retiring");
+    }
+    if !details.is_empty() {
+        let _ = write!(
+            t,
+            "\n{}",
+            render::wrap(&details.join(SEP), 6, render::width())
+        );
+    }
+    t
+}
+
+/// A queue entry: `1. pid 130150 · normal · "purpose" · req_…`.
+fn queue_entry_text(q: &Value) -> String {
+    let mut t = format!(
+        "{}. {}{SEP}{}",
+        q["position"],
+        render::holder(&q["holder"]),
+        text(&q["priority"])
+    );
+    if let Some(p) = some_text(&q["purpose"]) {
+        let _ = write!(t, "{SEP}{}", render::quoted(p));
+    }
+    let _ = write!(t, "{SEP}{}", text(&q["request_id"]));
+    if let Some(unit) = q["unit"].as_str() {
+        let _ = write!(t, "{SEP}unit {unit}");
+    }
+    t
 }
 
 fn status_text(v: &Value) -> String {
     let now = SystemClock.now_ms();
+    let style = Style::current();
+    let width = render::width();
     let resources = v["resources"].as_array().cloned().unwrap_or_default();
     if resources.is_empty() {
         return "No resources.".to_owned();
     }
     let mut out = Vec::new();
     for r in &resources {
-        let mut t = format!(
-            "{} ({}, {})  tags: {}",
-            text(&r["id"]),
-            text(&r["type"]),
-            scope_text(&r["scope"]),
-            tags_text(&r["tags"])
-        );
-        if r["shadows_user"] == true {
-            t.push_str("  [hides a user resource of the same id]");
+        let units: Vec<Value> = r["units"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|u| {
+                let mut u = u.clone();
+                u["resource"] = r["id"].clone();
+                u
+            })
+            .collect();
+        let mut t = resource_header(r, &units, true, style);
+        if let Some(d) = some_text(&r["description"]) {
+            let _ = write!(t, "\n{}", render::wrap(d, 2, width));
         }
-        if let Some(d) = r["description"].as_str().filter(|d| !d.is_empty()) {
-            let _ = write!(t, "\n  {d}");
-        }
-        let units = r["units"].as_array().cloned().unwrap_or_default();
         if units.is_empty() {
-            t.push_str("\n  (no units)");
+            t.push_str("\n  no units");
         }
         for u in &units {
-            let _ = write!(
-                t,
-                "\n  - {}: {}",
-                text(&u["id"]),
-                occupancy_text(&u["occupancy"], now)
-            );
-            if let Some(reason) = u["dirty"]["reason"].as_str() {
-                let _ = write!(t, ", dirty ({reason})");
-            }
-            if u["retiring"] == true {
-                t.push_str(", retiring");
-            }
-            if let Some(h) = u["last_health"].as_str() {
-                let _ = write!(t, ", health: {h}");
-            }
-            if let Some(d) = u["description"].as_str().filter(|d| !d.is_empty()) {
-                let _ = write!(t, "\n      {d}");
-            }
+            let _ = write!(t, "\n{}", unit_block(u, now, style));
         }
         let queue = r["queue"].as_array().cloned().unwrap_or_default();
         if !queue.is_empty() {
             t.push_str("\n  queue:");
             for q in &queue {
-                t.push('\n');
-                t.push_str(&queue_entry_text(q));
+                let _ = write!(t, "\n  {SUB}{}", queue_entry_text(q));
             }
         }
         out.push(t);
@@ -532,136 +647,188 @@ fn status_text(v: &Value) -> String {
     out.join("\n\n")
 }
 
-fn queue_entry_text(q: &Value) -> String {
-    let mut t = format!(
-        "    {}. {} ({}) \"{}\", request {}",
-        q["position"],
-        holder_text(&q["holder"]),
-        text(&q["priority"]),
-        text(&q["purpose"]),
-        text(&q["request_id"])
-    );
-    if let Some(unit) = q["unit"].as_str() {
-        let _ = write!(t, ", unit {unit}");
-    }
-    t
-}
-
-fn resources_text(v: &Value) -> String {
+/// `clerk resources`: one block per listed resource, its occupancy from
+/// `status` (the same resource by id and scope).
+fn resources_text(v: &Value, status: &Value) -> String {
+    let style = Style::current();
+    let width = render::width();
     let list = v.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         return "No resources.".to_owned();
     }
-    let mut rows = vec![
-        ["ID", "TYPE", "SCOPE", "UNITS", "TAGS", "DESCRIPTION"]
-            .map(str::to_owned)
-            .to_vec(),
-    ];
+    let mut out = Vec::new();
     for r in &list {
-        rows.push(vec![
-            text(&r["id"]),
-            text(&r["type"]),
-            scope_text(&r["scope"]),
-            r["units"].as_array().map_or(0, Vec::len).to_string(),
-            tags_text(&r["tags"]),
-            text(&r["description"]),
-        ]);
+        let units: Vec<Value> = status["resources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["id"] == r["id"] && s["scope"] == r["scope"])
+            .and_then(|s| s["units"].as_array().cloned())
+            .unwrap_or_else(|| r["units"].as_array().cloned().unwrap_or_default());
+        let mut t = resource_header(r, &units, false, style);
+        if let Some(d) = some_text(&r["description"]) {
+            let _ = write!(t, "\n{}", render::wrap(d, 2, width));
+        }
+        if r["tags"].as_array().is_some_and(|t| !t.is_empty()) {
+            let _ = write!(t, "\n  tags: {}", render::tags_of(&r["tags"], style));
+        }
+        out.push(t);
     }
-    table(&rows)
+    out.join("\n\n")
 }
 
-/// A resource with everything, usage as the raw template.
-pub fn resource_text(r: &Value) -> String {
-    let mut t = format!(
-        "{} ({}, {})",
-        text(&r["id"]),
-        text(&r["type"]),
-        scope_text(&r["scope"])
-    );
-    if r["shadows_user"] == true {
-        t.push_str("  [hides a user resource of the same id]");
-    }
-    let _ = write!(t, "\n  description: {}", text(&r["description"]));
-    let _ = write!(t, "\n  tags: {}", tags_text(&r["tags"]));
-    let health = match r["health"].as_array() {
-        None => "type default".to_owned(),
-        Some(checks) => checks
+/// The health checks of a resource: its own, or the type default.
+fn health_text(r: &Value) -> String {
+    let names = |checks: &[Value]| {
+        checks
             .iter()
             .map(|c| match (c.get("builtin"), c.get("custom")) {
                 (Some(b), _) => text(b),
                 (_, Some(cmd)) => format!("custom: {}", text(cmd)),
-                _ => c.to_string(),
+                _ => text(c),
             })
             .collect::<Vec<_>>()
-            .join(", "),
+            .join(", ")
     };
-    let _ = write!(t, "\n  health: {health}");
+    if let Some(checks) = r["health"].as_array() {
+        return names(checks);
+    }
+    if let Some(checks) = r["health"]["checks"].as_array() {
+        return names(checks);
+    }
+    let ty = serde_json::from_value::<ResourceType>(r["type"].clone()).ok();
+    let mode =
+        r["units"].as_array().into_iter().flatten().find_map(|u| {
+            serde_json::from_value::<ServiceMode>(u["settings"]["mode"].clone()).ok()
+        });
+    match ty {
+        Some(ty) => {
+            let defaults: Vec<&str> = HealthSpec::default_for(ty, mode)
+                .checks
+                .iter()
+                .filter_map(|c| match c {
+                    Check::Builtin(b) => Some(b.as_str()),
+                    Check::Custom { .. } => None,
+                })
+                .collect();
+            format!("type default ({})", defaults.join(", "))
+        }
+        None => "type default".to_owned(),
+    }
+}
+
+/// A resource with everything, usage as the raw template.
+pub fn resource_text(r: &Value) -> String {
+    let style = Style::current();
+    let width = render::width();
+    let mut t = format!(
+        "{}  {}{SEP}{}",
+        style.id(&text(&r["id"])),
+        text(&r["type"]),
+        render::scope(&r["scope"])
+    );
+    if r["shadows_user"] == true {
+        let _ = write!(t, "{SEP}hides the user resource of the same id");
+    }
+    if let Some(d) = some_text(&r["description"]) {
+        let _ = write!(t, "\n{}", render::wrap(d, 2, width));
+    }
+    if r["tags"].as_array().is_some_and(|t| !t.is_empty()) {
+        let _ = write!(t, "\n  tags:   {}", render::tags_of(&r["tags"], style));
+    }
+    let _ = write!(t, "\n  health: {}", health_text(r));
     let units = r["units"].as_array().cloned().unwrap_or_default();
     if units.is_empty() {
-        t.push_str("\n  units: none");
+        t.push_str("\n  units:  none");
     } else {
         t.push_str("\n  units:");
     }
+    let id_width = units
+        .iter()
+        .map(|u| text(&u["id"]).chars().count())
+        .max()
+        .unwrap_or(0);
     for u in &units {
         let _ = write!(
             t,
-            "\n    {}: {}",
+            "\n  {SUB}{:<id_width$}  {}",
             text(&u["id"]),
             settings_text(&u["settings"])
         );
         if let Some(reason) = u["dirty"]["reason"].as_str() {
-            let _ = write!(t, ", dirty ({reason})");
+            let _ = write!(t, "{SEP}{}", style.warn(&format!("dirty: {reason}")));
         }
         if u["retiring"] == true {
-            t.push_str(", retiring");
+            let _ = write!(t, "{SEP}retiring");
         }
-        if let Some(d) = u["description"].as_str().filter(|d| !d.is_empty()) {
-            let _ = write!(t, "  ({d})");
+        if let Some(d) = some_text(&u["description"]) {
+            let _ = write!(t, "\n{}", render::wrap(d, 4 + id_width + 2, width));
         }
     }
-    match r["usage"].as_str().filter(|u| !u.is_empty()) {
-        Some(usage) => {
-            let _ = write!(t, "\n  usage:\n{usage}");
-        }
-        None => t.push_str("\n  usage: none"),
+    if let Some(usage) = some_text(&r["usage"]) {
+        let _ = write!(t, "\n  usage (template):\n{}", render::indent(usage, 4));
     }
     t
 }
 
+/// `clerk leases`: one block per lease; a lease that also blocks linked
+/// units says so.
 fn leases_text(v: &Value) -> String {
     let now = SystemClock.now_ms();
+    let style = Style::current();
+    let width = render::width();
     let list = v.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         return "No leases.".to_owned();
     }
-    let mut rows = vec![
-        ["UNIT", "HOLDER", "STATE", "ENDS", "LEASE", "PURPOSE"]
-            .map(str::to_owned)
-            .to_vec(),
-    ];
+    let mut out = Vec::new();
+    let mut seen: Vec<&Value> = Vec::new();
     for l in &list {
         let o = &l["occupancy"];
-        let unit = format!("{}/{}", text(&l["resource"]), text(&l["unit"]));
-        if o["kind"] == "held" {
-            rows.push(vec![
-                unit,
-                holder_text(&o["holder"]),
-                text(&o["state"]),
-                o["ends_at"]
-                    .as_i64()
-                    .map_or_else(|| "-".to_owned(), |at| relative(at, now)),
-                text(&o["lease_id"]),
-                text(&o["purpose"]),
-            ]);
-        } else {
-            rows.push(vec![unit, "held by an agent in another project".to_owned()]);
+        if o["kind"] != "held" {
+            out.push(format!(
+                "{ITEM}{}{SEP}held by agent in another project",
+                unit_ref(&l["resource"], &l["unit"], style)
+            ));
+            continue;
         }
+        if seen.contains(&&o["lease_id"]) {
+            continue;
+        }
+        seen.push(&o["lease_id"]);
+        let mut t = format!(
+            "{ITEM}{}  {}{SEP}{}",
+            text(&o["lease_id"]),
+            unit_ref(&o["resource"], &o["unit"], style),
+            text(&o["state"])
+        );
+        if let Some(at) = o["ends_at"].as_i64() {
+            let _ = write!(t, "{SEP}ends {}", render::when(at, now));
+        }
+        let _ = write!(t, "{SEP}{}", render::holder(&o["holder"]));
+        if let Some(p) = some_text(&o["purpose"]) {
+            let _ = write!(t, "\n{}", render::wrap(&render::quoted(p), 2, width));
+        }
+        let also: Vec<String> = list
+            .iter()
+            .filter(|x| {
+                x["occupancy"]["lease_id"] == o["lease_id"]
+                    && (x["resource"] != o["resource"] || x["unit"] != o["unit"])
+            })
+            .map(|x| unit_ref(&x["resource"], &x["unit"], style))
+            .collect();
+        if !also.is_empty() {
+            let _ = write!(t, "\n  also blocks {} (same device)", also.join(", "));
+        }
+        out.push(t);
     }
-    table(&rows)
+    out.join("\n\n")
 }
 
 fn my_leases_text(v: &Value) -> String {
     let now = SystemClock.now_ms();
+    let style = Style::current();
+    let width = render::width();
     let leases = v["leases"].as_array().cloned().unwrap_or_default();
     let requests = v["requests"].as_array().cloned().unwrap_or_default();
     if leases.is_empty() && requests.is_empty() {
@@ -670,115 +837,253 @@ fn my_leases_text(v: &Value) -> String {
     let mut out = Vec::new();
     for l in &leases {
         let mut t = format!(
-            "lease {}: {}/{} ({})",
+            "{ITEM}{}  {}{SEP}{}",
             text(&l["lease_id"]),
-            text(&l["resource"]),
-            text(&l["unit"]),
+            unit_ref(&l["resource"], &l["unit"], style),
             text(&l["state"])
         );
         if let Some(at) = l["ends_at"].as_i64() {
-            let _ = write!(t, ", ends {}", relative(at, now));
+            let _ = write!(t, "{SEP}ends {}", render::when(at, now));
         }
         let _ = write!(t, "\n{}", brief_text(l));
         out.push(t);
     }
     for q in &requests {
-        out.push(format!(
-            "request {}: {} queued at position {} for \"{}\"",
+        let mut t = format!(
+            "{ITEM}{}  {}",
             text(&q["request_id"]),
-            text(&q["resource"]),
-            q["position"],
-            text(&q["purpose"])
-        ));
-    }
-    out.join("\n\n")
-}
-
-/// The brief of a grant or lease: both descriptions, the resource's tags,
-/// the unit's settings, the rendered usage and, when handed over dirty, why.
-pub fn brief_text(l: &Value) -> String {
-    let mut t = format!("  resource: {}", text(&l["resource_description"]));
-    let _ = write!(t, "\n  unit: {}", text(&l["unit_description"]));
-    let _ = write!(t, "\n  tags: {}", tags_text(&l["resource_tags"]));
-    let _ = write!(t, "\n  settings: {}", settings_text(&l["settings"]));
-    if let Some(usage) = l["usage"].as_str().filter(|u| !u.is_empty()) {
-        let _ = write!(t, "\n  usage:\n{usage}");
-    }
-    if let Some(reason) = l["dirty"]["reason"].as_str() {
-        let _ = write!(
-            t,
-            "\n  dirty: the last holder did not confirm cleanup ({reason}); expect a messy state"
+            style.id(&text(&q["resource"]))
         );
-    }
-    t
-}
-
-fn queue_text(v: &Value) -> String {
-    let mut out = Vec::new();
-    for r in v.as_array().into_iter().flatten() {
-        let mut t = format!("{} ({})", text(&r["resource"]), scope_text(&r["scope"]));
-        let entries = r["queue"].as_array().cloned().unwrap_or_default();
-        if entries.is_empty() {
-            t.push_str(": nobody waits");
+        if let Some(unit) = q["unit"].as_str() {
+            let _ = write!(t, "/{unit}");
         }
-        for q in &entries {
-            t.push('\n');
-            t.push_str(&queue_entry_text(q));
+        let _ = write!(t, "{SEP}queued at position {}", q["position"]);
+        if let Some(p) = some_text(&q["purpose"]) {
+            let _ = write!(t, "\n{}", render::wrap(&render::quoted(p), 2, width));
         }
         out.push(t);
     }
     out.join("\n\n")
 }
 
-fn log_text(v: &Value, now_ms: i64) -> String {
+/// The brief of a grant or lease, indented: both descriptions, the
+/// resource's tags, the unit's settings, the rendered usage and, when
+/// handed over dirty, why. Empty fields are left out.
+pub fn brief_text(l: &Value) -> String {
+    let style = Style::current();
+    let width = render::width();
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(d) = some_text(&l["resource_description"]) {
+        lines.push(render::wrap(d, 2, width));
+    }
+    if let Some(d) = some_text(&l["unit_description"]) {
+        lines.push(render::wrap(
+            &format!("{}: {d}", text(&l["unit"])),
+            2,
+            width,
+        ));
+    }
+    if l["resource_tags"].as_array().is_some_and(|t| !t.is_empty()) {
+        lines.push(format!(
+            "  tags: {}",
+            render::tags_of(&l["resource_tags"], style)
+        ));
+    }
+    lines.push(format!("  {}", settings_line(&l["settings"])));
+    if let Some(usage) = some_text(&l["usage"]) {
+        lines.push(format!("  usage:\n{}", render::indent(usage, 4)));
+    }
+    if let Some(reason) = l["dirty"]["reason"].as_str() {
+        lines.push(format!(
+            "  {}",
+            style.warn(&format!(
+                "dirty: {} ({reason}); expect a messy state",
+                dirty_explanation(reason)
+            ))
+        ));
+    }
+    lines.join("\n")
+}
+
+fn queue_text(v: &Value) -> String {
+    let style = Style::current();
+    let width = render::width();
+    let queues = v.as_array().cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for r in &queues {
+        let mut lines = Vec::new();
+        if queues.len() > 1 {
+            lines.push(format!(
+                "{}{SEP}{}:",
+                style.id(&text(&r["resource"])),
+                render::scope(&r["scope"])
+            ));
+        }
+        let entries = r["queue"].as_array().cloned().unwrap_or_default();
+        if entries.is_empty() {
+            lines.push(format!(
+                "Nobody waits for {}.",
+                style.id(&text(&r["resource"]))
+            ));
+        }
+        for q in &entries {
+            let mut t = format!(
+                "{ITEM}{}. {}{SEP}{}{SEP}{}",
+                q["position"],
+                text(&q["request_id"]),
+                render::holder(&q["holder"]),
+                text(&q["priority"])
+            );
+            if let Some(unit) = q["unit"].as_str() {
+                let _ = write!(t, "{SEP}unit {unit}");
+            }
+            if let Some(p) = some_text(&q["purpose"]) {
+                let _ = write!(t, "\n{}", render::wrap(&render::quoted(p), 2, width));
+            }
+            lines.push(t);
+        }
+        out.push(lines.join("\n"));
+    }
+    out.join("\n\n")
+}
+
+/// What an audit entry did, in a few words: the unit or resource, who did
+/// it (or to whom it went), the ids involved (shortened unless `wide`), the
+/// purpose and anything else it records.
+fn audit_what(e: &Value, wide: bool) -> String {
+    let style = Style::current();
+    let d = &e["detail"];
+    let mut head = String::new();
+    if let Some(r) = d["resource"].as_str() {
+        head.push_str(&style.id(r));
+        if let Some(u) = d["unit"].as_str() {
+            let _ = write!(head, "/{u}");
+        }
+    }
+    let actor = &e["actor"];
+    let by_clerk = actor["kind"] == "user" && actor["tag"] == "clerk";
+    if d["holder"].is_object() && e["action"] == "offered" {
+        let _ = write!(head, " → {}", render::holder(&d["holder"]));
+    } else if !by_clerk {
+        if !head.is_empty() {
+            head.push(' ');
+        }
+        let _ = write!(head, "by {}", render::holder(actor));
+    }
+    let mut parts = vec![head.trim().to_owned()];
+    if d["holder"].is_object() && e["action"] != "offered" {
+        parts.push(format!("holder {}", render::holder(&d["holder"])));
+    }
+    let consumed = ["resource", "unit", "holder", "purpose", "override_reason"];
+    if let Value::Object(map) = d {
+        for (key, value) in map {
+            if consumed.contains(&key.as_str()) || value.is_null() {
+                continue;
+            }
+            let shown = match value.as_str() {
+                Some(s) if ["lease", "request", "promotion", "offer"].contains(&key.as_str()) => {
+                    render::short_id(s, wide)
+                }
+                _ => match value {
+                    Value::Bool(true) => key.replace('_', " "),
+                    Value::Bool(false) => continue,
+                    // A holder, or a record with a reason (dirty): its
+                    // short form; any other structure is left to --json.
+                    Value::Object(o) if o.contains_key("kind") => {
+                        format!("{}: {}", key.replace('_', " "), render::holder(value))
+                    }
+                    Value::Object(o) => match o.get("reason").and_then(Value::as_str) {
+                        Some(reason) => format!("{}: {reason}", key.replace('_', " ")),
+                        None => continue,
+                    },
+                    other => format!("{}: {}", key.replace('_', " "), plain(other)),
+                },
+            };
+            parts.push(shown);
+        }
+    }
+    if let Some(p) = some_text(&d["purpose"]) {
+        parts.push(render::quoted(p));
+    }
+    if let Some(reason) = e["override_reason"]
+        .as_str()
+        .or_else(|| d["override_reason"].as_str())
+    {
+        parts.push(format!("override: {}", render::quoted(reason)));
+    }
+    parts.retain(|p| !p.is_empty());
+    parts.join(SEP)
+}
+
+fn log_text(v: &Value, now_ms: i64, wide: bool) -> String {
+    let width = render::width();
     let list = v.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         return "No log entries.".to_owned();
     }
-    let mut rows = vec![
-        ["WHEN", "ACTOR", "ACTION", "DETAIL"]
-            .map(str::to_owned)
-            .to_vec(),
-    ];
-    for e in &list {
-        let mut detail = e["detail"].to_string();
-        if let Some(reason) = e["override_reason"].as_str() {
-            detail = format!("override: \"{reason}\" {detail}");
-        }
-        rows.push(vec![
-            e["at"]
-                .as_i64()
-                .map_or_else(|| "-".to_owned(), |at| relative(at, now_ms)),
-            holder_text(&e["actor"]),
-            text(&e["action"]),
-            detail,
-        ]);
-    }
-    table(&rows)
+    let rows: Vec<(String, String, String)> = list
+        .iter()
+        .map(|e| {
+            (
+                e["at"]
+                    .as_i64()
+                    .map_or_else(|| "-".to_owned(), |at| render::when(at, now_ms)),
+                text(&e["action"]),
+                audit_what(e, wide),
+            )
+        })
+        .collect();
+    let w1 = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
+    let w2 = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(0);
+    let indent = ITEM.chars().count() + w1 + 2 + w2 + 2;
+    rows.iter()
+        .map(|(when, action, what)| {
+            let wrapped = render::wrap(what, indent, width);
+            format!("{ITEM}{when:<w1$}  {action:<w2$}  {}", wrapped.trim_start())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn promotions_text(v: &Value) -> String {
+    let style = Style::current();
+    let width = render::width();
     let list = v.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         return "No pending promotions.".to_owned();
     }
-    let mut rows = vec![
-        ["ID", "RESOURCE", "DESCRIPTION", "REQUESTER", "REASON"]
-            .map(str::to_owned)
-            .to_vec(),
-    ];
+    let mut out = Vec::new();
     for p in &list {
-        rows.push(vec![
+        let mut t = format!(
+            "{ITEM}{}  {}{SEP}{}",
             text(&p["id"]),
-            text(&p["resource"]),
-            text(&p["description"]),
-            text(&p["requester"]),
-            text(&p["reason"]),
-        ]);
+            style.id(&text(&p["resource"])),
+            render::scope(&p["scope"])
+        );
+        if let Some(d) = some_text(&p["description"]) {
+            let _ = write!(t, "\n{}", render::wrap(d, 2, width));
+        }
+        // The reason names the requester's project by its key; show it
+        // as the folder, like every project.
+        let mut reason = text(&p["reason"]);
+        if let Some(by) = p["requester"].as_str() {
+            reason = reason.replace(by, &render::project(&ProjectKey(by.into())));
+        }
+        let line = match p["requester"].as_str() {
+            Some(by) => format!(
+                "requested by {}: {reason}",
+                render::project(&ProjectKey(by.into()))
+            ),
+            None => reason,
+        };
+        let _ = write!(t, "\n{}", render::wrap(&line, 2, width));
+        out.push(t);
     }
-    let mut t = table(&rows);
-    t.push_str("Approve one with `clerk approve <id>`.");
-    t
+    let footer = match list.as_slice() {
+        [one] => format!("Approve with `clerk approve {}`.", text(&one["id"])),
+        _ => "Approve one with `clerk approve <id>`.".to_owned(),
+    };
+    format!("{}\n{footer}", out.join("\n\n"))
 }
 
 #[cfg(test)]
@@ -832,16 +1137,29 @@ mod tests {
     }
 
     #[test]
-    fn relative_reads_both_ways() {
-        assert_eq!(relative(70_000, 0), "in 1m 10s");
-        assert_eq!(relative(0, 5_000), "5s ago");
+    fn a_free_unit_with_a_failed_check_is_not_counted_free() {
+        let units = [
+            json!({"occupancy": {"kind": "free"}, "last_health": "unhealthy: connect failed"}),
+            json!({"occupancy": {"kind": "free"}, "last_health": "healthy"}),
+        ];
+        let style = Style {
+            color: false,
+            unicode: true,
+        };
+        assert_eq!(occupancy_bar(&units, style), "▮▯ 1/2 free ⚠");
     }
 
     #[test]
-    fn invisible_holder_reads_plainly() {
+    fn audit_entries_name_the_unit_and_actor() {
+        let e = json!({
+            "actor": {"kind": "user", "tag": "x"},
+            "action": "queued",
+            "detail": {"resource": "otbr", "request": "req_01M71FTC912KWSMGKC34CHWA9K",
+                       "purpose": "late", "unit": null}
+        });
         assert_eq!(
-            occupancy_text(&json!({"kind": "held_in_another_project"}), 0),
-            "held by an agent in another project"
+            audit_what(&e, false),
+            "otbr by cli · req_01M71FTC… · \"late\""
         );
     }
 }

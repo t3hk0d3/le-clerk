@@ -285,11 +285,11 @@ mod cli {
             fn prints_brief() {
                 let env = Env::new();
                 seed(&env);
-                let mut tty = Tty::spawn(&env, ACQUIRE);
+                let mut tty = Tty::spawn_with(&env, ACQUIRE, &[("NO_COLOR", "1")]);
                 tty.expect("Flash with key k1");
                 tty.send(CTRL_C);
                 let (_, shown) = tty.finish();
-                for part in ["A test board", "The left one", "esp32, thread"] {
+                for part in ["A test board", "u1: The left one", "tags: esp32 thread"] {
                     assert!(shown.contains(part), "{part}: {shown}");
                 }
             }
@@ -436,14 +436,18 @@ mod cli {
                 let env = Env::new();
                 seed(&env);
                 let lease = detached_lease(&env);
-                let mut tty = Tty::spawn(&env, &format!("\"$CLERK\" attach {lease}"));
+                let mut tty = Tty::spawn_with(
+                    &env,
+                    &format!("\"$CLERK\" attach {lease}"),
+                    &[("NO_COLOR", "1")],
+                );
                 tty.expect("Flash with key k1");
                 override_board(&env);
                 tty.expect("overridden");
                 tty.send(CTRL_C);
                 let (code, shown) = tty.finish();
                 assert_eq!(code, 130, "{shown}");
-                for part in ["A test board", "The left one", "esp32, thread"] {
+                for part in ["A test board", "u1: The left one", "tags: esp32 thread"] {
                     assert!(shown.contains(part), "{part}: {shown}");
                 }
             }

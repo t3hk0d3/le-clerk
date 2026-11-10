@@ -25,6 +25,7 @@ use ulid::Ulid;
 
 use super::lease;
 use super::output::{EXIT_INTERRUPTED, Exit, Mode};
+use super::render::{self, Style};
 
 /// Ctrl+C: cancel the request, or release the lease.
 const CTRL_C: u8 = 0x03;
@@ -85,7 +86,7 @@ impl Screen {
     pub fn say(&self, value: &Value, text: &str) {
         let line = match self.mode {
             Mode::Json => value.to_string(),
-            Mode::Human => text.trim_end_matches('\n').to_owned(),
+            Mode::Human => render::finish(text.trim_end_matches('\n'), Style::current()),
         };
         let line = if self.crlf {
             line.replace('\n', "\r\n") + "\r\n"
@@ -106,7 +107,7 @@ impl Screen {
 
     /// The keys that work while a lease is held.
     pub fn hint_held(&self) {
-        self.hint("Ctrl+C releases the lease; Ctrl+] detaches and keeps it.");
+        self.hint("Ctrl+C releases · Ctrl+] detaches");
     }
 
     /// Print a notice.

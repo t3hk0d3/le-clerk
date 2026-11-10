@@ -1479,7 +1479,12 @@ mod cli {
             #[test]
             fn json_has_no_details_key() {
                 let env = Env::new();
-                let error = error_of(env.cmd().args(["resource", "show", "ghost"]), 3);
+                seed(&env, "board", "k1");
+                let error = error_of(
+                    env.cmd()
+                        .args(["resource", "create", "board", "--type", "generic"]),
+                    4,
+                );
                 assert!(error.get("details").is_none(), "{error}");
             }
         }
@@ -1500,7 +1505,7 @@ mod cli {
         }
 
         #[test]
-        fn human_truncates_descriptions_to_the_terminal_width() {
+        fn human_wraps_descriptions_to_the_terminal_width() {
             let env = Env::new();
             let long = format!("Board {}", "x".repeat(150));
             env.ok(&[
@@ -1513,8 +1518,7 @@ mod cli {
                 &long,
             ]);
             let shown = env.tty("stty cols 60 rows 20; \"$CLERK\" status");
-            assert!(!shown.contains(&long), "{shown}");
-            assert!(shown.contains("Board xxx"), "{shown}");
+            assert_eq!(shown.matches('x').count(), 150, "{shown}");
             for line in shown.lines() {
                 assert!(line.chars().count() <= 60, "{line:?} in {shown}");
             }
@@ -1537,11 +1541,11 @@ mod cli {
                 );
                 acquire(&env, &agent_caller("sess-a", &a), "a-board");
                 let shown = env.tty(&format!(
-                    "cd '{}' && {SESSION_VAR}=sess-b \"$CLERK\" status",
+                    "cd '{}' && {SESSION_VAR}=sess-b NO_COLOR=1 \"$CLERK\" status",
                     b.display()
                 ));
                 assert!(
-                    shown.contains("held by an agent in another project"),
+                    shown.contains("held by agent in another project"),
                     "{shown}"
                 );
             }
@@ -1585,8 +1589,8 @@ mod cli {
         fn human_list_shows_tags() {
             let env = Env::new();
             seed(&env, "board", "k1");
-            let shown = env.tty("\"$CLERK\" resources --tag esp32");
-            assert!(shown.contains("esp32, thread"), "{shown}");
+            let shown = env.tty("NO_COLOR=1 \"$CLERK\" resources --tag esp32");
+            assert!(shown.contains("tags: esp32 thread"), "{shown}");
         }
 
         mod on_agent_session {
@@ -1963,8 +1967,7 @@ mod cli {
                     "The alpha devkit",
                 ]));
                 let shown = env.tty("\"$CLERK\" promotions");
-                assert!(shown.contains("DESCRIPTION"), "{shown}");
-                assert!(shown.contains("The alpha devkit"), "{shown}");
+                assert!(shown.contains("\n  The alpha devkit\n"), "{shown}");
             }
         }
 
@@ -2322,7 +2325,7 @@ mod cli {
                         .as_str()
                         .unwrap()
                         .to_owned();
-                    assert!(shown.contains(&format!("request {request}")), "{shown}");
+                    assert!(shown.contains(&request), "{shown}");
                     assert!(shown.contains("clerk attach"), "{shown}");
                     assert!(
                         shown.contains(&format!("clerk cancel {request}")),
@@ -3324,6 +3327,726 @@ mod cli {
                 let body = env.ok(&["wait", "--once"]);
                 let kinds = strings(&body, "kind");
                 assert!(kinds.contains(&"offered".to_owned()), "{body}");
+            }
+        }
+    }
+
+    /// Human output on a terminal, against `docs/cli-output.md`.
+    mod human_output {
+        use super::*;
+
+        use crossterm::style::Stylize;
+
+        /// A 100-column UTF-8 terminal without colour.
+        const PLAIN: &str = "stty cols 100 rows 40; export NO_COLOR=1 LC_ALL=C.UTF-8;";
+        /// A 100-column UTF-8 terminal with colour.
+        const COLOURED: &str = "stty cols 100 rows 40; unset NO_COLOR; export LC_ALL=C.UTF-8;";
+        /// A long device path, longer than a narrow terminal.
+        const LONG_PATH: &str =
+            "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_F0:F5:BD:01:02:03-if00";
+
+        /// `clerk <args>` on a plain terminal (stdin a terminal too).
+        fn human(env: &Env, args: &str) -> String {
+            env.tty(&format!("{PLAIN} \"$CLERK\" {args}"))
+        }
+
+        /// `clerk <args>` on a plain terminal, stdin not a terminal.
+        fn human_detached(env: &Env, args: &str) -> String {
+            env.tty(&format!("{PLAIN} \"$CLERK\" {args} < /dev/null"))
+        }
+
+        /// A local TCP port nothing listens on.
+        fn closed_port() -> u16 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        }
+
+        /// esp32-c6 (generic: b1 described, b2 not; tags; usage) and otbr (a
+        /// service on a closed port).
+        fn bench(env: &Env) {
+            env.ok(&[
+                "resource",
+                "create",
+                "esp32-c6",
+                "--type",
+                "generic",
+                "--description",
+                "ESP32-C6 devkits on the bench hub",
+                "--tag",
+                "devboard,esp32",
+                "--usage",
+                "Flash with key {unit.identity_key}",
+            ]);
+            env.ok(&[
+                "unit",
+                "add",
+                "esp32-c6",
+                "b1",
+                "--key",
+                "k1",
+                "--description",
+                "hub port 1",
+            ]);
+            env.ok(&["unit", "add", "esp32-c6", "b2", "--key", "k2"]);
+            env.ok(&[
+                "resource",
+                "create",
+                "otbr",
+                "--type",
+                "service",
+                "--description",
+                "Thread border router REST API",
+                "--tag",
+                "otbr,thread",
+            ]);
+            let port = closed_port().to_string();
+            env.ok(&[
+                "unit",
+                "add",
+                "otbr",
+                "main",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port,
+            ]);
+        }
+
+        /// A detached user lease on `target` for `purpose`; its id.
+        fn hold_for(env: &Env, target: &str, duration: &str, purpose: &str) -> String {
+            env.ok(&["acquire", target, "--for", duration, "--purpose", purpose])["lease_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        /// A detached user request on `target` that queues (exit 6); its
+        /// JSON answer.
+        fn queue_on(env: &Env, target: &str) -> Value {
+            let out = env
+                .cmd()
+                .args(["acquire", target, "--for", "10m"])
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(6), "{out:?}");
+            serde_json::from_slice(&out.stdout).unwrap()
+        }
+
+        /// The probe: a device resource whose unit has a long path.
+        fn probe(env: &Env) {
+            env.ok(&["resource", "create", "probe", "--type", "device"]);
+            env.ok(&["unit", "add", "probe", "p1", "--path", LONG_PATH]);
+        }
+
+        /// The prefix of the escape sequence crossterm writes for `styled`
+        /// (a style applied to "X").
+        fn prefix(styled: &str) -> String {
+            styled.split('X').next().unwrap().to_owned()
+        }
+
+        /// Every `ESC [ ... m` sequence in `text`.
+        fn escapes(text: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut rest = text;
+            while let Some(start) = rest.find('\x1b') {
+                let tail = &rest[start..];
+                let end = tail.find('m').map_or(tail.len(), |e| e + 1);
+                out.push(tail[..end].to_owned());
+                rest = &tail[end..];
+            }
+            out
+        }
+
+        mod any_list_or_detail_view {
+            use super::*;
+
+            #[test]
+            fn never_shortens_lease_ids() {
+                let env = Env::new();
+                bench(&env);
+                let lease = hold_for(&env, "esp32-c6/b1", "30m", "third");
+                let shown = env.tty(
+                    "stty cols 40 rows 20; export NO_COLOR=1 LC_ALL=C.UTF-8; \
+                     \"$CLERK\" leases; \"$CLERK\" status",
+                );
+                assert_eq!(shown.matches(&lease).count(), 2, "{shown}");
+            }
+
+            #[test]
+            fn never_shortens_settings() {
+                let env = Env::new();
+                probe(&env);
+                let shown = env.tty(
+                    "stty cols 40 rows 20; export NO_COLOR=1 LC_ALL=C.UTF-8; \
+                     \"$CLERK\" resource show probe",
+                );
+                assert!(shown.contains(LONG_PATH), "{shown}");
+            }
+
+            #[test]
+            fn wraps_free_text_instead_of_truncating() {
+                let env = Env::new();
+                let words: Vec<String> = (0..30).map(|i| format!("word{i}")).collect();
+                env.ok(&[
+                    "resource",
+                    "create",
+                    "board",
+                    "--type",
+                    "generic",
+                    "--description",
+                    &words.join(" "),
+                ]);
+                let shown = env.tty(
+                    "stty cols 60 rows 20; export NO_COLOR=1 LC_ALL=C.UTF-8; \"$CLERK\" status",
+                );
+                for word in &words {
+                    assert!(
+                        shown.contains(&format!("{word} ")) || shown.contains(&format!("{word}\n")),
+                        "{word}: {shown}"
+                    );
+                }
+                for line in shown.lines() {
+                    assert!(line.chars().count() <= 60, "{line:?} in {shown}");
+                }
+            }
+
+            #[test]
+            fn shows_projects_as_the_repo_folder_with_tilde_for_home() {
+                let env = Env::new();
+                let dir = env.dir("zigbee-fw");
+                let git = std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap();
+                assert!(git.success());
+                json_of(env.cmd().current_dir(&dir).args([
+                    "resource", "create", "nrf52", "--type", "generic", "--scope", "project",
+                ]));
+                let home = env.home().canonicalize().unwrap();
+                let shown = env.tty(&format!(
+                    "{PLAIN} export HOME='{}'; \"$CLERK\" resources",
+                    home.display()
+                ));
+                assert!(
+                    shown.contains("• nrf52 0/0 free · generic · project ~/projects/zigbee-fw\n"),
+                    "{shown}"
+                );
+            }
+
+            #[test]
+            fn never_shows_the_git_directory() {
+                let env = Env::new();
+                let dir = env.dir("zigbee-fw");
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap();
+                json_of(env.cmd().current_dir(&dir).args([
+                    "resource", "create", "nrf52", "--type", "generic", "--scope", "project",
+                ]));
+                let shown = human(&env, "resources; \"$CLERK\" status");
+                assert!(!shown.contains(".git"), "{shown}");
+            }
+
+            #[test]
+            fn shows_a_user_lease_holder_as_cli() {
+                let env = Env::new();
+                bench(&env);
+                let lease = hold_for(&env, "esp32-c6/b1", "30m", "third");
+                let shown = human(&env, "leases");
+                let line = shown.lines().find(|l| l.contains(&lease)).unwrap();
+                assert!(line.ends_with(" · cli"), "{shown}");
+            }
+
+            #[test]
+            fn shows_an_agent_holder_by_its_first_8_characters() {
+                let env = Env::new();
+                bench(&env);
+                let dir = env.dir("alpha");
+                acquire(&env, &agent_caller("3f2a9c1e-77aa-4c1b", &dir), "esp32-c6");
+                let shown = human(&env, "leases");
+                assert!(shown.contains(" · agent 3f2a9c1e\n"), "{shown}");
+            }
+
+            #[test]
+            fn omits_the_unit_line_without_a_unit_description() {
+                let env = Env::new();
+                bench(&env);
+                let shown = human_detached(&env, "acquire esp32-c6/b2 --for 10m");
+                assert!(shown.contains("Granted: esp32-c6/b2 until "), "{shown}");
+                assert!(!shown.contains("b2:"), "{shown}");
+                assert!(!shown.contains("unit:"), "{shown}");
+            }
+
+            #[test]
+            fn omits_the_tags_line_without_tags() {
+                let env = Env::new();
+                probe(&env);
+                let shown = human(&env, "resource show probe");
+                assert!(!shown.contains("tags"), "{shown}");
+            }
+        }
+
+        mod style {
+            use super::*;
+
+            mod on_a_tty_without_no_color {
+                use super::*;
+
+                fn coloured_status(env: &Env) -> String {
+                    bench(env);
+                    queue_on(env, "otbr");
+                    env.tty(&format!("{COLOURED} \"$CLERK\" status"))
+                }
+
+                #[test]
+                fn tags_are_bold_cyan() {
+                    let env = Env::new();
+                    let shown = coloured_status(&env);
+                    let style = prefix(&format!("{}", "X".cyan().bold()));
+                    assert!(shown.contains(&format!("{style}esp32")), "{shown:?}");
+                }
+
+                #[test]
+                fn resource_ids_are_bold() {
+                    let env = Env::new();
+                    let shown = coloured_status(&env);
+                    let style = prefix(&format!("{}", "X".bold()));
+                    assert!(shown.contains(&format!("{style}esp32-c6")), "{shown:?}");
+                }
+
+                #[test]
+                fn warning_lines_are_yellow() {
+                    let env = Env::new();
+                    let shown = coloured_status(&env);
+                    let style = prefix(&format!("{}", "X".yellow()));
+                    assert!(shown.contains(&format!("{style}⚠ unhealthy")), "{shown:?}");
+                }
+
+                #[test]
+                fn nothing_else_is_coloured() {
+                    let env = Env::new();
+                    let shown = coloured_status(&env);
+                    let allowed = [
+                        prefix(&format!("{}", "X".cyan().bold())),
+                        prefix(&format!("{}", "X".bold())),
+                        prefix(&format!("{}", "X".yellow())),
+                    ];
+                    let resets: Vec<String> = [
+                        format!("{}", "X".cyan().bold()),
+                        format!("{}", "X".bold()),
+                        format!("{}", "X".yellow()),
+                    ]
+                    .iter()
+                    .map(|s| s.split('X').nth(1).unwrap().to_owned())
+                    .collect();
+                    let known: Vec<String> = escapes(&allowed.concat())
+                        .into_iter()
+                        .chain(escapes(&resets.concat()))
+                        .collect();
+                    for e in escapes(&shown) {
+                        assert!(known.contains(&e), "{e:?} in {shown:?}");
+                    }
+                }
+            }
+
+            mod on_no_color {
+                use super::*;
+
+                #[test]
+                fn prints_no_escape_sequences() {
+                    let env = Env::new();
+                    bench(&env);
+                    queue_on(&env, "otbr");
+                    let shown = human(&env, "status");
+                    assert!(!shown.contains('\x1b'), "{shown:?}");
+                }
+            }
+
+            mod on_ascii_flag {
+                use super::*;
+
+                #[test]
+                fn prints_only_ascii() {
+                    let env = Env::new();
+                    bench(&env);
+                    hold_for(&env, "esp32-c6/b1", "30m", "third");
+                    queue_on(&env, "otbr");
+                    let shown = human(&env, "--ascii status");
+                    assert!(shown.contains("* esp32-c6 #. 1/2 free"), "{shown}");
+                    assert!(shown.is_ascii(), "{shown}");
+                }
+            }
+
+            mod on_a_non_utf8_locale {
+                use super::*;
+
+                #[test]
+                fn prints_only_ascii() {
+                    let env = Env::new();
+                    bench(&env);
+                    queue_on(&env, "otbr");
+                    let shown = env.tty(
+                        "stty cols 100 rows 40; export NO_COLOR=1 LC_ALL=C; \"$CLERK\" status",
+                    );
+                    assert!(shown.contains("  - main . ! unhealthy"), "{shown}");
+                    assert!(shown.is_ascii(), "{shown}");
+                }
+            }
+        }
+
+        mod resources {
+            use super::*;
+
+            #[test]
+            fn shows_one_block_per_resource_with_its_occupancy_bar() {
+                let env = Env::new();
+                bench(&env);
+                hold_for(&env, "esp32-c6/b1", "30m", "third");
+                queue_on(&env, "otbr");
+                let shown = human(&env, "resources");
+                assert!(
+                    shown.contains(
+                        "• esp32-c6 ▮▯ 1/2 free · generic · user\n  \
+                         ESP32-C6 devkits on the bench hub\n  tags: devboard esp32\n\n• otbr"
+                    ),
+                    "{shown}"
+                );
+                assert!(
+                    shown.contains(
+                        "• otbr ▯ 0/1 free ⚠ · service · user\n  \
+                         Thread border router REST API\n  tags: otbr thread\n"
+                    ),
+                    "{shown}"
+                );
+            }
+        }
+
+        mod status {
+            use super::*;
+
+            fn shown(env: &Env) -> (String, String, String) {
+                bench(env);
+                let lease = hold_for(env, "esp32-c6/b1", "30m", "third");
+                let request = queue_on(env, "otbr")["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                (human(env, "status"), lease, request)
+            }
+
+            #[test]
+            fn shows_the_header_with_the_bar_and_tags() {
+                let env = Env::new();
+                let (shown, ..) = shown(&env);
+                assert!(
+                    shown.contains(
+                        "• esp32-c6 ▮▯ 1/2 free · generic · user · devboard esp32\n  \
+                         ESP32-C6 devkits on the bench hub\n"
+                    ),
+                    "{shown}"
+                );
+            }
+
+            #[test]
+            fn shows_each_unit_with_its_holder_and_lease() {
+                let env = Env::new();
+                let (shown, lease, _) = shown(&env);
+                let line = shown
+                    .lines()
+                    .find(|l| l.starts_with("  ◦ b1 ▯ held by cli · ends in "))
+                    .unwrap_or_else(|| panic!("{shown}"));
+                assert!(line.ends_with(&format!(" · {lease}")), "{shown}");
+                assert!(
+                    shown.contains("\n      hub port 1 · \"third\"\n"),
+                    "{shown}"
+                );
+                assert!(shown.contains("\n  ◦ b2 ▮ free\n"), "{shown}");
+            }
+
+            #[test]
+            fn shows_an_unhealthy_unit_with_its_check_message() {
+                let env = Env::new();
+                let (shown, ..) = shown(&env);
+                assert!(
+                    shown.contains("\n  ◦ main ▯ ⚠ unhealthy: connect failed (checked "),
+                    "{shown}"
+                );
+                assert!(
+                    shown.contains("• otbr ▯ 0/1 free ⚠ · service · user"),
+                    "{shown}"
+                );
+            }
+
+            #[test]
+            fn shows_the_queue_under_its_resource() {
+                let env = Env::new();
+                let (shown, _, request) = shown(&env);
+                assert!(
+                    shown.contains(&format!(
+                        "\n  queue:\n  ◦ 1. cli · normal · \"held from the command line\" · \
+                         {request}\n"
+                    )),
+                    "{shown}"
+                );
+            }
+        }
+
+        mod leases {
+            use super::*;
+
+            #[test]
+            fn shows_one_block_per_lease_with_its_purpose() {
+                let env = Env::new();
+                bench(&env);
+                let lease = hold_for(&env, "esp32-c6/b1", "30m", "third");
+                let shown = human(&env, "leases");
+                let header = format!("• {lease}  esp32-c6/b1 · held · ends in ");
+                assert!(shown.contains(&header), "{shown}");
+                assert!(shown.contains(" · cli\n  \"third\""), "{shown}");
+            }
+        }
+
+        mod queue {
+            use super::*;
+
+            #[test]
+            fn shows_one_block_per_request() {
+                let env = Env::new();
+                bench(&env);
+                let request = queue_on(&env, "otbr")["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let shown = human(&env, "queue otbr");
+                assert!(
+                    shown.contains(&format!(
+                        "• 1. {request} · cli · normal\n  \"held from the command line\""
+                    )),
+                    "{shown}"
+                );
+            }
+        }
+
+        mod resource_show {
+            use super::*;
+
+            #[test]
+            fn matches_the_mock_up() {
+                let env = Env::new();
+                bench(&env);
+                let shown = human(&env, "resource show esp32-c6");
+                let expected = "esp32-c6  generic · user\n  \
+                                ESP32-C6 devkits on the bench hub\n  \
+                                tags:   devboard esp32\n  \
+                                health: type default (none)\n  \
+                                units:\n  \
+                                ◦ b1  key k1\n        \
+                                hub port 1\n  \
+                                ◦ b2  key k2\n  \
+                                usage (template):\n    \
+                                Flash with key {unit.identity_key}\n";
+                assert!(shown.contains(expected), "{shown}");
+            }
+        }
+
+        mod grant {
+            use super::*;
+
+            #[test]
+            fn shows_the_brief_with_usage_indented_under_its_label() {
+                let env = Env::new();
+                bench(&env);
+                let shown = human_detached(&env, "acquire esp32-c6/b1 --for 2h");
+                let header = shown
+                    .lines()
+                    .find(|l| l.starts_with("Granted: esp32-c6/b1 until "))
+                    .unwrap_or_else(|| panic!("{shown}"));
+                assert!(header.contains(" (in 2h) · lse_"), "{shown}");
+                assert!(
+                    shown.contains(
+                        "\n  ESP32-C6 devkits on the bench hub\n  b1: hub port 1\n  \
+                         tags: devboard esp32\n  key: k1\n  usage:\n    Flash with key k1\n"
+                    ),
+                    "{shown}"
+                );
+            }
+        }
+
+        mod queued_acquire {
+            use super::*;
+
+            mod on_every_free_unit_unhealthy {
+                use super::*;
+
+                #[test]
+                fn names_the_units_and_their_check_message_and_the_recheck() {
+                    let env = Env::new();
+                    bench(&env);
+                    let shown = human_detached(&env, "acquire otbr --for 10m");
+                    assert!(
+                        shown.contains("Queued: position 1 on otbr · req_"),
+                        "{shown}"
+                    );
+                    assert!(
+                        shown.contains(
+                            "\n  main is free but ⚠ unhealthy (connect failed); it is \
+                             re-checked every 30s.\n"
+                        ),
+                        "{shown}"
+                    );
+                }
+
+                #[test]
+                fn json_carries_blocked_by() {
+                    let env = Env::new();
+                    bench(&env);
+                    let body = queue_on(&env, "otbr");
+                    let blocked = &body["blocked_by"];
+                    assert_eq!(blocked["kind"], "unhealthy", "{body}");
+                    assert_eq!(blocked["units"][0]["unit"], "main", "{body}");
+                    assert_eq!(blocked["units"][0]["message"], "connect failed", "{body}");
+                }
+            }
+
+            mod on_units_held {
+                use super::*;
+
+                #[test]
+                fn names_the_holder_and_purpose_of_the_one_ending_first() {
+                    let env = Env::new();
+                    bench(&env);
+                    hold_for(&env, "esp32-c6/b1", "30m", "third");
+                    hold_for(&env, "esp32-c6/b2", "10m", "fourth");
+                    let shown = human_detached(&env, "acquire esp32-c6 --for 10m");
+                    assert!(
+                        shown.contains("\n  b2 is held by cli for \"fourth\", ends in "),
+                        "{shown}"
+                    );
+                    assert!(!shown.contains("third"), "{shown}");
+                }
+
+                #[test]
+                fn json_carries_blocked_by() {
+                    let env = Env::new();
+                    bench(&env);
+                    hold_for(&env, "esp32-c6/b1", "30m", "third");
+                    hold_for(&env, "esp32-c6/b2", "10m", "fourth");
+                    let body = queue_on(&env, "esp32-c6");
+                    let blocked = &body["blocked_by"];
+                    assert_eq!(blocked["kind"], "held", "{body}");
+                    assert_eq!(blocked["unit"], "b2", "{body}");
+                    assert_eq!(blocked["purpose"], "fourth", "{body}");
+                }
+            }
+        }
+
+        mod log {
+            use super::*;
+
+            #[test]
+            fn shortens_ids_in_the_action_column() {
+                let env = Env::new();
+                bench(&env);
+                let request = queue_on(&env, "otbr")["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let shown = human(&env, "log");
+                let line = shown
+                    .lines()
+                    .find(|l| l.contains(" queued "))
+                    .unwrap_or_else(|| panic!("{shown}"));
+                assert!(line.starts_with("• "), "{shown}");
+                assert!(line.contains("otbr by cli"), "{shown}");
+                assert!(line.contains(&format!("{}…", &request[..12])), "{shown}");
+                assert!(!shown.contains(&request), "{shown}");
+            }
+
+            #[test]
+            fn wide_shows_ids_whole() {
+                let env = Env::new();
+                bench(&env);
+                let request = queue_on(&env, "otbr")["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let shown = human(&env, "log --wide");
+                assert!(shown.contains(&request), "{shown}");
+            }
+        }
+
+        mod promotions {
+            use super::*;
+
+            #[test]
+            fn shows_one_block_per_promotion() {
+                let env = Env::new();
+                let id = promotion(&env);
+                let home = env.home().canonicalize().unwrap();
+                let shown = env.tty(&format!(
+                    "{PLAIN} export HOME='{}'; \"$CLERK\" promotions",
+                    home.display()
+                ));
+                assert!(
+                    shown.contains(&format!("• {id}  a-board · project ~/projects/alpha\n")),
+                    "{shown}"
+                );
+                assert!(
+                    shown.contains(&format!("Approve with `clerk approve {id}`.")),
+                    "{shown}"
+                );
+            }
+        }
+
+        mod errors {
+            use super::*;
+
+            mod on_not_found {
+                use super::*;
+
+                #[test]
+                fn human_names_the_missing_kind_and_id() {
+                    let env = Env::new();
+                    bench(&env);
+                    let shown = human(&env, "resource show nope");
+                    assert!(shown.contains("not found: resource \"nope\""), "{shown}");
+                }
+
+                #[test]
+                fn json_details_name_a_missing_resource() {
+                    let env = Env::new();
+                    bench(&env);
+                    let error = error_of(env.cmd().args(["resource", "show", "nope"]), 3);
+                    assert_eq!(error["details"], json!({"kind": "resource", "id": "nope"}));
+                }
+
+                #[test]
+                fn json_details_name_a_missing_unit() {
+                    let env = Env::new();
+                    bench(&env);
+                    let error =
+                        error_of(env.cmd().args(["acquire", "esp32-c6/zz", "--for", "1m"]), 3);
+                    assert_eq!(
+                        error["details"],
+                        json!({"kind": "unit", "id": "esp32-c6/zz"})
+                    );
+                }
+            }
+
+            mod on_a_clap_usage_error_in_json_mode {
+                use super::*;
+
+                #[test]
+                fn message_carries_no_help_tail() {
+                    let env = Env::new();
+                    let error = error_of(env.cmd().args(["status", "--bogus"]), 2);
+                    let message = error["message"].as_str().unwrap();
+                    assert!(!message.contains("--help"), "{message}");
+                    assert!(!message.contains("For more information"), "{message}");
+                }
             }
         }
     }

@@ -35,7 +35,8 @@ use ulid::Ulid;
 use super::caller::{self, CallerKind};
 use super::live::{self, Phase, RawMode, Screen};
 use super::output::{EXIT_INTERRUPTED, EXIT_QUEUED, Exit, View};
-use super::views::{brief_text, relative, text};
+use super::render::{self, SEP, Style};
+use super::views::{brief_text, text};
 use super::{Ctx, UsageError};
 
 /// Seconds one notice long-poll waits.
@@ -210,9 +211,9 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
         let _raw = RawMode::enable()?;
         let screen = Screen::new(ctx.out.mode());
         let outcome = client.call("acquire", &caller, body).await?;
-        screen.say(&outcome, &outcome_text(&outcome));
+        screen.say(&outcome, &outcome_text(&outcome, &args.target));
         let phase = if outcome["outcome"] == "queued" {
-            screen.hint("Ctrl+C cancels the request.");
+            screen.hint("Ctrl+C cancels.");
             Phase::Queued {
                 request: id(&outcome, "request_id")?,
             }
@@ -229,18 +230,19 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
         // Granted at once to `--wait`'s process holder: hand the lease to
         // a user holder before this process exits, or liveness ends it.
         detach_from_process(&client, &caller, outcome.clone()).await?;
-        return ctx.out.emit(&View::new(outcome, outcome_text));
+        return ctx.out.emit(&View::new(outcome, granted_text));
     }
     if !args.wait {
         let mut outcome = outcome;
         outcome["next"] = Value::String(queued_next(&outcome));
-        ctx.out.emit(&View::new(outcome, |v| {
-            format!("{}\n{}", outcome_text(v), text(&v["next"]))
+        let shown = args.target.clone();
+        ctx.out.emit(&View::new(outcome, move |v| {
+            format!("{}\n{}", outcome_text(v, &shown), text(&v["next"]))
         }))?;
         return Err(Exit(EXIT_QUEUED).into());
     }
     let request = id(&outcome, "request_id")?;
-    note(&outcome_text(&outcome));
+    note(&outcome_text(&outcome, &args.target));
     let lease = await_offer(ctx, &client, &caller, &request).await?;
     let lease = detach_from_process(&client, &caller, lease).await?;
     ctx.out.emit(&View::new(lease, granted_text))
@@ -364,9 +366,10 @@ pub async fn extend(ctx: &Ctx, args: ExtendArgs) -> anyhow::Result<()> {
         )
         .await?;
     ctx.out.emit(&View::new(view, |v| {
-        let ends = v["ends_at"]
-            .as_i64()
-            .map_or_else(|| "-".to_owned(), |at| relative(at, SystemClock.now_ms()));
+        let ends = v["ends_at"].as_i64().map_or_else(
+            || "-".to_owned(),
+            |at| render::when(at, SystemClock.now_ms()),
+        );
         format!("Extended: lease {} now ends {ends}.", text(&v["lease_id"]))
     }))
 }
@@ -382,7 +385,7 @@ pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
     let lease = match outcome["outcome"].as_str() {
         Some("granted") => outcome,
         Some("queued") => {
-            note(&outcome_text(&outcome));
+            note(&outcome_text(&outcome, &args.target));
             await_offer(ctx, &client, &caller, &id(&outcome, "request_id")?).await?
         }
         _ => anyhow::bail!("the daemon answered the acquire with {outcome}"),
@@ -915,25 +918,31 @@ fn id(v: &Value, key: &str) -> anyhow::Result<String> {
 
 /// A line on stderr, for progress that is not the command's output.
 fn note(text: &str) {
-    eprintln!("{text}");
+    eprintln!("{}", render::finish(text, Style::current()));
 }
 
 // ---------------------------------------------------------------------------
 // Human rendering
 // ---------------------------------------------------------------------------
 
-/// An acquire answer: the grant with its brief, or the queue position.
-fn outcome_text(v: &Value) -> String {
+/// An acquire answer on `target`: the grant with its brief, or the queue
+/// position and what blocks the request.
+fn outcome_text(v: &Value, target: &str) -> String {
     match v["outcome"].as_str() {
         Some("queued") => {
+            let style = Style::current();
             let mut t = format!(
-                "Queued: you are at position {} for this unit (request {}).",
+                "Queued: position {} on {}{SEP}{}",
                 v["position"],
+                style.id(target),
                 text(&v["request_id"])
             );
+            if let Some(line) = blocked_text(&v["blocked_by"], style) {
+                let _ = write!(t, "\n  {line}");
+            }
             if let Some(ms) = v["estimated_wait_ms"].as_i64() {
                 let now = SystemClock.now_ms();
-                let _ = write!(t, " Expected turn: {}.", relative(now + ms, now));
+                let _ = write!(t, "\n  Expected turn: {}.", render::when(now + ms, now));
             }
             t
         }
@@ -945,18 +954,95 @@ fn outcome_text(v: &Value) -> String {
     }
 }
 
+/// What keeps a queued request from a unit, in one sentence.
+fn blocked_text(b: &Value, style: Style) -> Option<String> {
+    let now = SystemClock.now_ms();
+    let ends = |b: &Value| {
+        b["ends_at"]
+            .as_i64()
+            .map(|at| format!(", ends {}", render::when(at, now)))
+            .unwrap_or_default()
+    };
+    let purpose = |b: &Value| {
+        b["purpose"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(|p| format!(" for {}", render::quoted(p)))
+            .unwrap_or_default()
+    };
+    match b["kind"].as_str()? {
+        "unhealthy" => {
+            let units: Vec<&Value> = b["units"].as_array()?.iter().collect();
+            let recheck = render::span(b["recheck_ms"].as_u64().unwrap_or(30_000) / 1000);
+            let names: Vec<String> = units.iter().map(|u| text(&u["unit"])).collect();
+            Some(match units.as_slice() {
+                [one] => format!(
+                    "{} is free but {}; it is re-checked every {recheck}.",
+                    names.join(", "),
+                    style.warn(&format!("unhealthy ({})", text(&one["message"])))
+                ),
+                _ => format!(
+                    "{} are free but {}; they are re-checked every {recheck}.",
+                    names.join(", "),
+                    style.warn(&format!(
+                        "unhealthy ({})",
+                        units
+                            .iter()
+                            .map(|u| format!("{}: {}", text(&u["unit"]), text(&u["message"])))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ))
+                ),
+            })
+        }
+        "held" => Some(format!(
+            "{} is held by {}{}{}.",
+            text(&b["unit"]),
+            render::holder(&b["holder"]),
+            purpose(b),
+            ends(b)
+        )),
+        "linked" => Some(match b["held_resource"].as_str() {
+            Some(r) => format!(
+                "{} is busy: the same device is held as {}/{} by {}{}{}.",
+                text(&b["unit"]),
+                style.id(r),
+                text(&b["held_unit"]),
+                render::holder(&b["holder"]),
+                purpose(b),
+                ends(b)
+            ),
+            None => format!(
+                "{} is busy: the same device is held in another project{}.",
+                text(&b["unit"]),
+                ends(b)
+            ),
+        }),
+        "queue" => Some(match b["ahead"].as_u64()? {
+            1 => "1 earlier request waits for the same units.".to_owned(),
+            n => format!("{n} earlier requests wait for the same units."),
+        }),
+        _ => None,
+    }
+}
+
 /// A grant or held lease, with its brief.
 pub fn granted_text(v: &Value) -> String {
+    let style = Style::current();
     let mut t = format!(
-        "Granted: lease {} on {}/{}",
-        text(&v["lease_id"]),
-        text(&v["resource"]),
+        "Granted: {}/{}",
+        style.id(&text(&v["resource"])),
         text(&v["unit"])
     );
     if let Some(at) = v["ends_at"].as_i64() {
-        let _ = write!(t, ", ends {}", relative(at, SystemClock.now_ms()));
+        let _ = write!(
+            t,
+            " until {} ({})",
+            render::clock(at),
+            render::when(at, SystemClock.now_ms())
+        );
     }
-    let _ = write!(t, ".\n{}", brief_text(v));
+    let _ = write!(t, "{SEP}{}\n{}", text(&v["lease_id"]), brief_text(v));
     t
 }
 
