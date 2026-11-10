@@ -6,6 +6,7 @@
 //! for `-f -` on the inventory commands and the hook input of `clerk hook`.
 
 mod admin;
+mod agent;
 mod caller;
 mod gate;
 mod hook;
@@ -13,6 +14,7 @@ mod input;
 mod inventory;
 mod lease;
 mod live;
+mod next;
 mod output;
 mod render;
 mod views;
@@ -120,6 +122,49 @@ enum Command {
         /// With --force: confirm without asking.
         #[arg(long, requires = "force")]
         yes: bool,
+        /// Start the cleanup window instead of confirming cleanup at once;
+        /// `clerk confirm <lease> clean` ends it.
+        #[arg(long, conflicts_with = "force")]
+        cleanup: bool,
+    },
+    /// The resource types, their settings, health checks and usage
+    /// placeholders.
+    Types,
+    /// Confirm a lease's cleanup (`clean`), or that you paused at a safe
+    /// point for a yield request (`yielded`).
+    Confirm {
+        /// The lease id.
+        lease: String,
+        /// clean or yielded.
+        #[arg(value_enum)]
+        how: agent::How,
+    },
+    /// Open (`on`) or close (`off`) a lease to interruption by more urgent
+    /// requests (agent sessions).
+    Interruptible {
+        /// The lease id.
+        lease: String,
+        /// on or off.
+        #[arg(value_enum)]
+        state: agent::OnOff,
+    },
+    /// Answer a yield request on a lease: --refuse turns it down.
+    Yield {
+        /// The lease id.
+        lease: String,
+        /// Refuse to yield.
+        #[arg(long, required = true)]
+        refuse: bool,
+    },
+    /// Take a lent unit back from a borrower that overran.
+    Reclaim {
+        /// The lease id.
+        lease: String,
+    },
+    /// Claim an offered lease.
+    Claim {
+        /// The lease id.
+        lease: String,
     },
     /// Move a lease's end to now plus --for.
     Extend(lease::ExtendArgs),
@@ -148,6 +193,39 @@ enum Command {
         #[arg(long = "as", value_name = "ID")]
         new_id: Option<String>,
     },
+}
+
+impl Command {
+    /// The top-level command name, as typed.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Daemon { .. } => "daemon",
+            Self::Resource { .. } => "resource",
+            Self::Unit { .. } => "unit",
+            Self::Status => "status",
+            Self::Resources(_) => "resources",
+            Self::Leases { .. } => "leases",
+            Self::Queue { .. } => "queue",
+            Self::Log(_) => "log",
+            Self::Promotions => "promotions",
+            Self::Acquire(_) => "acquire",
+            Self::Attach { .. } => "attach",
+            Self::Cancel { .. } => "cancel",
+            Self::Release { .. } => "release",
+            Self::Extend(_) => "extend",
+            Self::Run(_) => "run",
+            Self::Wait(_) => "wait",
+            Self::Admin(_) => "admin",
+            Self::Hook { .. } => "hook",
+            Self::Approve { .. } => "approve",
+            Self::Types => "types",
+            Self::Confirm { .. } => "confirm",
+            Self::Interruptible { .. } => "interruptible",
+            Self::Yield { .. } => "yield",
+            Self::Reclaim { .. } => "reclaim",
+            Self::Claim { .. } => "claim",
+        }
+    }
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -194,7 +272,10 @@ pub fn run() -> ExitCode {
         Err(e) => return parse_failure(&e),
     };
     render::install(cli.json, cli.ascii);
-    let out = Output::new(Mode::detect(cli.json));
+    let mut out = Output::new(Mode::detect(cli.json));
+    if std::env::var_os(caller::SESSION_VAR).is_some_and(|v| !v.is_empty()) {
+        out = out.for_agent(cli.command.name());
+    }
     if let Command::Daemon { action: None } = cli.command {
         // The daemon logs to its own file.
         return match run_daemon() {
@@ -289,8 +370,15 @@ async fn dispatch(ctx: &Ctx, command: Command) -> anyhow::Result<()> {
             lease,
             force: true,
             yes,
+            ..
         } => admin::force_release(ctx, lease, yes).await,
-        Command::Release { lease, .. } => lease::release(ctx, lease).await,
+        Command::Release { lease, cleanup, .. } => lease::release(ctx, lease, cleanup).await,
+        Command::Types => agent::types(ctx),
+        Command::Confirm { lease, how } => agent::confirm(ctx, &lease, how).await,
+        Command::Interruptible { lease, state } => agent::interruptible(ctx, &lease, state).await,
+        Command::Yield { lease, .. } => agent::refuse_yield(ctx, &lease).await,
+        Command::Reclaim { lease } => agent::reclaim(ctx, &lease).await,
+        Command::Claim { lease } => agent::claim(ctx, &lease).await,
         Command::Extend(args) => lease::extend(ctx, args).await,
         Command::Run(args) => lease::run(ctx, args).await,
         Command::Wait(args) => lease::wait(ctx, args).await,

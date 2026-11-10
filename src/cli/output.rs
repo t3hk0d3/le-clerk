@@ -244,12 +244,24 @@ fn exit_for(code: &str) -> u8 {
 #[derive(Debug, Clone, Copy)]
 pub struct Output {
     mode: Mode,
+    /// The command an agent session runs: JSON results and errors then
+    /// carry the next step (see [`super::next`]).
+    agent: Option<&'static str>,
 }
 
 impl Output {
     #[must_use]
     pub fn new(mode: Mode) -> Self {
-        Self { mode }
+        Self { mode, agent: None }
+    }
+
+    /// This output for agent session command `command`.
+    #[must_use]
+    pub fn for_agent(self, command: &'static str) -> Self {
+        Self {
+            agent: Some(command),
+            ..self
+        }
     }
 
     /// How this output prints.
@@ -264,7 +276,13 @@ impl Output {
     /// When stdout cannot be written or the value does not serialise.
     pub fn emit<T: Serialize + HumanRender>(self, value: &T) -> anyhow::Result<()> {
         let text = match self.mode {
-            Mode::Json => serde_json::to_string(value)?,
+            Mode::Json => {
+                let mut json = serde_json::to_value(value)?;
+                if let Some(command) = self.agent {
+                    super::next::annotate(command, &mut json);
+                }
+                json.to_string()
+            }
             Mode::Human => render::finish(&value.render(), Style::current()),
         };
         let mut stdout = io::stdout().lock();
@@ -281,7 +299,10 @@ impl Output {
     /// prints the message, then one `  key: value` line per detail, on
     /// stderr.
     pub fn fail(self, failure: impl Into<Failure>) -> ExitCode {
-        let f = failure.into();
+        let mut f = failure.into();
+        if self.agent.is_some() {
+            f.message = super::next::error_message(&f.code, &f.message);
+        }
         match self.mode {
             Mode::Json => {
                 let mut error = json!({"code": f.code, "message": f.message});

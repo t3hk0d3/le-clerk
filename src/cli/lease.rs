@@ -166,6 +166,14 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
     };
     let caller = ctx.caller(kind)?;
     caller::require_host(&caller)?;
+    if args.wait && caller::is_agent(&caller) {
+        return Err(UsageError(
+            "acquire --wait blocks the agent: acquire without it, then arm `clerk wait --follow` \
+             with the Monitor tool (or `clerk wait` in the background) to hear of the offer."
+                .to_owned(),
+        )
+        .into());
+    }
     interruptible_needs_session(&args.lease, &caller)?;
     let body = request_args(
         &target,
@@ -310,9 +318,21 @@ pub async fn cancel_request(ctx: &Ctx, request: String) -> anyhow::Result<()> {
         }))
 }
 
-pub async fn release(ctx: &Ctx, lease: String) -> anyhow::Result<()> {
+pub async fn release(ctx: &Ctx, lease: String, cleanup: bool) -> anyhow::Result<()> {
     let client = ctx.client().await?;
     let caller = lease_caller(ctx, &client, &lease).await?;
+    if cleanup {
+        let view = client
+            .call("release", &caller, json!({ "lease_id": lease }))
+            .await?;
+        return ctx.out.emit(&View::new(view, |v| {
+            format!(
+                "Released: lease {} is in its cleanup window; `clerk confirm {} clean` ends it.",
+                text(&v["lease_id"]),
+                text(&v["lease_id"])
+            )
+        }));
+    }
     let view = finish(&client, &caller, &lease).await?;
     ctx.out.emit(&View::new(view, |v| {
         format!(
@@ -770,7 +790,7 @@ async fn user_holders(client: &Client, caller: &Caller) -> anyhow::Result<Vec<Ho
 ///
 /// # Errors
 /// `not_found` when the user has no live lease of that id.
-async fn lease_caller(ctx: &Ctx, client: &Client, lease: &str) -> anyhow::Result<Caller> {
+pub async fn lease_caller(ctx: &Ctx, client: &Client, lease: &str) -> anyhow::Result<Caller> {
     let caller = ctx.caller(CallerKind::Detached)?;
     if caller::is_agent(&caller) {
         return Ok(caller);

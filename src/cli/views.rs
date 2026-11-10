@@ -124,11 +124,18 @@ pub async fn leases(ctx: &Ctx, mine: bool) -> anyhow::Result<()> {
             ))
             .into());
         }
-        let result = ctx
-            .client()
-            .await?
-            .call("list_my_leases", &caller, json!({}))
-            .await?;
+        let client = ctx.client().await?;
+        let mut result = client.call("list_my_leases", &caller, json!({})).await?;
+        if let HolderRef::AgentSession { session_id } = &caller.holder {
+            let brief = client
+                .call(
+                    "session_brief",
+                    &caller,
+                    json!({ "session_id": session_id }),
+                )
+                .await?;
+            result["armed"] = json!(brief["open_waits"].as_u64().unwrap_or(0) > 0);
+        }
         return ctx.out.emit(&View::new(result, my_leases_text));
     }
     let status = ctx
