@@ -28,37 +28,37 @@ only place leases are taken, queued, yielded and returned.
    purpose others can read; `--interruptible` for long work you can pause.
 3. **Granted** (exit 0): read the grant's descriptions and `usage` before
    using the unit: how to connect, gotchas, what "clean" means. A unit handed
-   over without confirmed cleanup is marked dirty: check it first.
+   over without confirmed cleanup is marked dirty (or abandoned by its previous
+   owner): check it first.
 4. **Queued** (exit 6): the result gives your position and request id. The
    wait (below) claims the offer for you when your turn comes.
-5. **Keep a wait armed** while you hold or wait for anything (below).
+5. **Queued or interruptible:** keep a wait running (below).
 6. **Done:** clean up as the usage says, then `clerk release <lease>`.
 
-## Keep a wait armed
+## When you need a wait
 
-Notices (offers, expiry warnings, yield requests, "your unit is back")
-reach you through a wait. Arm exactly one:
+A wait is how the clerk reaches you while you are idle. You need one **only
+while you are queued or hold an `--interruptible` lease**. A plain lease needs
+none: do not start or restart a wait just because you hold something.
 
-- **With the Monitor tool (preferred):** command `clerk wait --follow`,
-  `timeout_ms` 1800000, description "clerk notices". Each notice arrives as
-  a Monitor event: a `## Notice: <kind>` block, then for an offer the
-  `## Lease <id>` you now hold (already claimed for you, with its usage),
-  then its own `Next:`. When the monitor expires, arm it again if you still
-  hold or wait for anything.
-- **Without Monitor:** run `clerk wait` with the Bash tool's
-  `run_in_background` (`timeout` 7200000). When it completes, read its
-  output file, act on each notice, and start it again.
+Run `clerk wait` with the Bash tool's `run_in_background` (`timeout` 7200000),
+then get on with your work or end your turn. It costs nothing while idle.
+When it completes, read its output file: it holds `## Notice: <kind>` blocks
+and, for an offer, the `## Lease <id>` you now hold (already claimed for you,
+with its usage). Act on them, and start it again only if you are still queued
+or interruptible.
 
-A second wait exits at once ("already armed"): one is enough. If you end a
-turn holding something with no wait armed, a hook reminds you.
+A second wait exits at once ("already armed"): one is enough.
 `clerk leases --mine` shows what you hold, your queue positions and whether
 a wait is armed.
 
 ## While you hold it
 
 - **Expiry warning:** `clerk extend <lease> --for 15m` before the end.
-  Expiry is hard; an extension may be refused when someone with higher
-  priority waits.
+  An extension may be refused when someone with higher priority waits.
+- **Past your end:** with nobody waiting, you keep the lease. Once someone
+  queues for the unit you get a cleanup window; if you don't confirm, the
+  unit is handed over as abandoned. Extend if you still need it.
 - **Yield request** (interruptible leases): pause at a safe point, clean up,
   `clerk confirm <lease> yielded`; or `clerk yield <lease> --refuse`.
 - **Overridden:** your lease ends; stop using the unit.

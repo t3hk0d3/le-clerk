@@ -107,9 +107,9 @@ tool(B, "Bash", ACQ, [
     "- position: 1",
     "- blocked_by: p18080 held by another agent",
     '  for "API dev server", ends 16:45 (in 30m)',
-    f"{CYAN}Next:{RESET} arm `clerk wait --follow` with Monitor.",
+    f"{CYAN}Next:{RESET} run `clerk wait` in the background.",
 ], 0.9)
-tool(B, "Monitor", "clerk wait --follow", ["Monitor started · clerk notices"], 0.6, MAGENTA)
+tool(B, "Bash", "clerk wait", ["Running in the background"], 0.6, MAGENTA)
 say(B, "Another agent is running the API on that port. I'm first in the "
        "queue and will start the server as soon as the port is mine.", 2.5)
 
@@ -121,8 +121,9 @@ tool(A, "Bash", "clerk release lse_01M730E06MJPRTMNP28VZS0CEG", [
 ], 0.6)
 say(A, "Server stopped and the port released.", 0.9)
 
-B.lines += [f"{MAGENTA}●{RESET} Monitor event: {BOLD}## Notice: offered{RESET} · clerk notices",
-            f"  {DIM}⎿{RESET}  {BOLD}## Lease lse_01M730H4ZK3B{RESET} · api-port/p18080 · held",
+B.lines += [f"{MAGENTA}●{RESET} Background command \"clerk wait\" completed",
+            f"  {DIM}⎿{RESET}  {BOLD}## Notice: offered{RESET} · api-port/p18080",
+            f"     {BOLD}## Lease lse_01M730H4ZK3B{RESET} · held",
             f"     {CYAN}Next:{RESET} start the API with `serve-api 18080`.", ""]
 snap(1.2)
 tool(B, "Bash", "serve-api 18080 &", ["API listening on http://127.0.0.1:18080"], 0.6)

@@ -68,9 +68,10 @@ Durations are `<n>s|m|h|d`, up to 30 days.
   `CLERK_UNIT_<SETTING>` (`CLERK_UNIT_PATH`, `CLERK_UNIT_HOST`,
   `CLERK_UNIT_PORT`, …). Exit 0 confirms cleanup; anything else marks the
   unit dirty.
-- **`wait`** prints your notices as they arrive. Agents run it as
-  `clerk wait --follow` under Claude Code's Monitor tool, or as a one-batch
-  background command.
+- **`wait`** prints your notices as they arrive. Agents run it as a
+  one-batch background command, which ends with the first notice that needs
+  action; `--follow` keeps printing, for tools that stream a command's
+  output.
 
 ## Looking around
 
