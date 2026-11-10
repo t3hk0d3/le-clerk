@@ -22,7 +22,8 @@ pub const CLAIM_WINDOW_SECS: u64 = 300;
 pub const YIELD_WINDOW_SECS: u64 = 120;
 /// Health-check timeout, seconds.
 pub const HEALTH_TIMEOUT_SECS: u64 = 10;
-/// Reconnection grace, seconds (reserved for phase 3).
+/// Reconnection grace of an agent session whose last liveness stream
+/// closed, seconds.
 pub const RECONNECT_GRACE_SECS: u64 = 60;
 /// Gap between progress notifications of a blocked `lease_wait`, ms.
 pub const MCP_PROGRESS_MS: u64 = 30_000;

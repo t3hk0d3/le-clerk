@@ -19,7 +19,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 fs4 = "0.13"
-http-body-util = "0.1"
+http-body-util = { version = "0.1", features = ["channel"] }
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"

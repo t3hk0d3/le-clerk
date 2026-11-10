@@ -21,6 +21,7 @@ mod forced;
 mod interrupt;
 mod lifecycle;
 pub mod liveness;
+pub mod session;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;

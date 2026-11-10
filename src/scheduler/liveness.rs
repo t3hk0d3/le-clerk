@@ -4,8 +4,10 @@
 //! `/proc/<pid>/stat`), so a pid the kernel reused for another process does
 //! not keep a dead holder's leases alive. [`probe_all`] checks every such
 //! holder that has a live lease or a queued request; the engine calls it
-//! periodically. `AgentSession` and `User` holders are never probed in
-//! phase 1: only lease expiry ends them.
+//! periodically. `AgentSession` holders end through their liveness streams
+//! and the reconnect grace instead ([`crate::scheduler::session`], which
+//! reuses [`Scheduler::end_holders`]); `User` holders only through lease
+//! expiry.
 
 use std::collections::HashSet;
 use std::fs;

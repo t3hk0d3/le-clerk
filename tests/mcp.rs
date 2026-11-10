@@ -491,6 +491,31 @@ mod server {
             }
         }
 
+        mod on_a_session_aliased_by_a_resume {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn acts_as_the_live_proxy_session_it_resolves_to() {
+                let d = Daemon::start();
+                let _live = d
+                    .engine
+                    .session_connect("new".into(), ulid::Ulid::new(), Some(4242))
+                    .await
+                    .unwrap();
+                d.engine
+                    .session_alias("new".into(), "old".into())
+                    .await
+                    .unwrap();
+                d.session("old", "a")
+                    .ok("resource_create", json!({"id": "board", "type": "generic"}))
+                    .await;
+                assert_eq!(
+                    d.actor_of("resource_created").await,
+                    json!({"kind": "agent_session", "session_id": "new"})
+                );
+            }
+        }
+
         mod on_missing_x_clerk_session {
             use super::*;
 

@@ -104,6 +104,9 @@ pub enum IdentityError {
          which sets it"
     )]
     MissingSession,
+    /// A liveness stream without `X-Clerk-Connection`.
+    #[error("the liveness stream has no X-Clerk-Connection header; `clerk mcp` sets it")]
+    MissingConnection,
     /// A header is present but malformed.
     #[error("the {} header is malformed: {reason}", display_name(.header))]
     BadHeader {
@@ -309,15 +312,42 @@ impl ProjectCache {
     }
 }
 
-/// The session a request's `X-Clerk-Session` stands for.
+/// The session a request's `X-Clerk-Session` stands for: itself, or the
+/// live proxy session that took it over through a `SessionStart` resume
+/// alias ([`EngineHandle::session_alias`]). The Claude PID is not used
+/// here: a proxy's own requests always name its own session.
+async fn resolve_session(engine: &EngineHandle, session_id: String) -> String {
+    match engine.session_resolve(None, session_id.clone()).await {
+        Ok(resolved) => resolved,
+        // A stopped engine fails the request itself right after.
+        Err(_) => session_id,
+    }
+}
+
+/// Who a liveness stream (`GET /v1/session/live`) is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveIdentity {
+    /// The agent session id, as the proxy sent it.
+    pub session_id: String,
+    /// The proxy process.
+    pub connection: Ulid,
+    /// The Claude Code process, when the proxy said.
+    pub claude_pid: Option<u32>,
+}
+
+/// Read a liveness stream's `X-Clerk-Session` and `X-Clerk-Connection`
+/// (both required) and `X-Clerk-Claude-Pid`.
 ///
-/// The single seam for session aliases: a `SessionStart` hook with
-/// `source: "resume"` will alias the proxy's start-up id to the resumed id
-/// (phase 3, Task 4). Until then every id stands for itself.
-// Async and taking the engine because alias resolution will ask it.
-#[allow(clippy::unused_async)]
-async fn resolve_session(_engine: &EngineHandle, session_id: String) -> String {
-    session_id
+/// # Errors
+/// [`IdentityError`] for a missing session or connection, or a malformed
+/// header.
+pub fn live_identity(headers: &HeaderMap) -> Result<LiveIdentity, IdentityError> {
+    let claimed = Claimed::parse(headers)?;
+    Ok(LiveIdentity {
+        session_id: claimed.session_id,
+        connection: claimed.connection.ok_or(IdentityError::MissingConnection)?,
+        claude_pid: claimed.claude_pid,
+    })
 }
 
 /// Decode `%XX` escapes (two ASCII hex digits); `None` on a malformed

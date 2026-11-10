@@ -791,6 +791,18 @@ pub fn set_holder(tx: &Tx, row: i64, holder: &HolderRef) -> Result<(), StoreErro
     Ok(())
 }
 
+/// Give a queued request to another holder.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure.
+pub fn set_request_holder(tx: &Tx, row: i64, holder: &HolderRef) -> Result<(), StoreError> {
+    tx.conn().execute(
+        "UPDATE requests SET holder = ?2 WHERE row_id = ?1",
+        rusqlite::params![row, serde_json::to_string(holder)?],
+    )?;
+    Ok(())
+}
+
 /// Live leases whose unit or resource row does not exist (possible only in
 /// a damaged database: foreign keys normally cascade), by row.
 ///

@@ -327,6 +327,33 @@ pub fn holders_after(tx: &Tx, after: i64) -> Result<Vec<HolderRef>, StoreError> 
         .collect())
 }
 
+/// Hand every undelivered notice of `from` to `to`, as [`rehome`] does for
+/// one lease's notices. Returns how many moved.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure or a damaged row.
+pub fn rehome_all(tx: &Tx, from: &HolderRef, to: &HolderRef) -> Result<usize, StoreError> {
+    let rows = {
+        let mut stmt = tx.conn().prepare(
+            "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
+             ORDER BY created_at, row_id",
+        )?;
+        stmt.query_map([serde_json::to_string(from)?], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    for (row, payload) in &rows {
+        let mut notice: Notice = serde_json::from_str(payload)?;
+        notice.id = NoticeId::new();
+        notice.holder = to.clone();
+        publish(tx, &notice)?;
+        tx.conn()
+            .execute("DELETE FROM notices WHERE row_id = ?1", [row])?;
+    }
+    Ok(rows.len())
+}
+
 /// Hand the undelivered notices of `from` about `lease` to `to`. Each one is
 /// written again as a new row, under a fresh id but with its `created_at`
 /// (so its place in the order is kept), before the old row goes: the new
