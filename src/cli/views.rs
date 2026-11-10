@@ -60,11 +60,12 @@ fn view_of(caller: &Caller) -> &'static str {
     }
 }
 
-fn not_found(message: String) -> ApiError {
+/// The daemon's `not_found` for a resource, with its details.
+fn resource_not_found(id: &str) -> ApiError {
     ApiError {
         code: "not_found".to_owned(),
-        message,
-        details: None,
+        message: "no such resource or unit".to_owned(),
+        details: Some(json!({"kind": "resource", "id": id})),
     }
 }
 
@@ -166,10 +167,7 @@ pub async fn queue(ctx: &Ctx, resource: &str) -> anyhow::Result<()> {
         .map(|r| json!({"resource": r["id"], "scope": r["scope"], "queue": r["queue"]}))
         .collect();
     if queues.is_empty() {
-        return Err(not_found(format!(
-            "No resource {resource} is visible to you; check `clerk resources`."
-        ))
-        .into());
+        return Err(resource_not_found(resource).into());
     }
     ctx.out.emit(&View::new(Value::Array(queues), queue_text))
 }
@@ -1063,12 +1061,7 @@ fn promotions_text(v: &Value) -> String {
         if let Some(d) = some_text(&p["description"]) {
             let _ = write!(t, "\n{}", render::wrap(d, 2, width));
         }
-        // The reason names the requester's project by its key; show it
-        // as the folder, like every project.
-        let mut reason = text(&p["reason"]);
-        if let Some(by) = p["requester"].as_str() {
-            reason = reason.replace(by, &render::project(&ProjectKey(by.into())));
-        }
+        let reason = text(&p["reason"]);
         let line = match p["requester"].as_str() {
             Some(by) => format!(
                 "requested by {}: {reason}",

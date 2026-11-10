@@ -278,7 +278,11 @@ impl Output {
                 let mut stdout = io::stdout().lock();
                 let _ = writeln!(stdout, "{}", json!({ "error": error }));
             }
-            Mode::Human => eprintln!("{}", render::finish(&human_failure(&f), Style::current())),
+            Mode::Human => {
+                let text =
+                    render::on_stderr(|| render::finish(&human_failure(&f), Style::current()));
+                eprintln!("{text}");
+            }
         }
         ExitCode::from(f.exit)
     }

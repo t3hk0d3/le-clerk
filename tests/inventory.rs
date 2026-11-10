@@ -2176,7 +2176,7 @@ mod promotions {
             assert_eq!(list[0].id, id);
             assert_eq!(list[0].resource, rid("theirs"));
             assert_eq!(list[0].requester, Some(project("/p/a")));
-            assert!(list[0].reason.contains("/p/a"));
+            assert_eq!(list[0].reason, "a matching unit was registered there");
         }
     }
 

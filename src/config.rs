@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -154,6 +154,48 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// The daemon socket's path is too long for a Unix socket address.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "the daemon socket path is {len} bytes long, over the {max}-byte limit for Unix sockets \
+     ({}); set a shorter CLERK_HOME or XDG_RUNTIME_DIR",
+    path.display()
+)]
+pub struct SocketPathTooLong {
+    /// The socket path.
+    pub path: PathBuf,
+    /// Its length in bytes.
+    pub len: usize,
+    /// The longest path the platform takes, in bytes (without the NUL).
+    pub max: usize,
+}
+
+/// The longest Unix socket path this platform takes, in bytes, without the
+/// terminating NUL (107 on Linux).
+#[must_use]
+pub fn socket_path_max() -> usize {
+    // SAFETY: `sockaddr_un` is plain old data; all zeroes is a valid value.
+    let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_path.len() - 1
+}
+
+/// Refuse a socket path longer than [`socket_path_max`].
+///
+/// # Errors
+/// [`SocketPathTooLong`] naming the path and its length.
+pub fn check_socket_path(path: &Path) -> Result<(), SocketPathTooLong> {
+    let len = path.as_os_str().len();
+    let max = socket_path_max();
+    if len > max {
+        return Err(SocketPathTooLong {
+            path: path.to_owned(),
+            len,
+            max,
+        });
+    }
+    Ok(())
 }
 
 /// Where clerk keeps its files.

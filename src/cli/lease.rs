@@ -242,7 +242,7 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
         return Err(Exit(EXIT_QUEUED).into());
     }
     let request = id(&outcome, "request_id")?;
-    note(&outcome_text(&outcome, &args.target));
+    note(|| outcome_text(&outcome, &args.target));
     let lease = await_offer(ctx, &client, &caller, &request).await?;
     let lease = detach_from_process(&client, &caller, lease).await?;
     ctx.out.emit(&View::new(lease, granted_text))
@@ -385,12 +385,12 @@ pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
     let lease = match outcome["outcome"].as_str() {
         Some("granted") => outcome,
         Some("queued") => {
-            note(&outcome_text(&outcome, &args.target));
+            note(|| outcome_text(&outcome, &args.target));
             await_offer(ctx, &client, &caller, &id(&outcome, "request_id")?).await?
         }
         _ => anyhow::bail!("the daemon answered the acquire with {outcome}"),
     };
-    note(&granted_text(&lease));
+    note(|| granted_text(&lease));
     match supervise(&client, &caller, &lease, &args.command).await? {
         0 => Ok(()),
         code => Err(Exit(code).into()),
@@ -535,11 +535,11 @@ async fn await_offer(
                     gone = None;
                 }
                 (NoticeKind::QueueDropped, _) => {
-                    note(&notice_text(n));
+                    note(|| notice_text(n));
                     gone = Some(dropped(n));
                     offer = None;
                 }
-                _ => note(&notice_text(n)),
+                _ => note(|| notice_text(n)),
             }
         }
         if let Some(e) = gone {
@@ -562,12 +562,10 @@ async fn cancel_after_failure(ctx: &Ctx, caller: &Caller, request: &str) {
         Err(e) => Err(e.to_string()),
     };
     match cancelled {
-        Ok(()) => note(&format!(
-            "Request {request} is cancelled, as waiting for it failed."
-        )),
-        Err(e) => note(&format!(
-            "Request {request} may still be queued; cancelling it failed ({e})."
-        )),
+        Ok(()) => note(|| format!("Request {request} is cancelled, as waiting for it failed.")),
+        Err(e) => {
+            note(|| format!("Request {request} may still be queued; cancelling it failed ({e})."));
+        }
     }
 }
 
@@ -613,10 +611,12 @@ async fn supervise(
     {
         Ok(child) => child,
         Err(e) => {
-            note(&format!(
-                "Cannot run {}: {e}. The lease is given back.",
-                program.to_string_lossy()
-            ));
+            note(|| {
+                format!(
+                    "Cannot run {}: {e}. The lease is given back.",
+                    program.to_string_lossy()
+                )
+            });
             finish(client, caller, &lease_id).await?;
             return Ok(127);
         }
@@ -651,7 +651,7 @@ async fn supervise(
                 match batch {
                     Ok(batch) => {
                         for n in &batch {
-                            note(&notice_text(n));
+                            note(|| notice_text(n));
                             if let Some(at) = stop_time(n) {
                                 stop_at = Some(stop_at.map_or(at, |s| s.min(at)));
                             }
@@ -666,14 +666,14 @@ async fn supervise(
                 }
             }
             () = deadline, if !stopped => {
-                note("The lease is over: stopping the command (SIGTERM).");
+                note(|| "The lease is over: stopping the command (SIGTERM).".to_owned());
                 send(libc::SIGTERM);
                 stopped = true;
             }
             // A Ctrl+C on the terminal already reached the command, which
             // shares our foreground process group; pass on only the rest.
             _ = interrupt.recv() => if !terminal_delivers_sigint() {
-                note("Passing SIGINT on to the command.");
+                note(|| "Passing SIGINT on to the command.".to_owned());
                 send(libc::SIGINT);
             },
             _ = terminate.recv() => send(libc::SIGTERM),
@@ -916,9 +916,11 @@ fn id(v: &Value, key: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("the daemon's answer has no {key}: {v}"))
 }
 
-/// A line on stderr, for progress that is not the command's output.
-fn note(text: &str) {
-    eprintln!("{}", render::finish(text, Style::current()));
+/// A line on stderr, for progress that is not the command's output; styled
+/// for stderr.
+fn note(text: impl FnOnce() -> String) {
+    let line = render::on_stderr(|| render::finish(&text(), Style::current()));
+    eprintln!("{line}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,10 +1019,6 @@ fn blocked_text(b: &Value, style: Style) -> Option<String> {
                 text(&b["unit"]),
                 ends(b)
             ),
-        }),
-        "queue" => Some(match b["ahead"].as_u64()? {
-            1 => "1 earlier request waits for the same units.".to_owned(),
-            n => format!("{n} earlier requests wait for the same units."),
         }),
         _ => None,
     }

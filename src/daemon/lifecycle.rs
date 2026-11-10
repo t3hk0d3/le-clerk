@@ -23,7 +23,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 
 use crate::clock::{Clock, SystemClock};
-use crate::config::{Config, Paths};
+use crate::config::{Config, Paths, SocketPathTooLong, check_socket_path};
 use crate::daemon::server::{self, ServerInfo};
 use crate::engine::{Command, Engine, EngineHandle, NoArgs};
 use crate::health::HealthChecker;
@@ -52,6 +52,9 @@ pub enum RunError {
         /// The underlying error.
         source: io::Error,
     },
+    /// The socket path is too long for a Unix socket.
+    #[error(transparent)]
+    SocketPathTooLong(#[from] SocketPathTooLong),
     /// The database could not be opened.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -81,6 +84,7 @@ fn io_at(path: &Path) -> impl FnOnce(io::Error) -> RunError + '_ {
 /// # Errors
 /// [`RunError`] when a file, the database, the engine or the server fails.
 pub fn run(paths: &Paths, config: Config) -> Result<(), RunError> {
+    check_socket_path(&paths.socket)?;
     let run_dir = parent(&paths.socket);
     create_private_dir(run_dir)?;
     let Some(lock) = take_lock(&paths.lock)? else {

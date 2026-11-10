@@ -218,11 +218,6 @@ pub enum BlockedBy {
         purpose: Option<String>,
         ends_at: Option<i64>,
     },
-    /// A target unit is free and healthy, but earlier requests come first.
-    Queue {
-        /// Requests ahead of this one.
-        ahead: u32,
-    },
 }
 
 /// A free unit whose last health check failed.
@@ -519,16 +514,17 @@ fn group_busy(tx: &Tx, group: &[i64]) -> Result<bool, SchedulerError> {
     Ok(!leases::live_leases_on(tx, group)?.is_empty())
 }
 
-/// What keeps a request just queued (at `position`) on the resource at
-/// `resource_row` (only the unit at `pinned`, when set) from a unit: every
-/// free target unit unhealthy, else the held lease that ends first, else a
-/// leased linked unit, else the requests ahead.
+/// What keeps a request just queued on the resource at `resource_row`
+/// (only the unit at `pinned`, when set) from a unit: every free target unit
+/// unhealthy, else the held lease that ends first, else a leased linked
+/// unit. `None` when a free target unit passed its last check: the acquire
+/// dispatches first and then grants any free healthy unit, so that is never
+/// what queued it.
 fn blocked_by(
     tx: &Tx,
     who: &Caller,
     resource_row: i64,
     pinned: Option<i64>,
-    position: u32,
 ) -> Result<Option<BlockedBy>, SchedulerError> {
     // Loaded afresh: the acquire's health checks have just been recorded.
     let resource = inventory_sql::load_resource(tx, resource_row)?;
@@ -565,9 +561,8 @@ fn blocked_by(
             }
         }
     }
-    let ahead = position.saturating_sub(1);
     if free_healthy {
-        return Ok(Some(BlockedBy::Queue { ahead }));
+        return Ok(None);
     }
     if !unhealthy.is_empty() {
         return Ok(Some(BlockedBy::Unhealthy {
@@ -613,7 +608,7 @@ fn blocked_by(
             }
         }));
     }
-    Ok((ahead > 0).then_some(BlockedBy::Queue { ahead }))
+    Ok(None)
 }
 
 /// The actor recorded for actions the scheduler takes on its own.
@@ -1030,7 +1025,7 @@ impl Scheduler {
         .filter(|u| !u.retiring)
         .collect();
         let estimated_wait = self.estimate(tx, &after, row, &eligible)?;
-        let blocked_by = blocked_by(tx, who, resource.row, pinned.map(|u| u.row), position)?;
+        let blocked_by = blocked_by(tx, who, resource.row, pinned.map(|u| u.row))?;
         audit::record(
             tx,
             self.now(),

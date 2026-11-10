@@ -543,7 +543,9 @@ mod daemon {
                         assert_eq!(client, leclerk::VERSION);
                         assert_eq!(daemon, "0.0.0-other");
                     }
-                    other @ (DaemonError::Unavailable | DaemonError::Unresponsive { .. }) => {
+                    other @ (DaemonError::Unavailable
+                    | DaemonError::Unresponsive { .. }
+                    | DaemonError::SocketPathTooLong(_)) => {
                         panic!("expected a version mismatch, got {other:?}")
                     }
                 }

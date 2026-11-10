@@ -578,10 +578,9 @@ impl Inventory {
             return Ok(id);
         }
         let reason = match scope {
-            Scope::Project(p) => format!(
-                "a matching unit was registered in project {}",
-                p.0.display()
-            ),
+            // The requester is a field of its own; the reason does not
+            // repeat it.
+            Scope::Project(_) => "a matching unit was registered there".to_owned(),
             Scope::User => "a matching unit was registered in user scope".to_owned(),
         };
         let id = PromotionId::new();

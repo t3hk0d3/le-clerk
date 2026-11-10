@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::net::UnixStream;
 
-use crate::config::Paths;
+use crate::config::{Paths, SocketPathTooLong, check_socket_path};
 use crate::error::ErrorCode;
 use crate::model::{Caller, HolderRef, LeaseId, RequestId};
 use crate::scheduler::liveness;
@@ -67,6 +67,9 @@ pub enum DaemonError {
         /// The running daemon's version.
         daemon: String,
     },
+    /// The socket path is too long to bind or connect to.
+    #[error(transparent)]
+    SocketPathTooLong(#[from] SocketPathTooLong),
     /// A daemon holds the lock but does not answer: it is starting, wedged
     /// or stopped. It is not "not running", and no other daemon can start.
     #[error(
@@ -90,6 +93,7 @@ impl ErrorCode for DaemonError {
             DaemonError::Unavailable => "daemon_unavailable",
             DaemonError::VersionMismatch { .. } => "version_mismatch",
             DaemonError::Unresponsive { .. } => "daemon_unresponsive",
+            DaemonError::SocketPathTooLong(_) => "socket_path_too_long",
         }
     }
 }
@@ -285,6 +289,7 @@ impl Client {
 
     /// [`Client::probe`], giving up after `limit`.
     async fn probe_within(paths: &Paths, limit: Duration) -> Result<DaemonInfo, DaemonError> {
+        check_socket_path(&paths.socket)?;
         let (status, body) = send(&paths.socket, Method::GET, "/v1/version", None, limit)
             .await
             .map_err(|e| {
@@ -334,6 +339,7 @@ impl Client {
         paths: &Paths,
         launcher: &Launcher,
     ) -> Result<Self, DaemonError> {
+        check_socket_path(&paths.socket)?;
         let deadline = Instant::now() + START_TIMEOUT;
         let left = || {
             deadline

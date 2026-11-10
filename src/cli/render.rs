@@ -5,6 +5,7 @@
 //! when the terminal cannot show them. Colour is applied by [`Style`] only
 //! on a terminal without `NO_COLOR`, and never in JSON mode.
 
+use std::cell::Cell;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -49,19 +50,44 @@ pub struct Style {
 }
 
 static CURRENT: OnceLock<Style> = OnceLock::new();
+static STDERR: OnceLock<Style> = OnceLock::new();
+
+thread_local! {
+    /// Set while text for stderr is rendered (see [`on_stderr`]).
+    static ON_STDERR: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Detect and install the styles of stdout and stderr: each colours only
+/// when it is a terminal itself.
+pub fn install(json: bool, ascii_flag: bool) {
+    let var = |k: &str| std::env::var(k).ok();
+    let _ = CURRENT.set(Style::from_env(
+        io::stdout().is_terminal(),
+        json,
+        ascii_flag,
+        var,
+    ));
+    let _ = STDERR.set(Style::from_env(
+        io::stderr().is_terminal(),
+        json,
+        ascii_flag,
+        var,
+    ));
+}
+
+/// Run `render` with [`Style::current`] answering stderr's style: for text
+/// that goes to stderr.
+pub fn on_stderr<T>(render: impl FnOnce() -> T) -> T {
+    let before = ON_STDERR.with(|f| f.replace(true));
+    let out = render();
+    ON_STDERR.with(|f| f.set(before));
+    out
+}
 
 impl Style {
-    /// The style for this process: colour only on a terminal, without
-    /// `NO_COLOR` and without `--json`; Unicode unless `--ascii` or a
-    /// locale that is not UTF-8.
-    #[must_use]
-    pub fn detect(json: bool, ascii_flag: bool) -> Self {
-        Self::from_env(io::stdout().is_terminal(), json, ascii_flag, |k| {
-            std::env::var(k).ok()
-        })
-    }
-
-    /// [`Style::detect`] with the terminal check and the environment given.
+    /// The style for an output that is (`tty`) or is not a terminal:
+    /// colour only on a terminal, without `NO_COLOR` and without `--json`;
+    /// Unicode unless `--ascii` or a locale that is not UTF-8.
     #[must_use]
     pub fn from_env(
         tty: bool,
@@ -84,15 +110,16 @@ impl Style {
         }
     }
 
-    /// Make this the style [`Style::current`] returns.
-    pub fn install(self) {
-        let _ = CURRENT.set(self);
-    }
-
-    /// The installed style; plain Unicode without colour when none is.
+    /// The installed style (stderr's inside [`on_stderr`]); plain Unicode
+    /// without colour when none is installed.
     #[must_use]
     pub fn current() -> Self {
-        CURRENT.get().copied().unwrap_or(Self {
+        let slot = if ON_STDERR.with(Cell::get) {
+            &STDERR
+        } else {
+            &CURRENT
+        };
+        slot.get().copied().unwrap_or(Self {
             color: false,
             unicode: true,
         })
@@ -285,8 +312,44 @@ pub fn width() -> usize {
     .max(20)
 }
 
-/// `text` wrapped to `width` columns, every line starting with `indent`
-/// spaces; words longer than a line are broken. No trailing newline.
+/// The longest resource or unit id (see `model::ids`).
+const ID_MAX: usize = 63;
+
+/// `text`'s width in columns: its characters, escape sequences left out.
+#[must_use]
+pub fn visible_len(text: &str) -> usize {
+    let mut len = 0;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // `ESC [ … m`: skip to the final letter.
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            len += 1;
+        }
+    }
+    len
+}
+
+/// True when `word` may be split across lines: never an id (a lease,
+/// request or promotion id, anything as short as a resource or unit id),
+/// a path or `resource/unit`, or styled text.
+fn breakable(word: &str) -> bool {
+    let bare = word.trim_start_matches(['"', '`', '(', '\'']);
+    !(word.contains('\x1b')
+        || word.contains('/')
+        || ["lse_", "req_", "prm_"].iter().any(|p| bare.starts_with(p))
+        || visible_len(word) <= ID_MAX)
+}
+
+/// `text` wrapped to `width` columns (escape sequences take none), every
+/// line starting with `indent` spaces. Ids and paths are moved whole to the
+/// next line, even when longer than a line; other over-long words are
+/// broken. No trailing newline.
 #[must_use]
 pub fn wrap(text: &str, indent: usize, width: usize) -> String {
     let room = width.saturating_sub(indent).max(10);
@@ -296,15 +359,18 @@ pub fn wrap(text: &str, indent: usize, width: usize) -> String {
         let mut line = String::new();
         let mut len = 0;
         for word in paragraph.split_whitespace() {
-            let mut word: Vec<char> = word.chars().collect();
+            let mut word = word.to_owned();
+            // The rest of a word already broken is no id: break it further.
+            let mut broken = false;
             loop {
                 let gap = usize::from(len > 0);
-                if len + gap + word.len() <= room {
+                let wide = visible_len(&word);
+                if len + gap + wide <= room {
                     if gap == 1 {
                         line.push(' ');
                     }
-                    line.extend(word.iter());
-                    len += gap + word.len();
+                    line.push_str(&word);
+                    len += gap + wide;
                     break;
                 }
                 if len > 0 {
@@ -312,10 +378,17 @@ pub fn wrap(text: &str, indent: usize, width: usize) -> String {
                     len = 0;
                     continue;
                 }
-                // A word longer than a whole line: break it.
-                let rest = word.split_off(room);
-                lines.push(word.iter().collect());
+                if !broken && !breakable(&word) {
+                    // Alone on its line, overflowing.
+                    line = word;
+                    len = wide;
+                    break;
+                }
+                let head: String = word.chars().take(room).collect();
+                let rest: String = word.chars().skip(room).collect();
+                lines.push(head);
                 word = rest;
+                broken = true;
             }
         }
         lines.push(line);
@@ -558,8 +631,12 @@ mod tests {
         }
 
         #[test]
-        fn hours_and_days_read_whole() {
+        fn hours_read_whole() {
             assert_eq!(when(2 * 3_600_000 - 1, 0), "in 2h");
+        }
+
+        #[test]
+        fn days_read_whole() {
             assert_eq!(when(0, 3 * 86_400_000), "3d ago");
         }
     }
@@ -573,12 +650,42 @@ mod tests {
         }
 
         #[test]
+        fn takes_no_width_for_escape_sequences() {
+            let id = "ab".bold().to_string();
+            assert_eq!(wrap(&format!("{id} cd ef"), 0, 10), format!("{id} cd ef"));
+        }
+
+        #[test]
+        fn moves_a_styled_id_whole_to_the_next_line() {
+            let id = "esp32-c6-devkit-bench".bold().to_string();
+            assert_eq!(
+                wrap(&format!("see {id} now"), 2, 20),
+                format!("  see\n  {id}\n  now")
+            );
+        }
+
+        #[test]
+        fn never_splits_a_lease_id() {
+            let text = "held as lse_01M71FRGTW9BC1FSABQRDH7TZ1 here";
+            assert_eq!(
+                wrap(text, 0, 20),
+                "held as\nlse_01M71FRGTW9BC1FSABQRDH7TZ1\nhere"
+            );
+        }
+
+        #[test]
+        fn never_splits_a_path() {
+            let path = format!("/dev/serial/by-id/{}", "x".repeat(70));
+            assert_eq!(wrap(&format!("at {path}"), 0, 30), format!("at\n{path}"));
+        }
+
+        #[test]
         fn breaks_a_word_longer_than_a_line() {
-            let text = "x".repeat(25);
-            let wrapped = wrap(&text, 0, 10);
+            let text = "x".repeat(70);
+            let wrapped = wrap(&text, 0, 30);
             assert_eq!(
                 wrapped,
-                format!("{}\n{}\n{}", "x".repeat(10), "x".repeat(10), "x".repeat(5))
+                format!("{}\n{}\n{}", "x".repeat(30), "x".repeat(30), "x".repeat(10))
             );
         }
     }

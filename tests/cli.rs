@@ -3331,6 +3331,73 @@ mod cli {
         }
     }
 
+    mod socket_path_too_long {
+        use super::*;
+
+        /// A `CLERK_HOME` whose socket path is over the Unix limit.
+        fn long_home(env: &Env) -> PathBuf {
+            let dir = env.home().join("a".repeat(120));
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        mod on_a_client_command {
+            use super::*;
+
+            #[test]
+            fn exits_5() {
+                let env = Env::new();
+                let home = long_home(&env);
+                let error = error_of(env.cmd().env("CLERK_HOME", &home).arg("status"), 5);
+                assert_eq!(error["code"], "socket_path_too_long", "{error}");
+            }
+
+            #[test]
+            fn names_the_length_and_the_fix() {
+                let env = Env::new();
+                let home = long_home(&env);
+                let error = error_of(env.cmd().env("CLERK_HOME", &home).arg("status"), 5);
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("bytes long"), "{message}");
+                assert!(
+                    message.contains("CLERK_HOME or XDG_RUNTIME_DIR"),
+                    "{message}"
+                );
+            }
+        }
+
+        mod on_the_daemon {
+            use super::*;
+
+            #[test]
+            fn exits_nonzero() {
+                let env = Env::new();
+                let home = long_home(&env);
+                let out = env
+                    .cmd()
+                    .env("CLERK_HOME", &home)
+                    .arg("daemon")
+                    .output()
+                    .unwrap();
+                assert!(!out.status.success(), "{out:?}");
+            }
+
+            #[test]
+            fn names_the_fix() {
+                let env = Env::new();
+                let home = long_home(&env);
+                let out = env
+                    .cmd()
+                    .env("CLERK_HOME", &home)
+                    .arg("daemon")
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(text.contains("CLERK_HOME or XDG_RUNTIME_DIR"), "{out:?}");
+            }
+        }
+    }
+
     /// Human output on a terminal, against `docs/cli-output.md`.
     mod human_output {
         use super::*;
@@ -3998,6 +4065,248 @@ mod cli {
                     shown.contains(&format!("Approve with `clerk approve {id}`.")),
                     "{shown}"
                 );
+            }
+        }
+
+        /// Review fixes: linked blockers, stderr style, wrapping, reasons.
+        mod review_fixes {
+            use super::*;
+
+            /// r1/u1 and r2/u2 linked by the admin; r2 held for "other";
+            /// a user request on r1 queued. Its JSON answer.
+            fn linked_visible(env: &Env) -> Value {
+                for (r, u, k) in [("r1", "u1", "k1"), ("r2", "u2", "k2")] {
+                    env.ok(&["resource", "create", r, "--type", "generic"]);
+                    env.ok(&["unit", "add", r, u, "--key", k]);
+                }
+                env.rpc(
+                    "admin_link",
+                    &user("me"),
+                    json!({"a": {"resource": "r1", "unit": "u1"},
+                           "b": {"resource": "r2", "unit": "u2"}}),
+                )
+                .unwrap();
+                hold_for(env, "r2", "10m", "other");
+                queue_on(env, "r1")
+            }
+
+            /// `shared/u1` (user) linked with project alpha's `a-board/u`,
+            /// which an alpha agent holds; returns the beta directory.
+            fn linked_elsewhere(env: &Env) -> PathBuf {
+                let (a, b) = (env.dir("alpha"), env.dir("beta"));
+                seed(env, "shared", "k1");
+                json_of(env.agent("sess-a", &a).args([
+                    "resource", "create", "a-board", "--type", "generic", "--scope", "project",
+                ]));
+                json_of(
+                    env.agent("sess-a", &a)
+                        .args(["unit", "add", "a-board", "u", "--key", "k1"]),
+                );
+                acquire(env, &agent_caller("sess-a", &a), "a-board");
+                b
+            }
+
+            /// A beta agent's queued request on `shared`; its JSON answer.
+            fn queue_from_beta(env: &Env, beta: &Path) -> Value {
+                acquire(env, &agent_caller("sess-b", beta), "shared")
+            }
+
+            mod queued_acquire_on_a_busy_linked_unit {
+                use super::*;
+
+                #[test]
+                fn json_names_the_linked_resource_and_unit() {
+                    let env = Env::new();
+                    let body = linked_visible(&env);
+                    let b = &body["blocked_by"];
+                    assert_eq!(b["kind"], "linked", "{body}");
+                    assert_eq!(b["held_resource"], "r2", "{body}");
+                    assert_eq!(b["held_unit"], "u2", "{body}");
+                }
+
+                #[test]
+                fn json_names_the_holder_and_purpose() {
+                    let env = Env::new();
+                    let body = linked_visible(&env);
+                    let b = &body["blocked_by"];
+                    assert_eq!(b["holder"]["kind"], "user", "{body}");
+                    assert_eq!(b["purpose"], "other", "{body}");
+                }
+
+                #[test]
+                fn human_names_where_it_is_held() {
+                    let env = Env::new();
+                    linked_visible(&env);
+                    let shown = human_detached(&env, "acquire r1 --for 10m");
+                    assert!(
+                        shown.contains(
+                            "\n  u1 is busy: the same device is held as r2/u2 by cli for \
+                             \"other\", ends in "
+                        ),
+                        "{shown}"
+                    );
+                }
+            }
+
+            mod queued_acquire_on_a_linked_unit_busy_in_another_project {
+                use super::*;
+
+                #[test]
+                fn json_hides_the_resource_unit_holder_and_purpose() {
+                    let env = Env::new();
+                    let beta = linked_elsewhere(&env);
+                    let body = queue_from_beta(&env, &beta);
+                    let b = &body["blocked_by"];
+                    assert_eq!(b["kind"], "linked", "{body}");
+                    for key in ["held_resource", "held_unit", "holder", "purpose"] {
+                        assert!(b[key].is_null(), "{key}: {body}");
+                    }
+                }
+
+                #[test]
+                fn json_keeps_the_unit_and_end() {
+                    let env = Env::new();
+                    let beta = linked_elsewhere(&env);
+                    let body = queue_from_beta(&env, &beta);
+                    let b = &body["blocked_by"];
+                    assert_eq!(b["unit"], "u1", "{body}");
+                    assert!(b["ends_at"].is_i64(), "{body}");
+                }
+
+                #[test]
+                fn human_says_it_is_held_in_another_project() {
+                    let env = Env::new();
+                    let beta = linked_elsewhere(&env);
+                    let shown = env.tty(&format!(
+                        "{PLAIN} cd '{}' && {SESSION_VAR}=sess-b \"$CLERK\" acquire shared \
+                         --for 1m < /dev/null",
+                        beta.display()
+                    ));
+                    assert!(
+                        shown.contains(
+                            "\n  u1 is busy: the same device is held in another project, ends in "
+                        ),
+                        "{shown}"
+                    );
+                }
+            }
+
+            mod not_found_for_another_projects_unit {
+                use super::*;
+
+                #[test]
+                fn json_details_name_the_resource() {
+                    let env = Env::new();
+                    let beta = linked_elsewhere(&env);
+                    let error = error_of(
+                        env.agent("sess-b", &beta)
+                            .args(["acquire", "a-board/u", "--for", "1m"]),
+                        3,
+                    );
+                    assert_eq!(
+                        error["details"],
+                        json!({"kind": "resource", "id": "a-board"})
+                    );
+                }
+            }
+
+            mod queue_on_a_missing_resource {
+                use super::*;
+
+                #[test]
+                fn json_details_name_it() {
+                    let env = Env::new();
+                    bench(&env);
+                    let error = error_of(env.cmd().args(["queue", "nope"]), 3);
+                    assert_eq!(error["details"], json!({"kind": "resource", "id": "nope"}));
+                }
+
+                #[test]
+                fn human_names_it() {
+                    let env = Env::new();
+                    bench(&env);
+                    let shown = human(&env, "queue nope");
+                    assert!(shown.contains("not found: resource \"nope\""), "{shown}");
+                }
+            }
+
+            mod stderr_style {
+                use super::*;
+
+                #[test]
+                fn colours_stderr_on_a_tty_when_stdout_is_not() {
+                    let env = Env::new();
+                    bench(&env);
+                    let shown = env.tty(&format!(
+                        "{COLOURED} timeout 2 \"$CLERK\" acquire otbr --for 10m --wait \
+                         < /dev/null > /dev/null"
+                    ));
+                    let style = prefix(&format!("{}", "X".yellow()));
+                    assert!(shown.contains(&format!("{style}⚠ unhealthy")), "{shown:?}");
+                }
+
+                #[test]
+                fn does_not_colour_stderr_that_is_not_a_tty() {
+                    let env = Env::new();
+                    bench(&env);
+                    let err = env.home().join("err.txt");
+                    let shown = env.tty(&format!(
+                        "{COLOURED} timeout 2 \"$CLERK\" acquire otbr --for 10m --wait \
+                         < /dev/null 2> '{0}'; cat '{0}'",
+                        err.display()
+                    ));
+                    assert!(shown.contains("⚠ unhealthy"), "{shown:?}");
+                    assert!(!shown.contains('\x1b'), "{shown:?}");
+                }
+            }
+
+            mod wrapping {
+                use super::*;
+
+                #[test]
+                fn keeps_ids_whole_on_a_narrow_coloured_terminal() {
+                    let env = Env::new();
+                    bench(&env);
+                    let request = queue_on(&env, "otbr")["request_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let shown = env.tty(
+                        "stty cols 30 rows 40; unset NO_COLOR; export LC_ALL=C.UTF-8; \
+                         \"$CLERK\" log --wide",
+                    );
+                    assert!(shown.contains(&request), "{shown:?}");
+                }
+            }
+
+            mod promotion_reason {
+                use super::*;
+
+                #[test]
+                fn json_does_not_name_the_requester() {
+                    let env = Env::new();
+                    promotion(&env);
+                    let body = env.ok(&["promotions"]);
+                    assert_eq!(body[0]["reason"], "a matching unit was registered there");
+                }
+
+                #[test]
+                fn human_names_the_requester_once() {
+                    let env = Env::new();
+                    promotion(&env);
+                    let home = env.home().canonicalize().unwrap();
+                    let shown = env.tty(&format!(
+                        "{PLAIN} export HOME='{}'; \"$CLERK\" promotions",
+                        home.display()
+                    ));
+                    assert!(
+                        shown.contains(
+                            "\n  requested by ~/projects/beta: a matching unit was registered \
+                             there\n"
+                        ),
+                        "{shown}"
+                    );
+                }
             }
         }
 

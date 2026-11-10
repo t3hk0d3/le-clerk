@@ -182,7 +182,7 @@ pub fn run() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => return parse_failure(&e),
     };
-    render::Style::detect(cli.json, cli.ascii).install();
+    render::install(cli.json, cli.ascii);
     let out = Output::new(Mode::detect(cli.json));
     if let Command::Daemon { action: None } = cli.command {
         // The daemon logs to its own file.
