@@ -1017,8 +1017,8 @@ plugin
 - Produces: a result per spec §11 item 1–6 in Appendix C, and, for each that
   fails, the fallback applied to the later tasks (ledger ruling).
 
-- [ ] **Step 1:** §11.1: a background waiter released after 35 min wakes the
-  idle agent (started 2026-11-10 10:36).
+- [x] **Step 1:** §11.1: a background waiter released after 35 min wakes the
+  idle agent: passed 2026-11-10 (Appendix C item 6).
 - [ ] **Step 2:** §11.2: release the waiter while the agent is mid-turn (a
   prompt that runs `sleep 60` in the foreground); record what the agent sees
   and when.

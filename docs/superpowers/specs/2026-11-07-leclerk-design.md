@@ -1359,3 +1359,8 @@ private tmux server, model haiku). Scripts and screens:
    local interactive sessions (terminal, desktop app, VS Code); unattended
    sessions get 30 min by default, or the `timeout` passed with
    `run_in_background` up to 2 h (10 min with `-p` and a text prompt).
+6. **A 35-min background wait in an interactive session (§11.1): passed.**
+   Started 10:36, idle until the waiter was released at 11:12; Claude Code
+   started a turn on its own, the agent read the output file and replied
+   `WOKE flag-long` (`evidence/c-2.txt`). The waiter's own shell error about
+   a process name with spaces is a spike-script flaw, not Claude Code's.
