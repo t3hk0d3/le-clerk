@@ -1,0 +1,24 @@
+                                                                               
+
+● GOT 1
+
+✻ Cooked for 1s · done 11:51                                                   
+
+● Monitor event: NOTICE 2: lease lse_TEST on board/b1 needs you. Reply with exa…
+
+● GOT 2
+
+✻ Cogitated for 2s · done 11:52
+
+● Monitor event: [Monitor expired after 2m with 2 events delivered. Re-arm it i…
+
+● The monitor expired after 2 minutes with 2 events delivered (both answered:
+  GOT 1 and GOT 2). I haven't re-armed it because you asked for a single        
+  120-second watch. Say the word if you want it running again.
+
+✻ Crunched for 2s · done 11:53                                                
+                                                                              
+────────────────────────────────────────────────────────────────────────────────
+❯                                        
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

@@ -507,31 +507,33 @@ spike that showed the CLI is enough.
 The notices themselves are an event stream on the daemon. Getting them to
 agents works in layers:
 
-1. **Primary: a background `clerk wait`.**
-   - The agent keeps one `clerk wait` running with the Bash tool's
-     `run_in_background` while it holds or waits for anything.
-   - `clerk wait` blocks until there are notices for the agent, claims any
-     offer among them (waiting proves the agent is present), prints them and
-     exits.
-   - Claude Code starts a turn in an idle session when a background command
-     completes (verified, Appendix C). The completion notice carries only the
-     path of the command's output file, so the skill and every notice tell the
-     agent to read it.
-   - A local interactive session has no time limit on background commands
-     (documented). Unattended sessions (`-p`, Agent SDK) do: 30 min by
-     default, up to 2 h with the `timeout` passed with `run_in_background`. My
-     call: `clerk wait` has no limit of its own; the skill asks for the 2 h
-     `timeout`, and a wait killed by a limit ends like any other wait, so the
-     agent re-arms it.
-   - `clerk wait` exits when its session is no longer alive (§7.3: the
-     process is gone or has moved to another session); Claude Code does not
-     kill background commands when it is killed itself (Appendix C).
-   - One armed wait per agent (my call): a second `clerk wait` while one runs
-     exits at once, saying one is already armed, so notices are never split
-     between two outputs.
+1. **Primary: Claude Code's Monitor tool on `clerk wait --follow`**
+   (the user's suggestion, verified in Appendix C item 12).
+   - `clerk wait --follow` prints one JSON line per notice as it arrives,
+     claiming any offer first (waiting proves the agent is present), and
+     runs until its session is no longer alive (§7.3).
+   - Monitor turns every line into a message that wakes an idle agent and
+     carries the notice itself, so the agent never reads an output file and
+     never re-arms per notice.
+   - A Monitor watch lasts at most 30 min; its expiry wakes the agent, which
+     re-arms it. That costs an idle holder one short turn per 30 min.
+   - **Fallback: a background one-batch `clerk wait`** (Bash
+     `run_in_background`), where Monitor is not available. It blocks until
+     there are notices, prints them and exits; Claude Code starts a turn when
+     it completes (Appendix C), and the agent reads the output file and
+     starts it again. No time limit in interactive sessions; unattended
+     sessions kill it at 30 min (or the `timeout` passed, up to 2 h), which
+     also wakes the agent (Appendix C item 8). On SIGTERM it prints an empty
+     batch saying to start it again.
+   - Both exit when their session is no longer alive (the process is gone or
+     has moved to another session); Claude Code does not kill background
+     commands when it is killed itself (Appendix C).
+   - One armed wait per agent (my call): a second wait while one runs exits
+     at once, saying one is already armed, so notices are never split.
 2. **Re-arming.**
-   - A wait returns one batch of notices and ends. Its output tells the agent
-     to start it again while it holds or waits for anything.
+   - A Monitor watch expires at 30 min, and a fallback wait ends after one
+     batch; both tell the agent to arm it again while it holds or waits for
+     anything.
    - A **Stop hook** checks with the daemon at the end of each turn. If the
      agent holds a lease or a queued request but has no armed `clerk wait`, the
      hook adds a reminder to the context.
@@ -772,17 +774,18 @@ skill description in every agent's context. Its body is short and points to
 reference files in the skill directory, read only when needed (my call on the
 split):
 - `SKILL.md`: when to use the clerk, the never-message-other-agents rule, the
-  lease loop (find, acquire, keep `clerk wait` armed in the background, read
-  the wait's output file when it completes, follow `next`, release) and where
-  the rest is.
+  lease loop (find, acquire, keep a wait armed with Monitor on
+  `clerk wait --follow`, act on each notice's `next`, release), the
+  background `clerk wait` fallback, and where the rest is.
 - `leasing.md`: the etiquette below in full.
 - `registering.md`: registering resources, below.
 
 **Leasing (agent etiquette)** teaches agents:
 - when to lease, and to declare honest durations;
 - to mark long, pausable work as interruptible;
-- to keep one `clerk wait` running in the background, with the 2 h `timeout`,
-  and to read its output when it completes;
+- to keep one wait armed while holding or queued: Monitor on
+  `clerk wait --follow` (re-armed when it expires), or, without Monitor, a
+  background `clerk wait` whose output file it reads when it completes;
 - to confirm cleanup;
 - to record resource and unit IDs in project docs or memory after creating
   them;
@@ -1003,7 +1006,9 @@ stops the MVP):
 - the forms of CLI holder: `run` and `acquire`, non-interruptible;
 - the host process for liveness, and refusing agent leases without
   `CLAUDE_PID`;
-- one armed `clerk wait` per agent, with no time limit of its own;
+- Monitor on `clerk wait --follow` as the main wait (the user's suggestion),
+  a background one-batch `clerk wait` as the fallback, one armed wait per
+  agent;
 - the description and usage limits, the placeholder syntax and keys, and
   write-time placeholder checks;
 - the tag format and limits, all-tags matching, exact matching, and
@@ -1383,3 +1388,12 @@ private tmux server, model haiku). Scripts and screens:
     continued session's ID and a new `CLAUDE_PID`; Bash sees the same.
 11. **Not checked here (§11.6):** the desktop app and the VS Code extension;
     left for the user.
+12. **Monitor (the user's suggestion): works, idle and in `-p`.** The agent
+    armed Claude Code's Monitor tool on a script printing one notice line per
+    event and ended its turn; each line woke the idle session as a
+    "Monitor event" carrying the line itself, and the agent acted on it
+    (`evidence/g-monitor-idle.txt`). At its `timeout_ms` (at most 30 min) the
+    watch is killed and the expiry also wakes the agent, which must re-arm it
+    (`evidence/g-monitor-expiry.txt`). The same in `claude -p`
+    (`evidence/h-p-monitor.jsonl`; Monitor is a deferred tool there, loaded
+    with ToolSearch). Hence §6 layer 1: Monitor on `clerk wait --follow`.

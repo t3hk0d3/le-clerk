@@ -838,6 +838,13 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
     re-polls with gaps under 2 s); the daemon tracks it in memory;
   - no time limit of its own; `--timeout <duration>` ends it with an empty
     batch (the §11 fallback).
+  - **`--follow`** (Monitor, spec §6 layer 1): prints one JSON line per
+    notice as it arrives (claiming offers first), each acknowledged after
+    its line is flushed, and runs until the session is no longer alive or
+    SIGTERM; never a batch. The armed rule and the one-armed-wait rule
+    apply to it too.
+  - SIGTERM/SIGINT (a background time limit, Appendix C item 8): exits 0
+    after printing an empty batch whose `next` says to start it again.
 - **Agent results:** run by an agent, every command prints JSON (no TTY
   view, no prompts) with `summary` and `next`; errors carry `code`,
   `message`, `details` and end their message with the next step. The
@@ -1000,7 +1007,8 @@ plugin
     skills/clerk
         - SKILL.md frontmatter name clerk, one description; under 120 lines
         - links leasing.md and registering.md; mentions only commands in Part 2 Global Constraints
-        - tells the agent to run clerk wait with run_in_background and the 2 h timeout, and to read its output file on completion
+        - tells the agent to arm Monitor on clerk wait --follow (timeout_ms 1800000) and re-arm it on expiry
+        - gives the background clerk wait (run_in_background, 2 h timeout, read the output file) as the fallback
 ```
 
 ### Task 8: Verify first for the CLI-only interface (spec §11)
