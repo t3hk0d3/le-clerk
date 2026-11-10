@@ -99,7 +99,7 @@ with `--json`, every command prints JSON instead and none of this applies.
 esp32-c6  device · user
   ESP32-C6 devkits on the bench hub
   tags:   devboard esp32 esp32c6 thread zigbee
-  health: type default (exists, accessible, not-open)
+  health: type default (exists, not-open)
   units:
   ◦ b1  /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_F0:F5:BD:01:02:03-if00
         hub port 1
