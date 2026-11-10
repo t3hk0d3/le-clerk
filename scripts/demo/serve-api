@@ -1,6 +1,9 @@
 #!/bin/sh
-# Stand-in API dev server for the demo: listens on $CLERK_UNIT_PORT a few seconds.
-echo "API listening on http://127.0.0.1:$CLERK_UNIT_PORT"
-python3 -m http.server "$CLERK_UNIT_PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+# Stand-in API dev server for the demo: `serve-api [port]` (default
+# $CLERK_UNIT_PORT) listens for $SERVE_SECS seconds (default 6), then stops.
+case "$1" in -h|--help) echo "usage: serve-api [port]  (default \$CLERK_UNIT_PORT; stops after \$SERVE_SECS s)"; exit 0;; esac
+port="${1:-$CLERK_UNIT_PORT}"
+echo "API listening on http://127.0.0.1:$port"
+python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 &
 sleep "${SERVE_SECS:-6}"; kill $!
 echo "API stopped"

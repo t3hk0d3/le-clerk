@@ -2,7 +2,7 @@
 
 *"Un moment, s'il vous plaît… your esp32 is being prepared."*
 
-![Two agents start the same API dev server on one port: the first gets the port, the second queues and gets it when the first server stops](docs/demo.gif)
+![Two Claude Code agents want the API dev server's port: the first leases it, the second queues, arms a wait, and is handed the port when the first releases it](docs/demo.gif)
 
 Le Clerk (`clerk`) gives each of your coding agents its own turn with the
 things they share: dev boards, serial ports, network ports, test services,
@@ -45,10 +45,11 @@ Clean = erase flash and close the monitor.
 Next: Use the unit, then `clerk release lse_01M72…` when you are done.
 ```
 
-The demo at the top is the same idea with a network port: two agents each
-want to start the API dev server on 127.0.0.1:18080. The first gets the
-port; the second is told who holds it and why, waits, and starts its server
-the moment the first one stops. No "address already in use", no guessing.
+The demo at the top is the same idea with a network port: two Claude Code
+agents both want to start the API dev server on 127.0.0.1:18080. The first
+leases the port; the second is told who holds it and why, queues, and arms
+a wait. When the first releases it, the clerk hands the port to the second,
+which starts its server. No "address already in use", no guessing.
 
 If every board is busy, it gets its place in the queue instead and arms a
 wait. When the board comes back, the clerk wakes the idle session, hands it
