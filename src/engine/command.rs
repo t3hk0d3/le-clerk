@@ -439,6 +439,12 @@ macro_rules! commands {
                 match self { $( Self::$variant(caller, _) => caller, )* }
             }
 
+            /// Who is calling, to resolve it (the engine follows an agent
+            /// session's resume aliases).
+            pub fn caller_mut(&mut self) -> &mut Caller {
+                match self { $( Self::$variant(caller, _) => caller, )* }
+            }
+
             /// The read-only flag declared in the table.
             fn declared_read_only(&self) -> bool {
                 match self { $( Self::$variant(..) => $ro, )* }

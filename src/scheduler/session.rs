@@ -28,6 +28,11 @@
 //! session's leases, requests and pending notices to the live proxy session.
 //! Aliases are kept in the store (`session_aliases`) and loaded at boot, so
 //! a chain of resumes (`--continue` twice) resolves across daemon restarts.
+//!
+//! Work that writes the store goes through [`Sessions::transact`]: it runs
+//! on a copy of the record, which replaces the record only once the store
+//! transaction has committed, so a failed commit leaves memory and store
+//! in agreement.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -39,7 +44,7 @@ use ulid::Ulid;
 use crate::model::{EndCause, HolderRef, ProjectKey};
 use crate::scheduler::liveness::HolderEnded;
 use crate::scheduler::{Scheduler, SchedulerError, clerk_actor};
-use crate::store::{StoreError, Tx, audit, leases, notices, sessions as alias_store};
+use crate::store::{Store, StoreError, Tx, audit, leases, notices, sessions as alias_store};
 
 /// What [`Sessions::alias`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -109,7 +114,7 @@ pub enum AliasRefusal {
 }
 
 /// One agent session as the liveness record knows it.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct Session {
     /// Open liveness streams, by connection (a connection may briefly have
     /// two while a proxy reconnects).
@@ -129,7 +134,7 @@ struct Session {
 }
 
 /// The liveness record of every agent session the engine has seen.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Sessions {
     grace_ms: i64,
     known: HashMap<String, Session>,
@@ -155,6 +160,23 @@ impl Sessions {
             pending: HashMap::new(),
             connects: 0,
         }
+    }
+
+    /// Run `f` on a copy of this record inside a transaction of `store`;
+    /// the copy replaces the record only once the transaction committed.
+    /// On any error (from `f`, or the commit) the record is unchanged.
+    ///
+    /// # Errors
+    /// `f`'s error, or the store's.
+    pub fn transact<T, E: From<StoreError>>(
+        &mut self,
+        store: &mut Store,
+        f: impl FnOnce(&Tx<'_>, &mut Sessions) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut draft = self.clone();
+        let value = store.tx(|tx| f(tx, &mut draft))?;
+        *self = draft;
+        Ok(value)
     }
 
     /// The id `session_id` stands for: the end of its chain of resume

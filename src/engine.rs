@@ -504,6 +504,14 @@ impl EngineHandle {
         filter: Option<NoticeFilter>,
         timeout: Duration,
     ) -> Result<Vec<Notice>, ApiError> {
+        // Park under the session the engine will deliver to, so its
+        // notices wake this wait.
+        let holder = match holder {
+            HolderRef::AgentSession { session_id } => HolderRef::AgentSession {
+                session_id: self.session_resolve(None, session_id).await?,
+            },
+            other => other,
+        };
         let got = self
             .wait_until(&holder, timeout.min(MAX_WAIT), || async {
                 let got = self.take(holder.clone(), filter.clone()).await?;
@@ -902,8 +910,9 @@ impl Engine {
     fn boot_sessions(&mut self) {
         let result = self.guarded("session boot", |engine| {
             let now = engine.clock.now_ms();
-            let sessions = &mut engine.sessions;
-            Ok(engine.store.tx(|tx| sessions.boot(tx, now))?)
+            Ok(engine
+                .sessions
+                .transact(&mut engine.store, |tx, sessions| sessions.boot(tx, now))?)
         });
         match result {
             Ok(graced) if graced.is_empty() => {}
@@ -916,8 +925,12 @@ impl Engine {
     fn expire_sessions(&mut self) {
         let result = self.guarded("session expiry", |engine| {
             let now = engine.clock.now_ms();
-            let (sessions, sched) = (&mut engine.sessions, &engine.scheduler);
-            Ok(engine.store.tx(|tx| sessions.expire(tx, sched, now))?)
+            let sched = &engine.scheduler;
+            Ok(engine
+                .sessions
+                .transact(&mut engine.store, |tx, sessions| {
+                    sessions.expire(tx, sched, now)
+                })?)
         });
         match result {
             Ok(ended) if ended.is_empty() => {}
@@ -939,25 +952,9 @@ impl Engine {
 
     fn handle(&mut self, job: Job) {
         match job {
-            Job::Command(command, reply) => {
-                // Reads see overdue deadlines processed.
-                if self.deadline_due() {
-                    self.maintain();
-                }
-                let method = command.method();
-                let mutating = !command.read_only();
-                let stop = matches!(*command, Command::DaemonStop(..));
-                let result = self.guarded(method, |engine| engine.execute(*command));
-                if stop && result.is_ok() {
-                    self.stopping = true;
-                }
-                // The caller may have gone away; nothing to do then.
-                let _ = reply.send(result);
-                if mutating {
-                    self.maintain();
-                }
-            }
-            Job::TakeNotices(holder, filter, reply) => {
+            Job::Command(command, reply) => self.handle_command(*command, reply),
+            Job::TakeNotices(mut holder, filter, reply) => {
+                self.resolve_holder(&mut holder);
                 let result = self.guarded("take_notices", |engine| {
                     let now = engine.clock.now_ms();
                     Ok(engine.store.tx(|tx| {
@@ -966,7 +963,8 @@ impl Engine {
                 });
                 let _ = reply.send(result);
             }
-            Job::ReturnNotices(holder, filter, reply) => {
+            Job::ReturnNotices(mut holder, filter, reply) => {
+                self.resolve_holder(&mut holder);
                 let result = self.guarded("return_notices", |engine| {
                     let now = engine.clock.now_ms();
                     Ok(engine.store.tx(|tx| {
@@ -975,14 +973,16 @@ impl Engine {
                 });
                 let _ = reply.send(result);
             }
-            Job::AckNotices(holder, ids, reply) => {
+            Job::AckNotices(mut holder, ids, reply) => {
+                self.resolve_holder(&mut holder);
                 let result = self.guarded("ack_notices", |engine| {
                     let now = engine.clock.now_ms();
                     Ok(engine.store.tx(|tx| notices::ack(tx, &holder, &ids, now))?)
                 });
                 let _ = reply.send(result);
             }
-            Job::PendingNotices(holder, reply) => {
+            Job::PendingNotices(mut holder, reply) => {
+                self.resolve_holder(&mut holder);
                 let result = self.guarded("pending_notices", |engine| {
                     Ok(engine.store.tx(|tx| notices::pending(tx, &holder))?)
                 });
@@ -999,10 +999,12 @@ impl Engine {
             }
             Job::SessionEndNow(session_id, reply) => {
                 let result = self.guarded("session_end_now", |engine| {
-                    let (sessions, sched) = (&mut engine.sessions, &engine.scheduler);
+                    let sched = &engine.scheduler;
                     engine
-                        .store
-                        .tx(|tx| sessions.end_now(tx, sched, &session_id))?;
+                        .sessions
+                        .transact(&mut engine.store, |tx, sessions| {
+                            sessions.end_now(tx, sched, &session_id)
+                        })?;
                     Ok(())
                 });
                 let _ = reply.send(result);
@@ -1010,10 +1012,12 @@ impl Engine {
             }
             Job::SessionAlias(from, to, reply) => {
                 let result = self.guarded("session_alias", |engine| {
-                    let (sessions, sched) = (&mut engine.sessions, &engine.scheduler);
+                    let sched = &engine.scheduler;
                     Ok(engine
-                        .store
-                        .tx(|tx| sessions.alias(tx, sched, &from, &to))?)
+                        .sessions
+                        .transact(&mut engine.store, |tx, sessions| {
+                            sessions.alias(tx, sched, &from, &to)
+                        })?)
                 });
                 let _ = reply.send(result);
                 self.maintain();
@@ -1027,10 +1031,10 @@ impl Engine {
             Job::Hook(command, reply) => {
                 let result = self.guarded(command.method(), |engine| {
                     let now = engine.clock.now_ms();
-                    let (sessions, sched) = (&mut engine.sessions, &engine.scheduler);
-                    engine
-                        .store
-                        .tx(|tx| command.execute(tx, sessions, sched, now))
+                    let sched = &engine.scheduler;
+                    engine.sessions.transact(&mut engine.store, |tx, sessions| {
+                        command.execute(tx, sessions, sched, now)
+                    })
                 });
                 let changed = result.as_ref().is_ok_and(|a| a.changed);
                 let _ = reply.send(result);
@@ -1038,6 +1042,38 @@ impl Engine {
                     self.maintain();
                 }
             }
+        }
+    }
+
+    /// Run an RPC command for its caller (resolved through the resume
+    /// aliases) and answer `reply`.
+    fn handle_command(&mut self, mut command: Command, reply: Reply<Value>) {
+        self.resolve_holder(&mut command.caller_mut().holder);
+        // Reads see overdue deadlines processed.
+        if self.deadline_due() {
+            self.maintain();
+        }
+        let method = command.method();
+        let mutating = !command.read_only();
+        let stop = matches!(command, Command::DaemonStop(..));
+        let result = self.guarded(method, |engine| engine.execute(command));
+        if stop && result.is_ok() {
+            self.stopping = true;
+        }
+        // The caller may have gone away; nothing to do then.
+        let _ = reply.send(result);
+        if mutating {
+            self.maintain();
+        }
+    }
+
+    /// An agent session holder stands for the session its resume aliases
+    /// lead to (the live proxy session that took it over), whoever calls:
+    /// the CLI from an agent's shell after `--continue`, an RPC or MCP.
+    /// Other holders are left alone.
+    fn resolve_holder(&self, holder: &mut HolderRef) {
+        if let HolderRef::AgentSession { session_id } = holder {
+            *session_id = self.sessions.resolve(None, session_id);
         }
     }
 

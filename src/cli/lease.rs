@@ -7,6 +7,9 @@
 //! `--wait`, it waits for the offer and claims it); `attach` claims an
 //! offered lease and prints it, and `cancel` withdraws a queued request.
 //!
+//! `wait` refuses to run in an agent session: MCP `lease_wait` owns its
+//! notices.
+//!
 //! Leases of the user's CLI (no agent session) belong to lease-scoped
 //! `User` holders. `attach`, `release` and `extend` act as the holder the
 //! status view names for the lease, and only when it is such a holder: a
@@ -355,6 +358,16 @@ pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
 
 pub async fn wait(ctx: &Ctx, args: WaitArgs) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Detached)?;
+    if caller::is_agent(&caller) {
+        // MCP's lease_wait owns the session's notices (they stay pending
+        // until acknowledged); taking them here would hide them from it.
+        return Err(UsageError(format!(
+            "clerk wait does not run in an agent session ({} is set): call the clerk MCP tool \
+             lease_wait instead, which returns this session's notices and claims its offers.",
+            caller::SESSION_VAR
+        ))
+        .into());
+    }
     let client = ctx.client().await?;
     loop {
         let batch = next_batch(&client, &caller).await?;
@@ -379,7 +392,9 @@ pub async fn wait(ctx: &Ctx, args: WaitArgs) -> anyhow::Result<()> {
 // Shared steps
 // ---------------------------------------------------------------------------
 
-/// Claim the offered `lease`.
+/// Claim the offered `lease`. When the caller already holds it (an agent
+/// session's MCP `lease_wait` claims its offers too), its current state is
+/// the answer, as for MCP's claim.
 ///
 /// Debug builds only: `CLERK_TEST_CLAIM_DELAY_MS` delays the claim, so
 /// tests can press Ctrl+C while an offer is pending. Release builds never
@@ -392,9 +407,14 @@ pub async fn claim(client: &Client, caller: &Caller, lease: &str) -> Result<Valu
     {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
-    client
-        .call("claim", caller, json!({ "lease_id": lease }))
-        .await
+    let args = json!({ "lease_id": lease });
+    match client.call("claim", caller, args.clone()).await {
+        Ok(view) => Ok(view),
+        Err(e) => match client.call("get_lease", caller, args).await {
+            Ok(view) if matches!(view["state"].as_str(), Some("held" | "paused")) => Ok(view),
+            _ => Err(e),
+        },
+    }
 }
 
 /// Withdraw `request`; if it was already offered a unit, the offer.

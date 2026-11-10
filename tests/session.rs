@@ -493,6 +493,70 @@ mod scheduler {
                     .collect()
             }
 
+            mod on_the_transaction_failing_after_it {
+                use super::*;
+
+                /// `old` holds `board/u1` and is gone; `new` is connected;
+                /// the alias runs in a transaction that then fails (as a
+                /// failed commit would), through [`Sessions::transact`].
+                fn failed() -> Fixture {
+                    let mut f = fixture();
+                    let c = Ulid::new();
+                    f.connect("old", c, Some(41));
+                    f.grant(agent("old"));
+                    f.disconnect(c);
+                    f.connect("new", Ulid::new(), Some(42));
+                    let sched = &f.sched;
+                    let result: Result<(), StoreError> =
+                        f.sessions.transact(&mut f.store, |tx, sessions| {
+                            let done = sessions.alias(tx, sched, "new", "old").unwrap();
+                            assert_eq!(done, Aliased::TakenOver);
+                            Err(StoreError::Corrupt("injected"))
+                        });
+                    assert!(result.is_err());
+                    f
+                }
+
+                #[test]
+                fn the_resumed_id_still_resolves_to_itself() {
+                    let f = failed();
+                    assert_eq!(f.sessions.resolve(None, "old"), "old");
+                }
+
+                #[test]
+                fn the_resumed_session_keeps_its_grace() {
+                    let f = failed();
+                    assert_eq!(f.sessions.grace_ends("old"), Some(T0 + GRACE_MS));
+                }
+
+                #[test]
+                fn a_later_alias_still_takes_it_over() {
+                    let mut f = failed();
+                    assert_eq!(f.alias("new", "old"), Aliased::TakenOver);
+                }
+            }
+
+            mod on_the_transaction_committing {
+                use super::*;
+
+                #[test]
+                fn transact_keeps_the_changes() {
+                    let mut f = fixture();
+                    let c = Ulid::new();
+                    f.connect("old", c, Some(41));
+                    f.grant(agent("old"));
+                    f.disconnect(c);
+                    f.connect("new", Ulid::new(), Some(42));
+                    let sched = &f.sched;
+                    let done: Result<Aliased, leclerk::scheduler::SchedulerError> =
+                        f.sessions.transact(&mut f.store, |tx, sessions| {
+                            sessions.alias(tx, sched, "new", "old")
+                        });
+                    assert_eq!(done.unwrap(), Aliased::TakenOver);
+                    assert_eq!(f.sessions.resolve(None, "old"), "new");
+                }
+            }
+
             mod on_two_resumes_in_a_row {
                 use super::*;
 
@@ -913,6 +977,102 @@ mod engine {
                 engine.session_resolve(None, "old".into()).await.unwrap(),
                 "new"
             );
+        }
+    }
+
+    /// Any command, CLI or RPC, of an agent session that a resume aliased:
+    /// `old` held the board and was resumed by `new`.
+    mod any_command_of_an_aliased_session {
+        use super::*;
+
+        async fn resumed() -> (
+            EngineHandle,
+            leclerk::engine::SessionLink,
+            serde_json::Value,
+        ) {
+            let (store, clock) = seeded();
+            let engine = engine_on(store, clock);
+            let old = engine
+                .session_connect("old".into(), Ulid::new(), Some(41), None)
+                .await
+                .unwrap();
+            let grant = call(&engine, agent("old"), "acquire").await;
+            drop(old);
+            assert!(!engine.session_alive("old".into()).await.unwrap());
+            let new = engine
+                .session_connect("new".into(), Ulid::new(), Some(42), None)
+                .await
+                .unwrap();
+            engine
+                .session_alias("new".into(), "old".into())
+                .await
+                .unwrap();
+            (engine, new, grant)
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn acts_on_the_live_sessions_leases() {
+            let (engine, _link, grant) = resumed().await;
+            let lease = grant["lease_id"].clone();
+            let released = engine
+                .call(
+                    leclerk::engine::Command::parse(
+                        "release",
+                        as_caller(agent("old")),
+                        serde_json::json!({ "lease_id": lease }),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(released["state"], "cleaning", "{released}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_new_lease_is_held_by_the_live_session() {
+            let (engine, _link, grant) = resumed().await;
+            let lease = grant["lease_id"].clone();
+            let as_old = |method: &str, args: serde_json::Value| {
+                leclerk::engine::Command::parse(method, as_caller(agent("old")), args).unwrap()
+            };
+            engine
+                .call(as_old("release", serde_json::json!({ "lease_id": lease })))
+                .await
+                .unwrap();
+            engine
+                .call(as_old("confirm", serde_json::json!({ "lease_id": lease })))
+                .await
+                .unwrap();
+            call(&engine, agent("old"), "acquire").await;
+            assert_eq!(
+                state_of(&engine, agent("new")).await.as_deref(),
+                Some("held")
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn reads_the_live_sessions_notices() {
+            let (engine, _link, grant) = resumed().await;
+            let admin = Caller {
+                holder: user("admin"),
+                project: None,
+                override_reason: None,
+            };
+            engine
+                .call(
+                    leclerk::engine::Command::parse(
+                        "admin_release",
+                        admin,
+                        serde_json::json!({ "lease_id": grant["lease_id"] }),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let theirs = engine.pending_notices(agent("new")).await.unwrap();
+            assert_ne!(theirs.len(), 0);
+            let via_old = engine.pending_notices(agent("old")).await.unwrap();
+            assert_eq!(via_old.len(), theirs.len());
         }
     }
 
