@@ -1,0 +1,9 @@
+{
+  "name": "leclerk",
+  "version": "0.1.0",
+  "description": "Le Clerk for Claude Code: the clerk's MCP tools, hooks that keep agents listening for lease notices, and skills for leasing and registering shared resources. Needs `clerk` on PATH.",
+  "author": {
+    "name": "Igor Yamolov"
+  },
+  "keywords": ["lease", "resources", "devices", "ports", "coordination"]
+}

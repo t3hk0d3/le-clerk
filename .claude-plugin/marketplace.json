@@ -1,0 +1,14 @@
+{
+  "name": "leclerk",
+  "description": "Le Clerk: a local resource-lease broker for AI coding agents.",
+  "owner": {
+    "name": "Igor Yamolov"
+  },
+  "plugins": [
+    {
+      "name": "leclerk",
+      "source": "./integrations/claude-code",
+      "description": "Lease shared boards, ports, services and tokens through the clerk instead of fighting over them."
+    }
+  ]
+}

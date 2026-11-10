@@ -1,0 +1,33 @@
+{
+  "description": "Le Clerk: carry resumed sessions' leases over, re-arm lease_wait, show pending notices, end liveness on exit. Every hook fails open.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "clerk hook session-start", "timeout": 3 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "clerk hook stop", "timeout": 3 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "clerk hook pre-tool-use", "timeout": 3 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "clerk hook session-end", "timeout": 1.5 }
+        ]
+      }
+    ]
+  }
+}

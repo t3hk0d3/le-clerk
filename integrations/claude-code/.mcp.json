@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "clerk": {
+      "command": "clerk",
+      "args": ["mcp"]
+    }
+  }
+}
