@@ -36,9 +36,9 @@ const ARM_GRACE: Duration = Duration::from_secs(6);
 const STEP: Duration = Duration::from_secs(2);
 
 /// The next step after any wait that ended without leaving one armed.
-pub const ARM_AGAIN: &str = "While you hold or wait for anything, keep a wait armed: \
-     `clerk wait --follow` with the Monitor tool (timeout_ms 1800000), or `clerk wait` \
-     in the background.";
+pub const ARM_AGAIN: &str = "While you are queued or hold an interruptible lease, keep one \
+     `clerk wait` running with the Bash tool's run_in_background (timeout 7200000); it costs \
+     nothing while idle. When it completes, read its output and act on it.";
 
 /// Run `clerk wait` for agent session `caller`.
 ///
@@ -130,7 +130,11 @@ async fn steps(
                 );
             }
             Some("notices") => {
-                let notices = step["notices"].as_array().cloned().unwrap_or_default();
+                let all = step["notices"].as_array().cloned().unwrap_or_default();
+                let notices = actionable(client, caller, session_id, all).await?;
+                if notices.is_empty() {
+                    continue;
+                }
                 if args.follow {
                     for notice in notices {
                         let claimed = claim_if_offered(client, caller, &notice).await;
@@ -168,6 +172,47 @@ async fn steps(
             }
             other => anyhow::bail!("the daemon answered the wait with {other:?}"),
         }
+    }
+}
+
+/// The notices of `all` that need the agent; the others are acknowledged
+/// here and never printed.
+async fn actionable(
+    client: &Client,
+    caller: &Caller,
+    session: &str,
+    all: Vec<Value>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut keep = Vec::new();
+    let mut noise = Vec::new();
+    for notice in all {
+        if needs_no_action(client, caller, &notice).await {
+            noise.push(notice);
+        } else {
+            keep.push(notice);
+        }
+    }
+    ack(client, session, &noise.iter().collect::<Vec<_>>()).await?;
+    Ok(keep)
+}
+
+/// Whether `notice` needs nothing from the agent, so it must not end a
+/// wait (waking an agent re-reads its whole conversation): a queue move, a
+/// lease that ended cleanly, or the cleanup notice of a lease already over.
+async fn needs_no_action(client: &Client, caller: &Caller, notice: &Value) -> bool {
+    match notice["kind"].as_str() {
+        Some("position_changed") => true,
+        Some("lease_ended") => notice["dirty"].is_null(),
+        Some("cleanup_window_started") => {
+            let Some(lease) = notice["lease_id"].as_str() else {
+                return false;
+            };
+            client
+                .call("get_lease", caller, json!({ "lease_id": lease }))
+                .await
+                .is_ok_and(|l| l["state"] == "ended")
+        }
+        _ => false,
     }
 }
 

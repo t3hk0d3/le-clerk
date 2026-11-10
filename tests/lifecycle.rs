@@ -1508,3 +1508,163 @@ mod lease_lifecycle {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Soft expiry: an agent's lease past its end with nobody waiting stays held
+// ---------------------------------------------------------------------------
+
+mod soft_expiry {
+    use super::*;
+
+    fn agent(session: &str) -> Caller {
+        Caller {
+            holder: HolderRef::AgentSession {
+                session_id: session.into(),
+            },
+            project: None,
+            override_reason: None,
+        }
+    }
+
+    /// `s1` holds `board/u1` for 10 minutes, and the end has passed.
+    fn overdue(f: &mut Fixture) -> LeaseId {
+        f.seed("board", &["u1"]);
+        let g = f.grant(&agent("s1"), req("board", 10 * MIN, Priority::Normal, "x"));
+        f.at(T0 + 10 * MIN_MS);
+        f.tick();
+        g.lease_id
+    }
+
+    fn dispatch(f: &mut Fixture) {
+        f.store.tx(|tx| f.sched.dispatch(tx)).unwrap();
+    }
+
+    mod on_an_agent_lease_reaching_its_end {
+        use super::*;
+
+        #[test]
+        fn with_nobody_queued_it_stays_held_and_overdue() {
+            let mut f = fixture();
+            let lease = overdue(&mut f);
+            assert_eq!(f.column::<String>(&lease, "state"), "held");
+            assert!(f.column::<bool>(&lease, "overdue"));
+            assert_eq!(f.audit("lease_overdue").len(), 1);
+        }
+
+        #[test]
+        fn the_timer_does_not_fire_again() {
+            let mut f = fixture();
+            let lease = overdue(&mut f);
+            f.at(T0 + 100 * MIN_MS);
+            assert_eq!(f.tick(), None);
+            assert_eq!(f.column::<String>(&lease, "state"), "held");
+            assert_eq!(f.audit("lease_overdue").len(), 1);
+        }
+
+        #[test]
+        fn with_someone_queued_it_expires_as_before() {
+            let mut f = fixture();
+            f.seed("board", &["u1"]);
+            let g = f.grant(&agent("s1"), req("board", 10 * MIN, Priority::Normal, "x"));
+            f.queue(&caller("w"), req("board", MIN, Priority::Normal, "y"));
+            f.at(T0 + 10 * MIN_MS);
+            f.tick();
+            assert_eq!(f.column::<String>(&g.lease_id, "state"), "cleaning");
+            assert_eq!(f.column::<String>(&g.lease_id, "cleanup_cause"), "expired");
+        }
+    }
+
+    mod on_another_holders_lease_reaching_its_end {
+        use super::*;
+
+        #[test]
+        fn it_expires_as_before() {
+            let mut f = fixture();
+            f.seed("board", &["u1"]);
+            let g = f.grant(&caller("a"), req("board", 10 * MIN, Priority::Normal, "x"));
+            f.at(T0 + 10 * MIN_MS);
+            f.tick();
+            assert_eq!(f.column::<String>(&g.lease_id, "state"), "cleaning");
+        }
+    }
+
+    mod on_a_request_queued_for_an_overdue_unit {
+        use super::*;
+
+        /// `w` queues for the overdue unit and the queue is settled.
+        fn claimed(f: &mut Fixture) -> LeaseId {
+            let lease = overdue(f);
+            f.queue(&caller("w"), req("board", MIN, Priority::Normal, "y"));
+            dispatch(f);
+            lease
+        }
+
+        #[test]
+        fn the_lease_starts_cleaning_as_abandoned_and_the_holder_is_told() {
+            let mut f = fixture();
+            let lease = claimed(&mut f);
+            assert_eq!(f.column::<String>(&lease, "state"), "cleaning");
+            assert_eq!(f.column::<String>(&lease, "cleanup_cause"), "abandoned");
+            let told = f.notices_of(&agent("s1").holder, NoticeKind::CleanupWindowStarted);
+            assert_eq!(told.len(), 1);
+            assert!(
+                told[0].action.contains("someone is waiting"),
+                "{}",
+                told[0].action
+            );
+        }
+
+        #[test]
+        fn a_holder_confirming_in_the_window_hands_over_clean() {
+            let mut f = fixture();
+            let lease = claimed(&mut f);
+            f.confirm(&agent("s1"), &lease, Confirm::Clean).unwrap();
+            dispatch(&mut f);
+            let offers = f.notices_of(&caller("w").holder, NoticeKind::Offered);
+            assert_eq!(offers.len(), 1);
+            assert_eq!(offers[0].dirty, None);
+        }
+
+        #[test]
+        fn the_window_ending_marks_the_unit_abandoned_for_the_new_owner() {
+            let mut f = fixture();
+            claimed(&mut f);
+            f.at(T0 + 12 * MIN_MS + SEC);
+            f.tick();
+            dispatch(&mut f);
+            let offers = f.notices_of(&caller("w").holder, NoticeKind::Offered);
+            assert_eq!(offers.len(), 1);
+            assert_eq!(
+                offers[0].dirty.as_ref().unwrap().reason,
+                DirtyReason::Abandoned
+            );
+            assert!(
+                offers[0].action.contains("abandoned"),
+                "{}",
+                offers[0].action
+            );
+        }
+    }
+
+    mod on_an_overdue_lease {
+        use super::*;
+
+        #[test]
+        fn extend_moves_the_end_and_clears_overdue() {
+            let mut f = fixture();
+            let lease = overdue(&mut f);
+            f.at(T0 + 20 * MIN_MS);
+            f.extend(&agent("s1"), &lease, T0 + 30 * MIN_MS).unwrap();
+            assert!(!f.column::<bool>(&lease, "overdue"));
+            assert_eq!(f.column::<i64>(&lease, "ends_at"), T0 + 30 * MIN_MS);
+        }
+
+        #[test]
+        fn release_starts_a_normal_cleanup() {
+            let mut f = fixture();
+            let lease = overdue(&mut f);
+            f.release(&agent("s1"), &lease).unwrap();
+            assert_eq!(f.column::<String>(&lease, "cleanup_cause"), "released");
+        }
+    }
+}

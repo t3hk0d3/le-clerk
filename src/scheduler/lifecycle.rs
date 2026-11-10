@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::model::{
-    Caller, DirtyInfo, DirtyReason, EndCause, LeaseId, LeaseState, ResourceId, UnitId,
+    Caller, DirtyInfo, DirtyReason, EndCause, HolderRef, LeaseId, LeaseState, ResourceId, UnitId,
 };
 use crate::scheduler::dispatch::{HealthCache, QueueSnapshot};
 use crate::scheduler::{
@@ -64,6 +64,7 @@ fn dirty_reason(cause: EndCause) -> DirtyReason {
     match cause {
         EndCause::Expired => DirtyReason::Expired,
         EndCause::HolderGone => DirtyReason::HolderGone,
+        EndCause::Abandoned => DirtyReason::Abandoned,
         EndCause::Override => DirtyReason::Override,
         EndCause::CommandFailed => DirtyReason::CommandFailed,
         EndCause::AdminForced => DirtyReason::AdminForced,
@@ -113,7 +114,9 @@ impl Scheduler {
                         Timer::Warning,
                     ));
                 }
-                out.push((ends_at, Timer::Expiry));
+                if !lease.overdue {
+                    out.push((ends_at, Timer::Expiry));
+                }
                 if let Some(deadline) = lease.yield_deadline {
                     out.push((deadline, Timer::Yield));
                 }
@@ -199,7 +202,7 @@ impl Scheduler {
             match timer {
                 Timer::Claim => self.dispatch_with(tx, &mut HealthCache::new(), at)?,
                 Timer::Warning => self.warn(tx, &lease)?,
-                Timer::Expiry => self.expire(tx, &lease)?,
+                Timer::Expiry => self.reach_end(tx, &lease)?,
                 Timer::Yield => self.yield_timed_out(tx, &lease)?,
                 Timer::Overrun => self.borrower_overran(tx, &lease)?,
                 Timer::CleanupEnding => self.cleanup_ending(tx, &lease)?,
@@ -388,6 +391,56 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Whether `lease`, at its end, stays held instead of expiring: an
+    /// agent's lease with nobody waiting for the unit. (A dead session's
+    /// leases are ended by its grace, so an agent lease here is live.)
+    fn stays_past_end(tx: &Tx, lease: &LeaseRow) -> Result<bool, SchedulerError> {
+        Ok(matches!(lease.holder, HolderRef::AgentSession { .. }) && !Self::has_waiter(tx, lease)?)
+    }
+
+    /// A held lease reached its end: it goes overdue (soft expiry) or
+    /// expires.
+    fn reach_end(&self, tx: &Tx, lease: &LeaseRow) -> Result<(), SchedulerError> {
+        if !Self::stays_past_end(tx, lease)? {
+            return self.expire(tx, lease);
+        }
+        leases::set_overdue(tx, lease.row)?;
+        audit::record(
+            tx,
+            self.now(),
+            &clerk_actor(),
+            "lease_overdue",
+            &json!({ "lease": lease.id, "holder": lease.holder }),
+        )?;
+        Ok(())
+    }
+
+    /// Someone wants the unit of overdue `lease`: it starts its cleanup
+    /// window, and the holder is told, so an owner that is still there can
+    /// hand over properly. Unconfirmed, the unit goes on as abandoned.
+    pub(super) fn call_in_overdue(&self, tx: &Tx, lease: &LeaseRow) -> Result<(), SchedulerError> {
+        let window = millis(Duration::from_secs(self.config.cleanup_window));
+        self.start_cleanup(
+            tx,
+            lease,
+            EndCause::Abandoned,
+            self.now().saturating_add(window),
+            format!(
+                "Lease {} is past its end and someone is waiting for the unit; stop using it, \
+                 clean up and confirm before the deadline, or it is handed over as abandoned.",
+                lease.id
+            ),
+        )?;
+        audit::record(
+            tx,
+            self.now(),
+            &clerk_actor(),
+            "overdue_called_in",
+            &json!({ "lease": lease.id, "holder": lease.holder }),
+        )?;
+        Ok(())
+    }
+
     /// Expire a held lease: it starts cleaning. The window runs from
     /// `max(ends_at, now)`: in normal running that is the lease's end, and
     /// after downtime the holder still gets a full window from now (§5.4).
@@ -459,7 +512,7 @@ impl Scheduler {
             return Err(SchedulerError::BadState { state: lease.state });
         }
         let ends_at = lease.ends_at.ok_or(StoreError::Corrupt("leases.ends_at"))?;
-        if now >= ends_at {
+        if now >= ends_at && !lease.overdue && !Self::stays_past_end(tx, &lease)? {
             return Err(SchedulerError::BadState {
                 state: LeaseState::Cleaning,
             });
@@ -527,7 +580,10 @@ impl Scheduler {
         if lease.state != LeaseState::Held {
             return Err(SchedulerError::BadState { state: lease.state });
         }
-        if lease.ends_at.is_some_and(|e| now >= e) {
+        if lease.ends_at.is_some_and(|e| now >= e)
+            && !lease.overdue
+            && !Self::stays_past_end(tx, &lease)?
+        {
             self.expire(tx, &lease)?;
             return Self::view(tx, id);
         }

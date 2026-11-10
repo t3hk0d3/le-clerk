@@ -143,22 +143,48 @@ fn s(v: &Value, key: &str) -> String {
     v[key].as_str().unwrap_or("?").to_owned()
 }
 
+/// Whether a `leases --mine` answer has something an idle agent must hear
+/// about: a queued request or an interruptible lease.
+fn needs_wait(v: &Value) -> bool {
+    v["requests"].as_array().is_some_and(|r| !r.is_empty())
+        || v["leases"]
+            .as_array()
+            .is_some_and(|l| l.iter().any(|x| x["interruptible"] == true))
+}
+
+/// The note of a grant: what is held, whether the previous owner abandoned
+/// it, and a wait only when the lease can be asked to yield.
+fn granted(v: &Value, lease: &str) -> (Vec<String>, String) {
+    let mut summary = vec![format!(
+        "You hold lease {lease} ({}/{}); read its description and usage before using it.",
+        s(v, "resource"),
+        s(v, "unit")
+    )];
+    if v["dirty"]["reason"] == "abandoned" {
+        summary.push(
+            "The previous owner abandoned this unit: check it before you rely on it.".to_owned(),
+        );
+    }
+    let wait = if v["interruptible"] == true {
+        format!(" {ARM_AGAIN}")
+    } else {
+        String::new()
+    };
+    (
+        summary,
+        format!(
+            "Use the unit, then `clerk release {lease}` when you are done (`clerk extend \
+             {lease} --for <d>` for more time).{wait}"
+        ),
+    )
+}
+
 /// The summary lines and next step for `command`'s result `v`.
 pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
     let lease = s(v, "lease_id");
     match command {
         "acquire" | "claim" | "attach" if v["outcome"] == "queued" => queued(v),
-        "acquire" | "claim" | "attach" | "reclaim" => (
-            vec![format!(
-                "You hold lease {lease} ({}/{}); read its description and usage before using it.",
-                s(v, "resource"),
-                s(v, "unit")
-            )],
-            format!(
-                "Use the unit, then `clerk release {lease}` when you are done (`clerk extend \
-                 {lease} --for <d>` for more time). {ARM_AGAIN}"
-            ),
-        ),
+        "acquire" | "claim" | "attach" | "reclaim" => granted(v, &lease),
         "release" if v["state"] == "cleaning" => (
             vec![format!("Lease {lease} is in its cleanup window.")],
             format!("Clean the unit up, then `clerk confirm {lease} clean`."),
@@ -225,8 +251,10 @@ pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
             )],
             if v["armed"] == true {
                 "Act on the notices as they arrive.".to_owned()
-            } else {
+            } else if needs_wait(v) {
                 ARM_AGAIN.to_owned()
+            } else {
+                "No wait is needed for plain leases; release them when you are done.".to_owned()
             },
         ),
         "daemon" if v["running"] == false => (
@@ -303,6 +331,33 @@ mod tests {
         assert!(after_error("ambiguous_duplicate").contains("ask the user"));
         assert!(after_error("override_required").contains("--override"));
         assert!(after_error("extend_refused").contains("release"));
+    }
+
+    #[test]
+    fn a_plain_grant_asks_for_no_wait() {
+        let mut v = json!({"outcome": "granted", "lease_id": "L1", "resource": "r", "unit": "u",
+                           "interruptible": false});
+        annotate("acquire", &mut v);
+        assert!(!v["next"].as_str().unwrap().contains("clerk wait"), "{v}");
+    }
+
+    #[test]
+    fn an_interruptible_grant_asks_for_a_background_wait() {
+        let mut v = json!({"outcome": "granted", "lease_id": "L1", "resource": "r", "unit": "u",
+                           "interruptible": true});
+        annotate("acquire", &mut v);
+        assert!(
+            v["next"].as_str().unwrap().contains("run_in_background"),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn a_grant_of_an_abandoned_unit_says_so() {
+        let mut v = json!({"outcome": "granted", "lease_id": "L1", "resource": "r", "unit": "u",
+                           "dirty": {"reason": "abandoned"}});
+        annotate("acquire", &mut v);
+        assert!(v["summary"].to_string().contains("abandoned"), "{v}");
     }
 
     #[test]

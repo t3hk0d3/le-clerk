@@ -72,6 +72,8 @@ pub struct LeaseRow {
     pub end_cause: Option<EndCause>,
     /// `CleanupEnding` was handled for the current cleanup deadline.
     pub cleanup_ending_sent: bool,
+    /// Past its end with nobody waiting, and still held (agents only).
+    pub overdue: bool,
 }
 
 /// Values for a new lease row.
@@ -100,7 +102,7 @@ const LEASE_COLUMNS: &str = "row_id, lease_id, unit_row, resource_row, state, ho
      claim_deadline, cleanup_deadline, override_reason, dirty_info, request_id, warning_sent, \
      cleanup_cause, extension_used, yield_request, yield_asked_at, yield_deadline, \
      paused_remaining_ms, borrower_lease, paused_for_lease, borrow_due_at, overran_sent, \
-     cleanup_confirmed, end_cause, cleanup_ending_sent";
+     cleanup_confirmed, end_cause, cleanup_ending_sent, overdue";
 
 fn lease_from_row(r: &Row<'_>) -> rusqlite::Result<Result<LeaseRow, StoreError>> {
     let row: i64 = r.get(0)?;
@@ -135,6 +137,7 @@ fn lease_from_row(r: &Row<'_>) -> rusqlite::Result<Result<LeaseRow, StoreError>>
     let cleanup_confirmed: Option<bool> = r.get(29)?;
     let end_cause: Option<String> = r.get(30)?;
     let cleanup_ending_sent: bool = r.get(31)?;
+    let overdue: bool = r.get(32)?;
     Ok((|| {
         Ok(LeaseRow {
             row,
@@ -181,6 +184,7 @@ fn lease_from_row(r: &Row<'_>) -> rusqlite::Result<Result<LeaseRow, StoreError>>
                 .map(|c| parse_enum(&c, "leases.end_cause"))
                 .transpose()?,
             cleanup_ending_sent,
+            overdue,
         })
     })())
 }
@@ -303,9 +307,20 @@ pub fn timed_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
 /// [`StoreError`] on SQL failure.
 pub fn set_extended(tx: &Tx, row: i64, ends_at: i64, duration_ms: i64) -> Result<(), StoreError> {
     tx.conn().execute(
-        "UPDATE leases SET ends_at = ?2, duration_ms = ?3, warning_sent = 0 WHERE row_id = ?1",
+        "UPDATE leases SET ends_at = ?2, duration_ms = ?3, warning_sent = 0, overdue = 0 \
+         WHERE row_id = ?1",
         rusqlite::params![row, ends_at, duration_ms],
     )?;
+    Ok(())
+}
+
+/// Mark a held lease past its end as overdue: it stays held.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure.
+pub fn set_overdue(tx: &Tx, row: i64) -> Result<(), StoreError> {
+    tx.conn()
+        .execute("UPDATE leases SET overdue = 1 WHERE row_id = ?1", [row])?;
     Ok(())
 }
 

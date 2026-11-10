@@ -775,6 +775,7 @@ mod tests {
             cleanup_confirmed: None,
             end_cause: None,
             cleanup_ending_sent: false,
+            overdue: false,
         }
     }
 

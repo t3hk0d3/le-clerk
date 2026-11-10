@@ -265,6 +265,8 @@ pub enum EndCause {
     Override,
     /// Holder disappeared.
     HolderGone,
+    /// Past its end, and someone else wanted the unit.
+    Abandoned,
     /// A command failed.
     CommandFailed,
     /// Forced by an admin.
@@ -283,6 +285,9 @@ pub enum DirtyReason {
     Expired,
     /// The holder vanished.
     HolderGone,
+    /// The holder stayed past its end and did not answer when someone
+    /// else wanted the unit.
+    Abandoned,
     /// A user override.
     Override,
     /// A command failed.
