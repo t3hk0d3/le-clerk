@@ -254,7 +254,18 @@ impl Launcher {
             .append(true)
             .open(&paths.log)?;
         let mut cmd = std::process::Command::new(&self.program);
+        // The daemon outlives its caller and serves every project: it
+        // gets no `CLAUDE_*` variables or other secrets of the shell that
+        // happened to start it.
         cmd.arg("daemon")
+            .env_clear()
+            .envs(std::env::vars_os().filter(|(k, _)| {
+                // The tests' version and protocol overrides are for the
+                // daemon too.
+                crate::config::inherited_env_var(k)
+                    || k == crate::daemon::VERSION_OVERRIDE_ENV
+                    || k == crate::daemon::PROTOCOL_OVERRIDE_ENV
+            }))
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .envs(self.absolute_path_vars()?)
             .current_dir("/")

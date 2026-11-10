@@ -547,6 +547,8 @@ mod tests {
                     "not_directly_linked",
                     "not_holder",
                     "no_units",
+                    "not_yours",
+                    "override_required",
                     "retiring",
                     "scope_not_allowed",
                     "session_not_hosted",

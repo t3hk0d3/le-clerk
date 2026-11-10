@@ -15,7 +15,7 @@ use crate::model::{
     PromotionId, RequestId, Resource, ResourceId, ResourceType, Scope, TagSet, Unit, UnitId,
     UnitSettings,
 };
-use crate::scheduler::{AcquireOutcome, BlockedBy, Grant, Lease, MyLeases, MyRequest};
+use crate::scheduler::{AcquireOutcome, BlockedBy, Displaced, Grant, Lease, MyLeases, MyRequest};
 use crate::store::audit::AuditEntry;
 
 /// Milliseconds in `d`, saturating.
@@ -164,6 +164,10 @@ pub enum AcquireView {
         /// What keeps the request from a unit now; `null` when nothing
         /// specific does.
         blocked_by: Option<BlockedBy>,
+        /// The lease an override displaced for this request; absent
+        /// otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        displaced: Option<Displaced>,
     },
     /// A paused holder's override of its own borrower: the unit comes back.
     Reclaiming { lease_id: LeaseId },
@@ -181,11 +185,13 @@ impl From<AcquireOutcome> for AcquireView {
                 position,
                 estimated_wait,
                 blocked_by,
+                displaced,
             } => Self::Queued {
                 request_id,
                 position,
                 estimated_wait_ms: estimated_wait.map(millis),
                 blocked_by,
+                displaced,
             },
             AcquireOutcome::Reclaiming { lease_id } => Self::Reclaiming { lease_id },
             AcquireOutcome::Checking => Self::Checking,

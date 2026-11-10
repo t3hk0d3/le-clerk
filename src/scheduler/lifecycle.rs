@@ -482,6 +482,17 @@ impl Scheduler {
         Ok(lease)
     }
 
+    /// Load a lease the caller releases: another holder's is `NotYours`.
+    fn lease_to_release(tx: &Tx, who: &Caller, id: &LeaseId) -> Result<LeaseRow, SchedulerError> {
+        let lease = leases::find_lease(tx, id)?.ok_or(SchedulerError::NotFound)?;
+        if lease.holder != who.holder {
+            return Err(SchedulerError::NotYours {
+                holder_kind: lease.holder.kind(),
+            });
+        }
+        Ok(lease)
+    }
+
     /// Re-read a lease for its holder.
     pub(super) fn view(tx: &Tx, id: &LeaseId) -> Result<Lease, SchedulerError> {
         let lease = leases::find_lease(tx, id)?.ok_or(SchedulerError::NotFound)?;
@@ -558,11 +569,12 @@ impl Scheduler {
     /// `Unclaimed` at once and the unit goes to the next in line.
     ///
     /// # Errors
-    /// [`SchedulerError::NotFound`]; [`SchedulerError::NotHolder`];
-    /// [`SchedulerError::BadState`] unless held, paused or offered.
+    /// [`SchedulerError::NotFound`]; [`SchedulerError::NotYours`] for
+    /// another holder's lease; [`SchedulerError::BadState`] unless held,
+    /// paused or offered.
     pub fn release(&self, tx: &Tx, who: &Caller, id: &LeaseId) -> Result<Lease, SchedulerError> {
         let now = self.now();
-        let lease = Self::own_lease(tx, who, id)?;
+        let lease = Self::lease_to_release(tx, who, id)?;
         if lease.state == LeaseState::Offered {
             return self.decline_offer(tx, who, &lease);
         }
@@ -609,7 +621,7 @@ impl Scheduler {
     /// nothing on the unit).
     ///
     /// # Errors
-    /// [`SchedulerError::NotFound`]; [`SchedulerError::NotHolder`];
+    /// [`SchedulerError::NotFound`]; [`SchedulerError::NotYours`];
     /// [`SchedulerError::BadState`] for an ended lease.
     pub fn release_failed(
         &self,
@@ -617,7 +629,7 @@ impl Scheduler {
         who: &Caller,
         id: &LeaseId,
     ) -> Result<Lease, SchedulerError> {
-        let lease = Self::own_lease(tx, who, id)?;
+        let lease = Self::lease_to_release(tx, who, id)?;
         match lease.state {
             LeaseState::Ended => Err(SchedulerError::BadState { state: lease.state }),
             LeaseState::Offered => self.decline_offer(tx, who, &lease),

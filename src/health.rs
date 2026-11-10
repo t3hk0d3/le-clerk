@@ -252,8 +252,12 @@ impl HealthChecker {
     /// Run `sh -c command`. Settings reach it only as environment variables.
     fn custom(&self, command: &str, ids: Option<Ids<'_>>, settings: &UnitSettings) -> HealthResult {
         let mut cmd = Command::new("sh");
+        // An explicit environment: the daemon's variables a check may need,
+        // the unit's settings and its ids, and nothing else.
         cmd.arg("-c")
             .arg(command)
+            .env_clear()
+            .envs(std::env::vars_os().filter(|(k, _)| crate::config::inherited_env_var(k)))
             .envs(settings.env_vars())
             .stdin(Stdio::null())
             .stdout(Stdio::null())

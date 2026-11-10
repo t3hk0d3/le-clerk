@@ -174,6 +174,18 @@ pub struct SocketPathTooLong {
     pub max: usize,
 }
 
+/// True for the environment variables a child process of the clerk (the
+/// daemon, a custom health check) inherits: `HOME`, `PATH`, `XDG_*`,
+/// `CLERK_HOME`, `LANG` and `RUST_LOG`. Everything else (an agent's
+/// `CLAUDE_*` variables, tokens in the caller's shell) stays behind.
+#[must_use]
+pub fn inherited_env_var(key: &std::ffi::OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    matches!(key, "HOME" | "PATH" | "CLERK_HOME" | "LANG" | "RUST_LOG") || key.starts_with("XDG_")
+}
+
 /// The longest Unix socket path this platform takes, in bytes, without the
 /// terminating NUL (107 on Linux).
 #[must_use]

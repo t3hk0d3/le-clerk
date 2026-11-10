@@ -114,6 +114,14 @@ clerk daemon restart          # after upgrading clerk; leases survive
 clerk daemon stop
 ```
 
+An agent needs `--override "<reason>"` for `daemon stop` (a `restart` is open
+to it). The daemon holds agents to the same rule for the `admin` tools,
+`daemon stop` and handing a lease to another holder, whatever client sends the
+call; the reason is the client's own word, so this guards against mistakes, not
+against a hostile process. The daemon starts with only `HOME`, `PATH`, `XDG_*`,
+`CLERK_HOME`, `LANG` and `RUST_LOG` from its first client's environment; custom
+health checks get the same, plus the unit's `CLERK_*` variables.
+
 A client refuses a daemon of another version (exit 5) and says to restart it.
 
 ## Output

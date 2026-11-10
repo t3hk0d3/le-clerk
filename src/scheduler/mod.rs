@@ -209,6 +209,9 @@ pub enum AcquireOutcome {
         /// What keeps the request from a unit now; `None` when nothing
         /// specific does.
         blocked_by: Option<BlockedBy>,
+        /// The lease an override displaced to make room for this request;
+        /// `None` for a plain request.
+        displaced: Option<Displaced>,
     },
     /// An override by a paused holder against its own borrower: the
     /// borrower is reclaimed and the unit returns to the paused lease.
@@ -220,6 +223,14 @@ pub enum AcquireOutcome {
     /// ask again when it is back. Only
     /// [`Scheduler::acquire_unless_checking`] answers this.
     Checking,
+}
+
+/// The lease an override acquire displaced: it ends after its cleanup
+/// window and the overrider is served first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Displaced {
+    pub holder: HolderRef,
+    pub lease_id: LeaseId,
 }
 
 /// What keeps a queued request from a unit when it is queued.
@@ -356,6 +367,18 @@ pub enum SchedulerError {
     /// The caller is not the holder.
     #[error("you are not the holder")]
     NotHolder,
+    /// A release of a lease another holder holds. The kind is named, never
+    /// the holder.
+    #[error(
+        "that lease is held by another holder (kind: {}), not by you; only the user may end it: \
+         `clerk release <lease> --force`, which an agent runs with --override \"<reason>\" \
+         once the user said to",
+        holder_kind.replace('_', " ")
+    )]
+    NotYours {
+        /// The holder's kind (`agent_session`, `cli_process` or `user`).
+        holder_kind: &'static str,
+    },
     /// The targeted unit (or every unit of the resource) is being retired
     /// and will never be granted again.
     #[error("that unit is being retired; ask for another unit or resource")]
@@ -387,6 +410,7 @@ impl ErrorCode for SchedulerError {
             SchedulerError::ExtendNotLater { .. } => "extend_not_later",
             SchedulerError::ExtensionUsed => "extension_used",
             SchedulerError::NotHolder => "not_holder",
+            SchedulerError::NotYours { .. } => "not_yours",
             SchedulerError::Retiring => "retiring",
             SchedulerError::NoUnits => "no_units",
             SchedulerError::BorrowerNotOverrun { .. } => "borrower_not_overrun",
@@ -402,6 +426,7 @@ impl ErrorCode for SchedulerError {
             }
             SchedulerError::BorrowerNotOverrun { due_at } => Some(json!({ "due_at": due_at })),
             SchedulerError::ExtendNotLater { ends_at } => Some(json!({ "ends_at": ends_at })),
+            SchedulerError::NotYours { holder_kind } => Some(json!({ "holder_kind": holder_kind })),
             _ => None,
         }
     }
@@ -1110,7 +1135,7 @@ impl Scheduler {
                 lease_id: paused.id,
             });
         }
-        let outcome = self.enqueue(
+        let mut outcome = self.enqueue(
             tx,
             who,
             req,
@@ -1119,7 +1144,12 @@ impl Scheduler {
             ask,
             displaced.as_ref().map(|l| l.row),
         )?;
-        if let AcquireOutcome::Queued { request_id, .. } = &outcome {
+        if let AcquireOutcome::Queued {
+            request_id,
+            displaced: shown,
+            ..
+        } = &mut outcome
+        {
             match (&displaced, &req.override_reason) {
                 (Some(lease), Some(reason)) => {
                     let other = OtherParty {
@@ -1127,6 +1157,10 @@ impl Scheduler {
                         purpose: &req.purpose,
                     };
                     self.apply_override(tx, who, lease, request_id, reason, other)?;
+                    *shown = Some(Displaced {
+                        holder: lease.holder.clone(),
+                        lease_id: lease.id.clone(),
+                    });
                 }
                 _ => self.maybe_request_yield(tx, request_id)?,
             }
@@ -1204,6 +1238,7 @@ impl Scheduler {
             position,
             estimated_wait,
             blocked_by,
+            displaced: None,
         })
     }
 

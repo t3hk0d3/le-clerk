@@ -15,10 +15,7 @@ use super::caller;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GateRefusal {
     /// An agent called without `--override`.
-    #[error(
-        "Refused: an agent must pass --override \"<reason>\" to {effect}. Ask the user, then retry \
-         with the reason they gave."
-    )]
+    #[error("Refused: an agent must pass --override \"<reason>\" to {effect}.")]
     OverrideRequired { effect: String },
     /// Not on a terminal, and `--yes` was not given.
     #[error(

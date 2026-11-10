@@ -1159,7 +1159,14 @@ mod engine {
                     let args = serde_json::json!({
                         "lease_id": lease["lease_id"], "new_holder": user("y"),
                     });
-                    assert_not_hosted(rpc(&engine, "rehome_holder", agent("s1"), None, args).await);
+                    // An agent may rehome only on the user's word: give it, so
+                    // the hosting check is what answers.
+                    let caller = Caller {
+                        override_reason: Some("the user asked".into()),
+                        ..as_caller(agent("s1"))
+                    };
+                    let command = EngineCommand::parse("rehome_holder", caller, args).unwrap();
+                    assert_not_hosted(engine.call_from(command, None).await);
                 }
             }
         }

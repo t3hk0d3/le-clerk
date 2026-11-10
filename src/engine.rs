@@ -163,6 +163,18 @@ impl ApiError {
         )
     }
 
+    /// `override_required`: an agent session called something that needs the
+    /// user's say-so, and gave no reason. The reason is client-asserted: this
+    /// guards against mistakes, not hostile processes.
+    #[must_use]
+    pub fn override_required(effect: &str) -> Self {
+        Self::new(
+            ErrorKind::Conflict,
+            "override_required",
+            format!("Refused: an agent must pass --override \"<reason>\" to {effect}."),
+        )
+    }
+
     /// `internal_error`.
     #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
@@ -233,6 +245,7 @@ impl From<SchedulerError> for ApiError {
             | SchedulerError::ExtendRefused { .. }
             | SchedulerError::ExtensionUsed
             | SchedulerError::NotHolder
+            | SchedulerError::NotYours { .. }
             | SchedulerError::Retiring
             | SchedulerError::NoUnits
             | SchedulerError::BorrowerNotOverrun { .. }

@@ -51,8 +51,10 @@ struct Cli {
     /// default when the locale is not UTF-8).
     #[arg(long, global = true)]
     ascii: bool,
-    /// Why an agent does this for the user (agents need it for `approve`
-    /// and `admin`; the reason is recorded in the audit log).
+    /// Why an agent does this for the user (the reason is recorded in the
+    /// audit log). Agents need it for `approve`, `promotions`, `admin`,
+    /// `log`, `release --force`, `acquire` of a unit another holder has (it
+    /// takes the unit from them) and `daemon stop`.
     #[arg(long = "override", global = true, value_name = "REASON")]
     override_reason: Option<String>,
     #[command(subcommand)]
@@ -233,7 +235,8 @@ impl Command {
 enum DaemonAction {
     /// Show whether the daemon runs, with its pid and version.
     Status,
-    /// Stop the running daemon.
+    /// Stop the running daemon (an agent needs --override; `restart` it
+    /// without).
     Stop,
     /// Stop the running daemon and start a fresh one.
     Restart,
@@ -433,6 +436,13 @@ async fn manage_daemon(ctx: &Ctx, action: DaemonAction) -> anyhow::Result<()> {
             Err(e) => return Err(e.into()),
         },
         DaemonAction::Stop => {
+            // An agent stops the daemon for every project only on the
+            // user's word; the daemon asks for it too.
+            let caller = ctx.caller(CallerKind::Detached)?;
+            gate::require_override(
+                "stop the daemon, which every project's agents rely on",
+                &caller,
+            )?;
             Client::stop(&ctx.paths, &caller).await?;
             None
         }

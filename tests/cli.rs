@@ -4989,7 +4989,12 @@ mod cli {
                     .args(["leases", "--mine"])
                     .assert()
                     .success();
-                let body = json_of(env.agent("sess-1", &dir).args(["daemon", "stop"]));
+                let body = json_of(env.agent("sess-1", &dir).args([
+                    "daemon",
+                    "stop",
+                    "--override",
+                    "the user asked",
+                ]));
                 let next = body["next"].as_str().unwrap();
                 assert!(
                     next.contains("stays stopped until the next clerk command"),
@@ -5401,6 +5406,338 @@ mod cli {
             .unwrap();
             let occupancy = unit_status(&env)["occupancy"].clone();
             assert_eq!(occupancy["state"], "offered", "{occupancy}");
+        }
+    }
+
+    mod agent_policy {
+        use super::*;
+
+        /// Agent `sess` in `dir` holds `board`; returns its lease id.
+        fn agent_holds(env: &Env, sess: &str, dir: &Path) -> String {
+            lease_of(&json_of(
+                env.agent(sess, dir)
+                    .args(["acquire", "board", "--for", "10m"]),
+            ))
+        }
+
+        /// Agent `session` hosted by a process of its own, so another agent
+        /// session may run from this test process too.
+        fn other(env: &Env, session: &str, dir: &Path, md: bool) -> Command {
+            let mut cmd = if md {
+                env.agent_md(session, dir)
+            } else {
+                env.agent(session, dir)
+            };
+            cmd.env(CLAUDE_PID, env.own_host(session, dir).to_string());
+            cmd
+        }
+
+        mod acquire_override_on_a_unit_held_by_another_session {
+            use super::*;
+
+            fn overridden(env: &Env, md: bool) -> (String, std::process::Output) {
+                seed(env, "board", "k1");
+                let (a, b) = (env.dir("alpha"), env.dir("beta"));
+                let theirs = agent_holds(env, "sess-1", &a);
+                let args = ["acquire", "board", "--for", "10m", "--override", "asked"];
+                let out = other(env, "sess-2", &b, md).args(args).output().unwrap();
+                assert_eq!(out.status.code(), Some(6), "{out:?}");
+                (theirs, out)
+            }
+
+            #[test]
+            fn the_heading_says_the_unit_was_taken_from_that_session() {
+                let env = Env::new();
+                let (_, out) = overridden(&env, true);
+                let md = String::from_utf8_lossy(&out.stdout).into_owned();
+                let heading = md.lines().next().unwrap();
+                assert!(heading.starts_with("## Queued: board"), "{md}");
+                assert!(heading.contains("taken from"), "{md}");
+                assert!(heading.contains("sess-1"), "{md}");
+            }
+
+            #[test]
+            fn the_summary_names_the_displaced_lease() {
+                let env = Env::new();
+                let (theirs, out) = overridden(&env, false);
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                let summary = body["summary"].to_string();
+                assert!(summary.contains(&theirs), "{body}");
+                assert!(summary.contains("overridden"), "{body}");
+            }
+
+            #[test]
+            fn the_answer_names_the_displaced_holder_and_lease() {
+                let env = Env::new();
+                let (theirs, out) = overridden(&env, false);
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(body["displaced"]["lease_id"], theirs, "{body}");
+                assert_eq!(
+                    body["displaced"]["holder"],
+                    json!({"kind": "agent_session", "session_id": "sess-1"}),
+                    "{body}"
+                );
+            }
+
+            #[test]
+            fn without_an_override_nothing_is_displaced() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let (a, b) = (env.dir("alpha"), env.dir("beta"));
+                agent_holds(&env, "sess-1", &a);
+                let out = other(&env, "sess-2", &b, false)
+                    .args(["acquire", "board", "--for", "10m"])
+                    .output()
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert!(body.get("displaced").is_none(), "{body}");
+            }
+        }
+
+        mod gate_messages {
+            use super::*;
+
+            fn next_steps(message: &str) -> usize {
+                message.matches("Ask the user").count()
+            }
+
+            #[test]
+            fn log_without_override_has_exactly_one_next_step() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let error = error_of(env.agent("sess-1", &dir).arg("log"), 4);
+                assert_eq!(error["code"], "override_required", "{error}");
+                let message = error["message"].as_str().unwrap();
+                assert_eq!(next_steps(message), 1, "{message}");
+            }
+
+            #[test]
+            fn daemon_stop_without_override_has_exactly_one_next_step() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let error = error_of(env.agent("sess-1", &dir).args(["daemon", "stop"]), 4);
+                assert_eq!(error["code"], "override_required", "{error}");
+                let message = error["message"].as_str().unwrap();
+                assert_eq!(next_steps(message), 1, "{message}");
+                assert!(message.contains("--override"), "{message}");
+            }
+
+            /// The CLI ends a message with the next step; the daemon's must
+            /// not carry one of its own.
+            #[test]
+            fn the_daemons_own_refusal_carries_no_next_step() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                seed(&env, "board", "k1");
+                let caller = agent_caller("sess-1", &dir);
+                let e = env
+                    .rpc(
+                        "admin_clean",
+                        &caller,
+                        json!({"resource": "board", "unit": "u1"}),
+                    )
+                    .unwrap_err();
+                assert_eq!(e.code, "override_required");
+                assert_eq!(next_steps(&e.message), 0, "{}", e.message);
+            }
+        }
+
+        mod override_help {
+            use super::*;
+
+            #[test]
+            fn lists_every_gated_command() {
+                let env = Env::new();
+                let out = env.cmd().arg("--help").output().unwrap();
+                let help = String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let at = help.find("--override").expect("the flag is documented");
+                let flag = &help[at..];
+                for gated in [
+                    "approve",
+                    "admin",
+                    "log",
+                    "release --force",
+                    "acquire",
+                    "daemon stop",
+                ] {
+                    assert!(flag.contains(gated), "{gated} missing in {flag}");
+                }
+            }
+
+            #[test]
+            fn daemon_stop_help_says_agents_need_it() {
+                let env = Env::new();
+                let out = env.cmd().args(["daemon", "--help"]).output().unwrap();
+                let help = String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(help.contains("--override"), "{help}");
+            }
+        }
+
+        mod daemon_stop_by_an_agent {
+            use super::*;
+
+            #[test]
+            fn without_override_is_refused_and_the_daemon_stays_up() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                env.ok(&["status"]);
+                error_of(env.agent("sess-1", &dir).args(["daemon", "stop"]), 4);
+                assert_eq!(env.ok(&["daemon", "status"])["running"], true);
+            }
+
+            #[test]
+            fn with_override_stops_it() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                env.ok(&["status"]);
+                env.agent("sess-1", &dir)
+                    .args(["daemon", "stop", "--override", "the user asked"])
+                    .assert()
+                    .success();
+                assert_eq!(env.ok(&["daemon", "status"])["running"], false);
+            }
+
+            #[test]
+            fn restart_needs_no_override() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                env.ok(&["status"]);
+                env.agent("sess-1", &dir)
+                    .args(["daemon", "restart"])
+                    .assert()
+                    .success();
+                assert_eq!(env.ok(&["daemon", "status"])["running"], true);
+            }
+        }
+
+        mod release_of_another_holders_lease {
+            use super::*;
+
+            #[test]
+            fn by_an_agent_exits_4_with_not_yours_naming_the_kind() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let (a, b) = (env.dir("alpha"), env.dir("beta"));
+                let theirs = agent_holds(&env, "sess-1", &a);
+                let error = error_of(
+                    other(&env, "sess-2", &b, false).args(["release", &theirs]),
+                    4,
+                );
+                assert_eq!(error["code"], "not_yours", "{error}");
+                assert_eq!(
+                    error["details"],
+                    json!({"holder_kind": "agent_session"}),
+                    "{error}"
+                );
+                assert_eq!(unit_status(&env)["occupancy"]["state"], "held");
+            }
+
+            #[test]
+            fn by_an_agent_with_cleanup_exits_4_too() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let (a, b) = (env.dir("alpha"), env.dir("beta"));
+                let theirs = agent_holds(&env, "sess-1", &a);
+                let error = error_of(
+                    other(&env, "sess-2", &b, false).args(["release", &theirs, "--cleanup"]),
+                    4,
+                );
+                assert_eq!(error["code"], "not_yours", "{error}");
+            }
+
+            #[test]
+            fn by_an_agent_on_an_unknown_lease_is_not_found() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let b = env.dir("beta");
+                let ghost = leclerk::model::LeaseId::new();
+                let error = error_of(
+                    other(&env, "sess-2", &b, false).args(["release", ghost.as_str()]),
+                    3,
+                );
+                assert_eq!(error["code"], "not_found", "{error}");
+            }
+
+            #[test]
+            fn by_the_user_keeps_its_informative_text() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let a = env.dir("alpha");
+                let theirs = agent_holds(&env, "sess-1", &a);
+                let error = error_of(env.cmd().args(["release", &theirs]), 3);
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("belongs to an agent session"), "{message}");
+                assert!(message.contains("clerk leases"), "{message}");
+            }
+
+            #[test]
+            fn with_force_and_override_an_agent_ends_it() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let (a, b) = (env.dir("alpha"), env.dir("beta"));
+                let theirs = agent_holds(&env, "sess-1", &a);
+                other(&env, "sess-2", &b, false)
+                    .args([
+                        "release",
+                        "--force",
+                        "--yes",
+                        &theirs,
+                        "--override",
+                        "asked",
+                    ])
+                    .assert()
+                    .success();
+                assert_eq!(unit_status(&env)["occupancy"]["kind"], "free");
+            }
+        }
+
+        mod launcher_spawn {
+            use super::*;
+
+            fn environ(pid: u64) -> Vec<String> {
+                fs::read(format!("/proc/{pid}/environ"))
+                    .unwrap()
+                    .split(|b| *b == 0)
+                    .filter(|e| !e.is_empty())
+                    .map(|e| String::from_utf8_lossy(e).into_owned())
+                    .collect()
+            }
+
+            #[test]
+            fn the_daemon_environment_has_no_claude_variables() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                env.agent("sess-1", &dir)
+                    .env("CLAUDE_LEAK_TEST", "1")
+                    .env("UNRELATED_SECRET", "x")
+                    .arg("status")
+                    .assert()
+                    .success();
+                let pid = env.ok(&["daemon", "status"])["pid"].as_u64().unwrap();
+                let vars = environ(pid);
+                assert!(vars.iter().all(|v| !v.starts_with("CLAUDE_")), "{vars:?}");
+                assert!(
+                    vars.iter().all(|v| !v.starts_with("UNRELATED_SECRET")),
+                    "{vars:?}"
+                );
+            }
+
+            #[test]
+            fn the_daemon_keeps_home_path_and_clerk_home() {
+                let env = Env::new();
+                env.ok(&["status"]);
+                let pid = env.ok(&["daemon", "status"])["pid"].as_u64().unwrap();
+                let vars = environ(pid);
+                for kept in ["CLERK_HOME=", "PATH="] {
+                    assert!(vars.iter().any(|v| v.starts_with(kept)), "{kept}: {vars:?}");
+                }
+            }
         }
     }
 

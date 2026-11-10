@@ -435,7 +435,7 @@ mod lease_lifecycle {
             use super::*;
 
             #[test]
-            fn returns_not_holder_for_someone_else() {
+            fn returns_not_yours_for_someone_else() {
                 let mut f = fixture();
                 f.seed("board", &["u1"]);
                 let g = f.grant(&caller("a"), req("board", 10 * MIN, Priority::Normal, "x"));
@@ -1009,7 +1009,12 @@ mod lease_lifecycle {
                 f.seed("board", &["u1"]);
                 let g = f.grant(&caller("a"), req("board", 10 * MIN, Priority::Normal, "x"));
                 let err = f.release(&caller("b"), &g.lease_id).unwrap_err();
-                assert!(matches!(err, SchedulerError::NotHolder));
+                assert!(matches!(
+                    err,
+                    SchedulerError::NotYours {
+                        holder_kind: "user"
+                    }
+                ));
             }
 
             #[test]

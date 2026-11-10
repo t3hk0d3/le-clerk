@@ -211,6 +211,18 @@ pub enum HolderRef {
     },
 }
 
+impl HolderRef {
+    /// The holder's kind as it is spelled on the wire.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::AgentSession { .. } => "agent_session",
+            Self::CliProcess { .. } => "cli_process",
+            Self::User { .. } => "user",
+        }
+    }
+}
+
 /// The Claude Code process hosting an agent session, identified by pid and
 /// start time (field 22 of `/proc/<pid>/stat`) so a reused pid is never
 /// mistaken for it.

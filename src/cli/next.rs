@@ -97,15 +97,19 @@ pub fn error_message(code: &str, message: &str) -> String {
 
 /// The summary and next step of a queued request.
 fn queued(v: &Value) -> (Vec<String>, String) {
+    let mut summary = vec![format!(
+        "Queued for {} at position {} (request {}).",
+        v["unit"]
+            .as_str()
+            .map_or_else(|| s(v, "resource"), |u| format!("{}/{u}", s(v, "resource"))),
+        v["position"],
+        s(v, "request_id")
+    )];
+    if let Some(line) = displaced_line(v) {
+        summary.push(line);
+    }
     (
-        vec![format!(
-            "Queued for {} at position {} (request {}).",
-            v["unit"]
-                .as_str()
-                .map_or_else(|| s(v, "resource"), |u| format!("{}/{u}", s(v, "resource"))),
-            v["position"],
-            s(v, "request_id")
-        )],
+        summary,
         format!(
             "The unit is not yours yet: arm a wait to be told when it is. {ARM_AGAIN} \
          `clerk cancel {}` drops the request.{}",
@@ -113,6 +117,18 @@ fn queued(v: &Value) -> (Vec<String>, String) {
             unhealthy_hint(v)
         ),
     )
+}
+
+/// What an override did, when the acquire displaced a holder: whose lease
+/// ends and that the unit comes to the caller after it.
+fn displaced_line(v: &Value) -> Option<String> {
+    let d = v.get("displaced").filter(|d| d.is_object())?;
+    Some(format!(
+        "Lease {} of {} was overridden at your request: it ends after its cleanup window, then \
+         the unit is offered to you.",
+        s(d, "lease_id"),
+        super::render::holder(&d["holder"])
+    ))
 }
 
 /// For a request a failed health check blocks: how to get past it when the

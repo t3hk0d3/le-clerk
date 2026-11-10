@@ -4,6 +4,8 @@
 //! far away; a fixed heading and field order for grants, queued requests,
 //! leases and notices; and the next step last (`Next: …`).
 
+use std::fmt::Write;
+
 use serde_json::{Map, Value};
 
 /// Render `value`, the JSON result of agent command `command`, at `now_ms`.
@@ -185,13 +187,16 @@ fn heading(m: &Map<String, Value>) -> (Option<String>, Vec<&'static str>) {
             Some(format!("## Granted: {}", at(s("resource"), s("unit")))),
             vec!["outcome"],
         ),
-        (Some("queued"), ..) => (
-            Some(match s("resource") {
+        (Some("queued"), ..) => {
+            let mut h = match s("resource") {
                 Some(_) => format!("## Queued: {}", at(s("resource"), s("unit"))),
                 None => format!("## Queued: request {}", s("request_id").unwrap_or("?")),
-            }),
-            vec!["outcome"],
-        ),
+            };
+            if let Some(d) = m.get("displaced").filter(|d| d.is_object()) {
+                let _ = write!(h, " (taken from {})", super::render::holder(&d["holder"]));
+            }
+            (Some(h), vec!["outcome"])
+        }
         (_, Some(kind), Some(_), ..) => (Some(format!("## Notice: {kind}")), vec!["kind"]),
         (None, _, _, Some(id), Some(_)) => (Some(format!("## Lease {id}")), Vec::new()),
         _ => (None, Vec::new()),

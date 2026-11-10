@@ -2198,7 +2198,7 @@ mod rehome_holder {
         async fn the_lease_belongs_to_the_new_holder() {
             let (h, lease) = rehomed().await;
             let e = err(&h, "release", &user("a"), json!({"lease_id": lease})).await;
-            assert_eq!(e.code, "not_holder");
+            assert_eq!(e.code, "not_yours");
             let view = ok(&h, "release", &session("s9"), json!({"lease_id": lease})).await;
             assert_eq!(view["holder"], json!(session("s9").holder));
         }

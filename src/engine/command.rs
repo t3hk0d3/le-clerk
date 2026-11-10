@@ -612,7 +612,37 @@ impl Command {
         {
             return Err(ApiError::scope_not_allowed(what));
         }
+        let c = self.caller();
+        if matches!(c.holder, HolderRef::AgentSession { .. })
+            && c.override_reason
+                .as_deref()
+                .is_none_or(|r| r.trim().is_empty())
+            && let Some(effect) = self.needs_override()
+        {
+            return Err(ApiError::override_required(effect));
+        }
         Ok(())
+    }
+
+    /// What this command does that an agent session may do only on the
+    /// user's word (an override reason), if anything: the `admin_*` tools
+    /// (export and a doctor that only looks excepted), a plain stop of the
+    /// daemon (a restart is open), and handing a lease to another holder.
+    /// Ending or editing another holder's lease is among the `admin_*`;
+    /// `release` of one answers `not_yours` in the scheduler.
+    fn needs_override(&self) -> Option<&'static str> {
+        match self {
+            Self::AdminExport(..) => None,
+            Self::AdminDoctor(_, a) => a.fix.then_some("repair the database"),
+            Self::DaemonStop(_, a) => (!a.restart).then_some("stop the daemon"),
+            Self::RehomeHolder(..) => Some("hand a lease to another holder"),
+            Self::AdminRelease(..) => Some("end another holder's lease and mark its unit dirty"),
+            Self::AdminEditLease(..) => Some("edit another holder's lease"),
+            Self::AdminEvict(..) => Some("end every lease and request of a holder"),
+            Self::AdminImport(..) => Some("import resources"),
+            _ if self.method().starts_with("admin_") => Some("use an admin tool"),
+            _ => None,
+        }
     }
 
     /// Checks that need the liveness record: an agent session may hold or

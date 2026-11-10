@@ -3094,3 +3094,361 @@ mod wire_tags {
         }
     }
 }
+
+/// The daemon holds agent sessions to the override rule, not only the CLI.
+mod agent_policy {
+    use super::*;
+
+    fn agent(session: &str, reason: Option<&str>) -> Caller {
+        Caller {
+            holder: HolderRef::AgentSession {
+                session_id: session.into(),
+            },
+            project: None,
+            override_reason: reason.map(str::to_owned),
+        }
+    }
+
+    async fn err(h: &EngineHandle, method: &str, who: &Caller, args: Value) -> ApiError {
+        match rpc(h, method, who, args).await {
+            Ok(v) => panic!("{method} unexpectedly succeeded: {v}"),
+            Err(e) => e,
+        }
+    }
+
+    /// The audit entries of `action`, as the user reads them.
+    async fn audited(h: &EngineHandle, action: &str) -> Vec<Value> {
+        let log = ok(h, "list_audit", &user("admin"), json!({"action": action})).await;
+        log.as_array().expect("an array").clone()
+    }
+
+    /// The `admin_*` commands an agent needs an override for, with arguments
+    /// that name `lease` (held by `agent("a", None)`).
+    fn gated(lease: &Value) -> Vec<(&'static str, Value)> {
+        vec![
+            ("admin_release", json!({"lease_id": lease})),
+            ("admin_evict", json!({"holder": "session:nobody"})),
+            (
+                "admin_import",
+                json!({"doc": {"version": 1, "resources": []}}),
+            ),
+            (
+                "admin_edit_lease",
+                json!({"lease_id": lease, "priority": "high"}),
+            ),
+            ("admin_clean", json!({"resource": "board", "unit": "u1"})),
+        ]
+    }
+
+    mod admin_commands {
+        use super::*;
+
+        mod on_no_override_reason {
+            use super::*;
+
+            #[tokio::test]
+            async fn refuse_with_override_required() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &agent("a", None), 600_000).await["lease_id"].clone();
+                for (method, args) in gated(&lease) {
+                    let e = err(&h, method, &agent("a", None), args).await;
+                    assert_eq!(e.code, "override_required", "{method}");
+                }
+            }
+
+            #[tokio::test]
+            async fn refuse_a_blank_reason_too() {
+                let (h, _clock) = spawn();
+                let e = err(
+                    &h,
+                    "admin_evict",
+                    &agent("a", Some("  ")),
+                    json!({"holder": "session:x"}),
+                )
+                .await;
+                assert_eq!(e.code, "override_required");
+            }
+
+            #[tokio::test]
+            async fn change_nothing() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &agent("a", None), 600_000).await["lease_id"].clone();
+                err(
+                    &h,
+                    "admin_release",
+                    &agent("a", None),
+                    json!({"lease_id": lease}),
+                )
+                .await;
+                let view = ok(
+                    &h,
+                    "get_lease",
+                    &agent("a", None),
+                    json!({"lease_id": lease}),
+                )
+                .await;
+                assert_eq!(view["state"], "held");
+            }
+
+            #[tokio::test]
+            async fn leave_export_and_a_read_only_doctor_open() {
+                let (h, _clock) = spawn();
+                ok(&h, "admin_export", &agent("a", None), json!({})).await;
+                ok(&h, "admin_doctor", &agent("a", None), json!({})).await;
+            }
+
+            #[tokio::test]
+            async fn refuse_a_doctor_that_fixes() {
+                let (h, _clock) = spawn();
+                let e = err(&h, "admin_doctor", &agent("a", None), json!({"fix": true})).await;
+                assert_eq!(e.code, "override_required");
+            }
+
+            #[tokio::test]
+            async fn name_the_command_in_the_message() {
+                let (h, _clock) = spawn();
+                let e = err(
+                    &h,
+                    "admin_clean",
+                    &agent("a", None),
+                    json!({"resource": "board", "unit": "u1"}),
+                )
+                .await;
+                assert!(e.message.contains("--override"), "{}", e.message);
+            }
+        }
+
+        mod on_an_override_reason {
+            use super::*;
+
+            #[tokio::test]
+            async fn proceed_and_audit_the_reason() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &agent("a", None), 600_000).await["lease_id"].clone();
+                let asked = agent("a", Some("the user asked"));
+                ok(
+                    &h,
+                    "admin_edit_lease",
+                    &asked,
+                    json!({"lease_id": lease, "priority": "high"}),
+                )
+                .await;
+                ok(&h, "admin_release", &asked, json!({"lease_id": lease})).await;
+                for action in ["admin_edit_lease", "admin_release"] {
+                    let entries = audited(&h, action).await;
+                    assert_eq!(entries.len(), 1, "{action}");
+                    assert_eq!(entries[0]["override_reason"], "the user asked", "{action}");
+                }
+            }
+
+            #[tokio::test]
+            async fn let_import_and_evict_through() {
+                let (h, _clock) = spawn();
+                let asked = agent("a", Some("the user asked"));
+                ok(
+                    &h,
+                    "admin_import",
+                    &asked,
+                    json!({"doc": {"version": 1, "resources": []}}),
+                )
+                .await;
+                ok(&h, "admin_evict", &asked, json!({"holder": "session:x"})).await;
+            }
+        }
+    }
+
+    mod rehome_holder {
+        use super::*;
+
+        mod on_no_override_reason {
+            use super::*;
+
+            #[tokio::test]
+            async fn refuses_with_override_required() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &agent("a", None), 600_000).await["lease_id"].clone();
+                let e = err(
+                    &h,
+                    "rehome_holder",
+                    &agent("a", None),
+                    json!({"lease_id": lease, "new_holder": {"kind": "user", "tag": "u"}}),
+                )
+                .await;
+                assert_eq!(e.code, "override_required");
+            }
+        }
+
+        mod on_an_override_reason {
+            use super::*;
+
+            #[tokio::test]
+            async fn proceeds_and_audits_the_reason() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &agent("a", None), 600_000).await["lease_id"].clone();
+                ok(
+                    &h,
+                    "rehome_holder",
+                    &agent("a", Some("the user asked")),
+                    json!({"lease_id": lease, "new_holder": {"kind": "user", "tag": "u"}}),
+                )
+                .await;
+                let entries = audited(&h, "rehomed").await;
+                assert_eq!(entries[0]["override_reason"], "the user asked");
+            }
+        }
+
+        mod for_a_cli_process {
+            use super::*;
+
+            #[tokio::test]
+            async fn needs_no_override() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &user("a"), 600_000).await["lease_id"].clone();
+                ok(
+                    &h,
+                    "rehome_holder",
+                    &user("a"),
+                    json!({"lease_id": lease, "new_holder": {"kind": "user", "tag": "u"}}),
+                )
+                .await;
+            }
+        }
+    }
+
+    mod daemon_stop {
+        use super::*;
+
+        mod on_restart_false_and_no_override {
+            use super::*;
+
+            #[tokio::test]
+            async fn refuses_with_override_required() {
+                let (h, _clock) = spawn();
+                let e = err(&h, "daemon_stop", &agent("a", None), json!({})).await;
+                assert_eq!(e.code, "override_required");
+            }
+
+            #[tokio::test]
+            async fn leaves_the_daemon_running() {
+                let (h, _clock) = spawn();
+                err(&h, "daemon_stop", &agent("a", None), json!({})).await;
+                ok(&h, "status", &agent("a", None), json!({})).await;
+            }
+        }
+
+        mod on_restart_true {
+            use super::*;
+
+            #[tokio::test]
+            async fn proceeds() {
+                let (h, _clock) = spawn();
+                ok(
+                    &h,
+                    "daemon_stop",
+                    &agent("a", None),
+                    json!({"restart": true}),
+                )
+                .await;
+                tokio::time::timeout(PATIENCE, h.stopped()).await.unwrap();
+            }
+        }
+
+        mod on_an_override_reason {
+            use super::*;
+
+            #[tokio::test]
+            async fn proceeds() {
+                let (h, _clock) = spawn();
+                ok(
+                    &h,
+                    "daemon_stop",
+                    &agent("a", Some("the user asked")),
+                    json!({}),
+                )
+                .await;
+                tokio::time::timeout(PATIENCE, h.stopped()).await.unwrap();
+            }
+        }
+    }
+
+    mod release_of_another_holders_lease {
+        use super::*;
+
+        mod on_no_force_or_override {
+            use super::*;
+
+            #[tokio::test]
+            async fn refuses_with_not_yours() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &agent("a", None), 600_000).await["lease_id"].clone();
+                let e = err(&h, "release", &agent("b", None), json!({"lease_id": lease})).await;
+                assert_eq!(e.code, "not_yours");
+            }
+
+            #[tokio::test]
+            async fn names_the_holder_kind() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &user("a"), 600_000).await["lease_id"].clone();
+                let e = err(&h, "release", &agent("b", None), json!({"lease_id": lease})).await;
+                assert_eq!(e.details, Some(json!({"holder_kind": "user"})));
+                assert!(e.message.contains("user"), "{}", e.message);
+            }
+
+            #[tokio::test]
+            async fn names_the_failed_variant_too() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &agent("a", None), 600_000).await["lease_id"].clone();
+                let e = err(
+                    &h,
+                    "release",
+                    &agent("b", None),
+                    json!({"lease_id": lease, "failed": true}),
+                )
+                .await;
+                assert_eq!(e.code, "not_yours");
+            }
+
+            #[tokio::test]
+            async fn leaves_the_lease_held() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let lease = acquire(&h, &agent("a", None), 600_000).await["lease_id"].clone();
+                err(&h, "release", &agent("b", None), json!({"lease_id": lease})).await;
+                let view = ok(
+                    &h,
+                    "get_lease",
+                    &agent("a", None),
+                    json!({"lease_id": lease}),
+                )
+                .await;
+                assert_eq!(view["state"], "held");
+            }
+        }
+
+        mod on_an_unknown_lease {
+            use super::*;
+
+            #[tokio::test]
+            async fn stays_not_found() {
+                let (h, _clock) = spawn();
+                let e = err(
+                    &h,
+                    "release",
+                    &agent("b", None),
+                    json!({"lease_id": "lse_01M73T4BRYS4EYTM4KSGD7GPKX"}),
+                )
+                .await;
+                assert_eq!(e.code, "not_found");
+            }
+        }
+    }
+}

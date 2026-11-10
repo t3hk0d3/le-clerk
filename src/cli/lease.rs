@@ -472,7 +472,22 @@ pub async fn cancel(client: &Client, caller: &Caller, request: &str) -> Result<(
 /// `not_found` for an ended lease; the daemon's errors.
 pub async fn finish(client: &Client, caller: &Caller, lease: &str) -> Result<Value, ApiError> {
     let args = json!({ "lease_id": lease });
-    let mut view = client.call("get_lease", caller, args.clone()).await?;
+    let mut view = match client.call("get_lease", caller, args.clone()).await {
+        Ok(view) => view,
+        // Another holder's lease is not shown to the caller; releasing it
+        // says whose kind it is (`not_yours`).
+        Err(e) if e.code == "not_found" => {
+            match client.call("release", caller, args.clone()).await {
+                Err(not_yours) if not_yours.code == "not_yours" => return Err(not_yours),
+                Err(_) => return Err(e),
+                // It was the caller's after all (a race): carry on from the
+                // release.
+                Ok(released) if released["state"] != "cleaning" => return Ok(released),
+                Ok(released) => released,
+            }
+        }
+        Err(e) => return Err(e),
+    };
     match view["state"].as_str() {
         Some("ended") => return Err(no_live_lease(lease)),
         Some("held" | "paused" | "offered") => {
@@ -995,6 +1010,15 @@ fn outcome_text(v: &Value, target: &str) -> String {
             if let Some(ms) = v["estimated_wait_ms"].as_i64() {
                 let now = SystemClock.now_ms();
                 let _ = write!(t, "\n  Expected turn: {}.", render::when(now + ms, now));
+            }
+            if let Some(d) = v.get("displaced").filter(|d| d.is_object()) {
+                let _ = write!(
+                    t,
+                    "\n  Taken from {}: lease {} is overridden and ends after its cleanup \
+                     window.",
+                    render::holder(&d["holder"]),
+                    text(&d["lease_id"])
+                );
             }
             t
         }

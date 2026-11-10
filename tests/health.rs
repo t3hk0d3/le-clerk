@@ -409,6 +409,41 @@ mod custom_command {
         );
     }
 
+    /// `cargo test` gives this process `CARGO_*` variables: a check does
+    /// not inherit them, only the documented ones.
+    #[test]
+    fn runs_with_only_the_documented_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("env");
+        let cmd = format!("env > {}", seen.display());
+        let s = UnitSettings::Generic {
+            identity_key: "k".into(),
+        };
+        let r = checker().check_unit(
+            &spec(vec![custom(&cmd)]),
+            &ResourceId::parse("esp32").unwrap(),
+            &UnitId::parse("u1").unwrap(),
+            &s,
+        );
+        assert_eq!(r, HealthResult::Healthy);
+        let text = fs::read_to_string(&seen).unwrap();
+        let names: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+            .collect();
+        for name in &names {
+            let allowed = matches!(
+                *name,
+                "HOME" | "PATH" | "LANG" | "RUST_LOG" | "PWD" | "SHLVL" | "_" | "OLDPWD"
+            ) || name.starts_with("XDG_")
+                || name.starts_with("CLERK_");
+            assert!(allowed, "{name} leaked into the check: {names:?}");
+        }
+        assert!(names.contains(&"PATH"), "{names:?}");
+        assert!(names.contains(&"CLERK_RESOURCE"), "{names:?}");
+        assert!(names.contains(&"CLERK_UNIT_IDENTITY_KEY"), "{names:?}");
+    }
+
     #[test]
     fn settings_are_never_executed() {
         let dir = tempfile::tempdir().unwrap();
