@@ -679,7 +679,12 @@ running and starts it if not. The roles:
   Create and update take a description, a usage template (§4.7) and tags.
 - `unit_add`, `unit_update`, `unit_remove`, `unit_retire`. Adding or updating a
   unit returns duplicate results (§4.4).
-- `promotion_request`.
+- No separate promotion tool (my call): a `similar_in_other_project` warning
+  already files the promotion request for the user (§4.4).
+- `resource_create` defaults to the session's project scope; user scope only
+  when asked (my call, matching the CLI).
+- Never exposed to agents (enforced by the daemon): `view: all`, admin
+  operations, the audit log, the promotion list and approval, holder lookups.
 
 **Leasing:**
 - `lease_acquire` (§5.1). Returns a grant at once, or a task / queued result.
@@ -694,6 +699,9 @@ running and starts it if not. The roles:
 - `lease_reclaim`: a paused holder takes its unit back after the borrower
   overruns.
 - `lease_cancel`: cancel a queued request.
+- `lease_claim`: claim an offered unit (my call; `lease_wait` and a completed
+  `lease_acquire` task claim offers themselves, since the waiting call proves
+  the agent is present).
 - `lease_wait`: blocks, or runs as a task, until notices exist, then returns
   them.
 
@@ -712,21 +720,39 @@ Every notice states:
 Notices come from the clerk's own tools and hooks, never as cross-session
 messages.
 
-### 8.3 Skill (agent etiquette)
+### 8.3 Skills
 
-A Claude Code skill shipped with the integration package teaches agents:
+Two Claude Code skills ship with the integration package (user decision).
+
+**Leasing (agent etiquette)** teaches agents:
 - when to lease, and to declare honest durations;
 - to mark long, pausable work as interruptible;
 - to keep `lease_wait` armed;
 - to confirm cleanup;
 - to record resource and unit IDs in project docs or memory after creating
   them;
-- to give every resource and unit a description, and every resource usage
-  instructions with unit placeholders (§4.7), and to read them on grant;
-- to tag every resource it creates (chip, radio protocols, board kind) and to
-  search by tags before creating a resource that may already exist (§4.8);
+- to read the descriptions and usage on grant;
 - to use `override` only when the user said so;
 - never to coordinate resources by messaging other agents.
+
+**Registering resources** covers both moments: the user asks an agent to
+register things ("register the boards on my hub"), and an agent needs something
+that isn't registered yet. It is generic across types; serial boards are one
+example among services and generic pools. Discovery is the agent's prerogative:
+the clerk has no scan tool (user decision). The steps:
+1. Search first (`resource_list` by tags) and reuse what exists.
+2. Pick the type: `device` (reached by a path), `service` (host and port,
+   connect or listen), `generic` (anything else with an identity key).
+3. Group interchangeable things into one resource, one unit each.
+4. Fill in the context: ID, description, tags (what it is, its capabilities,
+   its kind), and usage in Markdown with `{unit.*}` placeholders, gotchas and
+   what "clean" means (§4.7, §4.8).
+5. Create, add units, and act on duplicate warnings. A similar thing in another
+   project means telling the user about the promotion, never re-registering
+   it.
+6. Scope: the agent's project by default; user scope only when the user says
+   the thing is shared.
+7. Record the IDs in project docs or memory.
 
 ### 8.4 CLI (for the user)
 
@@ -812,7 +838,7 @@ alternative (e.g. `clerk install claude-code`). It contains:
 - the MCP server registration: stdio, `clerk mcp`;
 - the hooks from §6 (Stop reminder, PreToolUse notice injection, optional
   asyncRewake) and an optional SessionEnd notification;
-- the skill (§8.3).
+- the two skills (§8.3).
 
 Hooks call `clerk` CLI subcommands meant for hooks. They must fail open: if the
 daemon is unreachable, the agent's work is never blocked. The scope the plugin
@@ -883,6 +909,8 @@ stops the MVP):
 - a description per resource and unit, and usage instructions per resource
   with unit placeholders, handed over on grant;
 - tags per resource, used by agents to search, never to lease "any match";
+- two skills, leasing and registering resources; no scan tool, discovery is
+  the agent's job;
 - hard expiry even when nobody is waiting, marking the unit dirty and warning
   its next owner;
 - CLI holders for the user, scripts and smoke tests;
