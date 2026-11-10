@@ -63,6 +63,16 @@ impl Env {
     /// this test process (alive for the whole test).
     fn agent(&self, session: &str, cwd: &Path) -> Command {
         let mut cmd = self.cmd();
+        cmd.arg("--json")
+            .env(SESSION_VAR, session)
+            .env(CLAUDE_PID, std::process::id().to_string())
+            .current_dir(cwd);
+        cmd
+    }
+
+    /// As [`Env::agent`], without `--json`: the agent's default Markdown.
+    fn agent_md(&self, session: &str, cwd: &Path) -> Command {
+        let mut cmd = self.cmd();
         cmd.env(SESSION_VAR, session)
             .env(CLAUDE_PID, std::process::id().to_string())
             .current_dir(cwd);
@@ -73,7 +83,7 @@ impl Env {
     /// `CLAUDE_PID` (Claude Code older than 2.1.214).
     fn agent_without_pid(&self, session: &str, cwd: &Path) -> Command {
         let mut cmd = self.cmd();
-        cmd.env(SESSION_VAR, session).current_dir(cwd);
+        cmd.arg("--json").env(SESSION_VAR, session).current_dir(cwd);
         cmd
     }
 
@@ -2318,7 +2328,8 @@ mod cli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(session) = session {
-            cmd.env(SESSION_VAR, session)
+            cmd.arg("--json")
+                .env(SESSION_VAR, session)
                 .env(CLAUDE_PID, std::process::id().to_string());
         }
         Bg(cmd.spawn().unwrap())
@@ -3930,6 +3941,105 @@ mod cli {
                     "{error}"
                 );
             }
+        }
+    }
+
+    mod agent_md {
+        use super::*;
+
+        fn stdout(cmd: &mut Command) -> (String, Option<i32>) {
+            let out = cmd.output().unwrap();
+            (String::from_utf8(out.stdout).unwrap(), out.status.code())
+        }
+
+        #[test]
+        fn a_grant_is_markdown_with_its_heading_and_next_last() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let dir = env.dir("alpha");
+            let (text, code) = stdout(
+                env.agent_md("sess-1", &dir)
+                    .args(["acquire", "board", "--for", "10m"]),
+            );
+            assert_eq!(code, Some(0), "{text}");
+            assert!(text.starts_with("## Granted: board/u1\n"), "{text}");
+            assert!(text.contains("- lease_id: lse_"), "{text}");
+            assert!(
+                text.trim_end()
+                    .lines()
+                    .last()
+                    .unwrap()
+                    .starts_with("Next: "),
+                "{text}"
+            );
+            assert!(!text.contains('{') && !text.contains('\u{1b}'), "{text}");
+        }
+
+        #[test]
+        fn queued_is_markdown_and_next_names_the_wait() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            hold(&env, "x");
+            let dir = env.dir("alpha");
+            let (text, code) = stdout(
+                env.agent_md("sess-1", &dir)
+                    .args(["acquire", "board", "--for", "10m"]),
+            );
+            assert_eq!(code, Some(6), "{text}");
+            assert!(text.starts_with("## Queued: request req_"), "{text}");
+            assert!(text.contains("- request_id: req_"), "{text}");
+            assert!(text.contains("clerk wait --follow"), "{text}");
+        }
+
+        #[test]
+        fn a_list_is_one_block_per_item_without_next() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let dir = env.dir("alpha");
+            let (text, _) = stdout(env.agent_md("sess-1", &dir).arg("resources"));
+            assert!(text.starts_with("## board\n"), "{text}");
+            assert!(!text.contains("Next:"), "{text}");
+        }
+
+        #[test]
+        fn an_error_is_markdown_on_stdout_with_the_next_step() {
+            let env = Env::new();
+            let dir = env.dir("alpha");
+            let (text, code) = stdout(
+                env.agent_md("sess-1", &dir)
+                    .args(["release", "lse_01ARZ3NDEKTSV4RRFFQ69G5FAV"]),
+            );
+            assert_eq!(code, Some(3), "{text}");
+            assert!(text.starts_with("## Error: not_found\n"), "{text}");
+            assert!(
+                text.trim_end().ends_with("to see where you stand."),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn json_flag_prints_todays_json() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let dir = env.dir("alpha");
+            let body = json_of(
+                env.agent_md("sess-1", &dir)
+                    .args(["--json", "acquire", "board", "--for", "10m"]),
+            );
+            assert!(body["next"].is_string(), "{body}");
+        }
+
+        #[test]
+        fn clerk_agent_format_json_prints_json() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let dir = env.dir("alpha");
+            let body = json_of(
+                env.agent_md("sess-1", &dir)
+                    .env("CLERK_AGENT_FORMAT", "json")
+                    .args(["acquire", "board", "--for", "10m"]),
+            );
+            assert!(body["next"].is_string(), "{body}");
         }
     }
 

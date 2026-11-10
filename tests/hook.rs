@@ -229,6 +229,7 @@ impl Drop for Host {
 fn agent(env: &Env, session: &str, host: &Host, args: &[&str]) -> (Value, Option<i32>) {
     let out = env
         .cmd()
+        .arg("--json")
         .args(args)
         .env(SESSION_VAR, session)
         .env(CLAUDE_PID, host.pid().to_string())

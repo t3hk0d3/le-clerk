@@ -247,12 +247,18 @@ pub struct Output {
     /// The command an agent session runs: JSON results and errors then
     /// carry the next step (see [`super::next`]).
     agent: Option<&'static str>,
+    /// Agent results as Markdown ([`super::md`]) instead of JSON.
+    markdown: bool,
 }
 
 impl Output {
     #[must_use]
     pub fn new(mode: Mode) -> Self {
-        Self { mode, agent: None }
+        Self {
+            mode,
+            agent: None,
+            markdown: false,
+        }
     }
 
     /// This output for agent session command `command`.
@@ -260,6 +266,15 @@ impl Output {
     pub fn for_agent(self, command: &'static str) -> Self {
         Self {
             agent: Some(command),
+            ..self
+        }
+    }
+
+    /// This agent output printing Markdown when it would print JSON.
+    #[must_use]
+    pub fn markdown(self) -> Self {
+        Self {
+            markdown: true,
             ..self
         }
     }
@@ -278,10 +293,18 @@ impl Output {
         let text = match self.mode {
             Mode::Json => {
                 let mut json = serde_json::to_value(value)?;
-                if let Some(command) = self.agent {
-                    super::next::annotate(command, &mut json);
+                match self.agent {
+                    Some(command) if self.markdown => super::md::render(
+                        command,
+                        &json,
+                        leclerk::clock::Clock::now_ms(&leclerk::clock::SystemClock),
+                    ),
+                    Some(command) => {
+                        super::next::annotate(command, &mut json);
+                        json.to_string()
+                    }
+                    None => json.to_string(),
                 }
-                json.to_string()
             }
             Mode::Human => render::finish(&value.render(), Style::current()),
         };
@@ -304,6 +327,10 @@ impl Output {
             f.message = super::next::error_message(&f.code, &f.message);
         }
         match self.mode {
+            Mode::Json if self.markdown && self.agent.is_some() => {
+                let mut stdout = io::stdout().lock();
+                let _ = writeln!(stdout, "{}", super::md::error(&f.code, &f.message));
+            }
             Mode::Json => {
                 let mut error = json!({"code": f.code, "message": f.message});
                 if let Some(details) = &f.details {

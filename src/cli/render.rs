@@ -280,6 +280,28 @@ fn span_ms(ms: u64) -> String {
     }
 }
 
+/// The local date and time of `at_ms`: `2026-11-10 14:32`.
+#[must_use]
+pub fn date_time(at_ms: i64) -> String {
+    let secs: libc::time_t = at_ms.div_euclid(1000);
+    // SAFETY: as in `clock`.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&raw const secs, &raw mut tm).is_null() {
+            return "?".to_owned();
+        }
+        tm
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
 /// The local clock time of `at_ms`: `14:32`.
 #[must_use]
 pub fn clock(at_ms: i64) -> String {

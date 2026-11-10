@@ -67,7 +67,7 @@ fn s(v: &Value, key: &str) -> String {
 }
 
 /// The summary lines and next step for `command`'s result `v`.
-fn note(command: &str, v: &Value) -> (Vec<String>, String) {
+pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
     let lease = s(v, "lease_id");
     match command {
         "acquire" | "claim" | "attach" if v["outcome"] == "queued" => (

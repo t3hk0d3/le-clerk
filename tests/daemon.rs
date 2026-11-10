@@ -1116,6 +1116,9 @@ mod daemon {
                     "XDG_STATE_HOME",
                     "XDG_CONFIG_HOME",
                     "XDG_RUNTIME_DIR",
+                    // Tests may run inside a Claude Code session.
+                    "CLAUDE_CODE_SESSION_ID",
+                    "CLAUDE_PID",
                 ] {
                     cmd.env_remove(var);
                 }

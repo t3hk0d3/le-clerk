@@ -148,3 +148,48 @@ or a linked unit busy.
   requested by ~/dev/thread-app: a matching unit was registered there
 Approve with `clerk approve prm_01M71FSCD807F5CX1J7EJ0TBA6`.
 ```
+
+## Agent sessions
+
+Run in an agent session (`CLAUDE_CODE_SESSION_ID` set) with stdout not a
+terminal, a command prints its result as **labelled Markdown** rendered from
+the same JSON scripts get (`src/cli/md.rs`). `--json`, or
+`CLERK_AGENT_FORMAT=json`, prints the JSON instead. A terminal keeps the
+person view.
+
+- Every non-empty field is a `- key: value` line, in the JSON's (key)
+  order; nulls and empty values are left out; nested objects are indented
+  lists; lists of scalars are comma-joined; multi-line text (usage) is a
+  `### key` section, verbatim.
+- Times read `2026-11-10 14:32 (in 20m)`; durations `20m`, labelled without
+  `_ms`.
+- Grants, queued requests, leases and notices get a heading
+  (`## Granted: <resource>/<unit>`, `## Queued: …`, `## Lease <id>`,
+  `## Notice: <kind>`) and leave out fields that only restate it or a
+  default (the caller's own holder, `held`, `normal` priority, not
+  interruptible).
+- The summary follows as a paragraph, and the last line is `Next: …`.
+- A list is one `## <id>` block per item, without `Next:`.
+- An error is `## Error: <code>` and its message (ending with the next
+  step), on stdout.
+
+```text
+## Granted: c6-boards/c6-a
+- duration: 20m
+- ends_at: 2026-11-10 14:52 (in 20m)
+- lease_id: lse_01M72…
+- purpose: flash and test the OTA path
+- resource: c6-boards
+- resource_description: ESP32-C6 dev boards on the USB hub
+- settings:
+  - path: /dev/serial/by-id/usb-Espressif_…-if00
+  - type: device
+- unit: c6-a
+
+### usage
+Flash with `idf.py -p /dev/serial/by-id/… flash`. Clean = erase flash.
+
+You hold lease lse_01M72… (c6-boards/c6-a); read its description and usage before using it.
+
+Next: Use the unit, then `clerk release lse_01M72…` when you are done (…).
+```

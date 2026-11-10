@@ -14,6 +14,7 @@ mod input;
 mod inventory;
 mod lease;
 mod live;
+mod md;
 mod next;
 mod output;
 mod render;
@@ -275,6 +276,13 @@ pub fn run() -> ExitCode {
     let mut out = Output::new(Mode::detect(cli.json));
     if std::env::var_os(caller::SESSION_VAR).is_some_and(|v| !v.is_empty()) {
         out = out.for_agent(cli.command.name());
+        // Agents read Markdown unless asked for JSON (`--json`, or
+        // CLERK_AGENT_FORMAT=json); a terminal keeps the person view.
+        let json_wanted =
+            cli.json || std::env::var("CLERK_AGENT_FORMAT").is_ok_and(|f| f.trim() == "json");
+        if !json_wanted {
+            out = out.markdown();
+        }
     }
     if let Command::Daemon { action: None } = cli.command {
         // The daemon logs to its own file.

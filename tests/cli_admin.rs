@@ -50,6 +50,8 @@ fn clerk_with(env: &Env, args: &[&str], vars: &[(&str, &str)]) -> Output {
         .env_remove(SESSION_VAR)
         .env_remove("CLAUDE_PID")
         .envs(vars.iter().copied())
+        // Agent callers read JSON here, as scripts do.
+        .env("CLERK_AGENT_FORMAT", "json")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
