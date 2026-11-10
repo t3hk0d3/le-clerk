@@ -172,6 +172,19 @@ impl Daemon {
     /// Lease `lease` of agent session `session` (in project "a"), as the
     /// engine reports it.
     async fn lease_of(&self, session: &str, lease: &Value) -> Value {
+        self.as_session(session, "get_lease", json!({ "lease_id": lease }))
+            .await
+            .unwrap()
+    }
+
+    /// Engine call `method` as agent session `session` in project "a",
+    /// straight to the engine (no MCP).
+    async fn as_session(
+        &self,
+        session: &str,
+        method: &str,
+        args: Value,
+    ) -> Result<Value, leclerk::engine::ApiError> {
         let caller = Caller {
             holder: HolderRef::AgentSession {
                 session_id: session.into(),
@@ -179,11 +192,9 @@ impl Daemon {
             project: Some(leclerk::model::ProjectKey(self.project("a"))),
             override_reason: None,
         };
-        let args = json!({ "lease_id": lease });
         self.engine
-            .call(Command::parse("get_lease", caller, args).unwrap())
+            .call(Command::parse(method, caller, args).unwrap())
             .await
-            .unwrap()
     }
 
     /// Every resource, in every scope.
@@ -1328,6 +1339,28 @@ mod leasing {
             }
         }
 
+        mod on_the_same_offer_returned_twice {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn yields_one_grant_of_the_same_lease_and_no_claim_error() {
+                let d = Daemon::start();
+                let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+                let (lease, _) = held_pool(&s1, &s2).await;
+                hand_over(&s1, &lease).await;
+                let first = s2.ok("lease_wait", json!({})).await;
+                let again = s2.ok("lease_wait", json!({})).await;
+                for got in [&first, &again] {
+                    assert_eq!(got["grants"].as_array().unwrap().len(), 1, "{got}");
+                    assert_eq!(got["claim_errors"], json!([]), "{got}");
+                }
+                assert_eq!(
+                    again["grants"][0]["lease_id"],
+                    first["grants"][0]["lease_id"]
+                );
+            }
+        }
+
         mod on_none_pending {
             use super::*;
 
@@ -1366,6 +1399,7 @@ mod leasing {
                 let got = s.ok("lease_wait", json!({})).await;
                 let waited = started.elapsed();
                 assert_eq!(got["notices"], json!([]), "{got}");
+                assert_eq!(got["timed_out"], json!(true), "{got}");
                 assert!(waited >= Duration::from_millis(400), "{waited:?}");
                 assert!(waited < Duration::from_secs(5), "{waited:?}");
             }
@@ -1601,6 +1635,33 @@ mod leasing {
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn lease_acquire_by_a_paused_holder_overriding_reclaims_next_step_lease_wait() {
+            let d = Daemon::start();
+            let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+            let lease = asked_to_yield(&s1, &s2).await;
+            s1.ok(
+                "lease_confirm",
+                json!({"lease_id": lease, "how": "yielded"}),
+            )
+            .await;
+            s2.ok("lease_wait", json!({})).await;
+            let result = s1
+                .call(
+                    "lease_acquire",
+                    json!({"target": {"resource": "board"}, "for": "1h", "purpose": "back",
+                           "override_reason": "the user needs it now"}),
+                )
+                .await;
+            assert_eq!(
+                result["structuredContent"]["outcome"],
+                json!("reclaiming"),
+                "{result}"
+            );
+            assert!(text_of(&result).contains("comes back to you"), "{result}");
+            assert!(next_step(&result).contains("lease_wait"), "{result}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn lease_cancel_drops_the_request_next_step_lease_status() {
             let d = Daemon::start();
             let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
@@ -1709,6 +1770,99 @@ mod leasing {
                 finished(&s2, handle["taskId"].as_str().unwrap()).await;
                 let engine = d.engine.clone();
                 eventually(|| engine.open_waits(&agent("s2")) == 0, "the task closes").await;
+            }
+        }
+
+        /// `lease_wait` as a task of `s` (which declares tasks); the
+        /// handle.
+        async fn wait_task(s: &Raw) -> Value {
+            let handle = s.call("lease_wait", json!({})).await;
+            assert_eq!(handle["resultType"], json!("task"), "{handle}");
+            handle
+        }
+
+        mod lease_wait_as_a_task {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn completes_with_the_same_result_shape_as_the_blocking_path() {
+                let d = Daemon::start();
+                let s = d.session("s1", "a");
+                seed(&s, "board", "k", &[]).await;
+                ended_notice(&d, &s, "board").await;
+                let t = d.session("s1", "a").with_tasks();
+                let handle = wait_task(&t).await;
+                let done = finished(&t, handle["taskId"].as_str().unwrap()).await;
+                assert_eq!(done["status"], json!("completed"), "{done}");
+                let blocking = s.call("lease_wait", json!({})).await;
+                assert_eq!(
+                    done["result"]["structuredContent"],
+                    blocking["structuredContent"]
+                );
+                assert_eq!(text_of(&done["result"]), text_of(&blocking));
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_never_fetched_result_leaves_its_notices_pending() {
+                let d = Daemon::start();
+                let s = d.session("s1", "a");
+                seed(&s, "board", "k", &[]).await;
+                ended_notice(&d, &s, "board").await;
+                let pending = pending_ids(&d, "s1").await;
+                wait_task(&d.session("s1", "a").with_tasks()).await;
+                let engine = d.engine.clone();
+                eventually(|| engine.open_waits(&agent("s1")) == 0, "the task ends").await;
+                assert_eq!(pending_ids(&d, "s1").await, pending);
+                let again = notice_ids(&s.ok("lease_wait", json!({})).await);
+                assert_eq!(again, pending);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn tasks_cancel_closes_its_open_wait() {
+                let d = Daemon::start();
+                let s = d.session("s1", "a").with_tasks();
+                let handle = wait_task(&s).await;
+                assert_eq!(d.engine.open_waits(&agent("s1")), 1);
+                let reply = s
+                    .request("tasks/cancel", json!({"taskId": handle["taskId"]}))
+                    .await;
+                assert!(reply.message.get("error").is_none(), "{}", reply.message);
+                let engine = d.engine.clone();
+                eventually(|| engine.open_waits(&agent("s1")) == 0, "the task closes").await;
+            }
+        }
+
+        mod on_an_acquire_task_whose_offer_cannot_be_claimed {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_tool_error_ends_with_lease_wait_as_the_next_step() {
+                let d = Daemon::start();
+                let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a").with_tasks());
+                seed(&s1, "board", "k", &[]).await;
+                let lease = acquire(&s1, "board").await["lease_id"].clone();
+                let handle = s2
+                    .call(
+                        "lease_acquire",
+                        json!({"target": {"resource": "board"}, "for": "1h", "purpose": "x"}),
+                    )
+                    .await;
+                assert_eq!(handle["resultType"], json!("task"), "{handle}");
+                s1.ok("lease_release", json!({"lease_id": lease})).await;
+                // Both jobs reach the engine before the task wakes: the
+                // confirm makes the offer, the eviction ends it unclaimed.
+                let (confirmed, evicted) = tokio::join!(
+                    d.as_session("s1", "confirm", json!({"lease_id": lease})),
+                    d.admin("admin_evict", json!({"holder": "session:s2"})),
+                );
+                confirmed.unwrap();
+                assert!(evicted.is_object(), "{evicted}");
+                let done = finished(&s2, handle["taskId"].as_str().unwrap()).await;
+                assert_eq!(done["status"], json!("completed"), "{done}");
+                assert_eq!(done["result"]["isError"], json!(true), "{done}");
+                let text = text_of(&done["result"]);
+                let next = text.rsplit(". ").next().unwrap();
+                assert!(next.starts_with("Call lease_wait"), "{text}");
             }
         }
 

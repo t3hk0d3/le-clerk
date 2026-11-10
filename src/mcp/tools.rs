@@ -200,9 +200,17 @@ fn task_result(outcome: Result<Outcome, ApiError>) -> CallToolResult {
 
 /// A tool error carrying the engine's code, message and details.
 fn tool_error(e: &ApiError) -> CallToolResult {
+    tool_error_then(e, None)
+}
+
+/// [`tool_error`] whose text ends in `next`, when given.
+fn tool_error_then(e: &ApiError, next: Option<&str>) -> CallToolResult {
     let mut text = format!("{}: {}", e.code, e.message);
     if let Some(details) = &e.details {
         let _ = write!(text, " ({details})");
+    }
+    if let Some(next) = next {
+        let _ = write!(text, ". {next}");
     }
     let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
     result.structured_content = Some(json!({ "error": e }));
@@ -803,7 +811,9 @@ async fn lease_acquire(ctx: &Ctx<'_>, a: LeaseAcquireArgs) -> Result<Answer, Api
                         identity: &identity,
                         live: &live,
                     };
-                    task_result(queued_outcome(&ctx, &request).await)
+                    queued_outcome(&ctx, &request)
+                        .await
+                        .unwrap_or_else(Failure::into_result)
                 };
                 return Ok(Answer::Task(tasks.spawn(ctx.engine, ctx.identity, work)));
             }
@@ -819,40 +829,76 @@ async fn lease_acquire(ctx: &Ctx<'_>, a: LeaseAcquireArgs) -> Result<Answer, Api
             )
             .into())
         }
-        _ => Ok(Outcome::new(
-            got.clone(),
-            &[format!(
-                "Your borrower is being ended so lease {} comes back to you.",
-                str_at(&got, "/lease_id")
-            )],
-            "Call lease_wait to hear when the unit is back.",
-        )
-        .into()),
+        "reclaiming" => Ok(reclaiming_outcome(got).into()),
+        other => Err(ApiError::internal(format!(
+            "acquire answered with an unknown outcome {other:?}"
+        ))),
+    }
+}
+
+/// `lease_acquire` answered `reclaiming`: a paused holder's override of its
+/// own borrower.
+fn reclaiming_outcome(got: Value) -> Outcome {
+    let summary = format!(
+        "Your borrower is being ended so lease {} comes back to you.",
+        str_at(&got, "/lease_id")
+    );
+    Outcome::new(
+        got,
+        &[summary],
+        "Call lease_wait to hear when the unit is back.",
+    )
+}
+
+/// The next step after a queued request's offer could not be claimed.
+const CLAIM_FAILED_NEXT: &str = "Call lease_wait to see what became of the offer, or \
+     lease_acquire again if you still need the unit.";
+
+/// A task that ended in a tool error, and the next step its text ends in.
+struct Failure {
+    error: ApiError,
+    next: Option<&'static str>,
+}
+
+impl From<ApiError> for Failure {
+    fn from(error: ApiError) -> Self {
+        Self { error, next: None }
+    }
+}
+
+impl Failure {
+    fn into_result(self) -> CallToolResult {
+        tool_error_then(&self.error, self.next)
     }
 }
 
 /// What a queued request came to, within the wait cap (a task's result).
-async fn queued_outcome(ctx: &Ctx<'_>, request: &RequestId) -> Result<Outcome, ApiError> {
+async fn queued_outcome(ctx: &Ctx<'_>, request: &RequestId) -> Result<CallToolResult, Failure> {
     let holder = ctx.identity.caller().holder;
     let Some(notice) = wait::request_outcome(ctx.engine, &holder, request).await? else {
         return Ok(Outcome::new(
             json!({ "outcome": "queued", "request_id": request }),
             &[format!("Request {request} is still queued.")],
             QUEUED_NEXT,
-        ));
+        )
+        .into_result());
     };
-    match (notice.kind, &notice.lease_id) {
+    let outcome = match (notice.kind, &notice.lease_id) {
         (NoticeKind::Offered, Some(lease)) => {
-            let lease = claim_offer(ctx, lease).await?;
+            let lease = claim_offer(ctx, lease).await.map_err(|error| Failure {
+                error,
+                next: Some(CLAIM_FAILED_NEXT),
+            })?;
             let brief = grant_brief(&lease, ctx.engine.now_ms());
-            Ok(Outcome::new(lease, &[brief], HELD_NEXT))
+            Outcome::new(lease, &[brief], HELD_NEXT)
         }
-        _ => Ok(Outcome::new(
+        _ => Outcome::new(
             json!({ "outcome": "dropped", "request_id": request, "notice": notice }),
             std::slice::from_ref(&notice.action),
             "Call lease_acquire again if you still need it.",
-        )),
-    }
+        ),
+    };
+    Ok(outcome.into_result())
 }
 
 async fn lease_status(ctx: &Ctx<'_>, NoArgs {}: NoArgs) -> Result<Outcome, ApiError> {
@@ -1252,6 +1298,31 @@ mod tests {
     fn update_leaves_out_an_absent_health() {
         let a: ResourceUpdateArgs = parse("t", json!({"id": "r"})).unwrap();
         assert_eq!(engine_args(&a).unwrap(), json!({"id": "r"}));
+    }
+
+    #[test]
+    fn reclaiming_outcome_names_the_lease_and_lease_wait() {
+        let o = reclaiming_outcome(json!({"outcome": "reclaiming", "lease_id": "lse_1"}));
+        assert!(o.text.contains("lease lse_1 comes back"), "{}", o.text);
+        assert!(
+            o.text
+                .ends_with("Call lease_wait to hear when the unit is back.")
+        );
+    }
+
+    #[test]
+    fn a_failed_claim_ends_in_lease_wait() {
+        let failure = Failure {
+            error: ApiError::internal("gone"),
+            next: Some(CLAIM_FAILED_NEXT),
+        };
+        let result = failure.into_result();
+        let text = serde_json::to_value(&result.content).unwrap()[0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(text.ends_with(CLAIM_FAILED_NEXT), "{text}");
+        assert!(text.starts_with("internal_error: gone"), "{text}");
     }
 
     #[test]
