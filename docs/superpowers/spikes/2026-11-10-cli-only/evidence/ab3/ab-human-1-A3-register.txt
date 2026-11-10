@@ -1,0 +1,24 @@
+                                                                                
+● I added the two hub boards to the clerk as units of the existing c6-boards
+  resource. Both are user-scoped, since they are physical hardware:             
+                                                                                
+  - c6-aa: .../sp/ab-human-1/hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debu
+    g_unit_AA-if00                                                              
+  - c6-bb: .../sp/ab-human-1/hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debu
+    g_unit_BB-if00                                              
+                                                                                
+  The resource's existing flash and clean usage applies to both.            
+                                                                                
+  The clerk still lists c6-a, which points at board-a, an empty placeholder     
+  rather than a hub port. You haven't answered whether to retire it, so I left  
+  it in place. Say the word and I'll run clerk unit retire on it.               
+                                                                                
+  I also updated my memory note for c6-boards, which described older       
+  registrations that the clerk no longer had.                                   
+
+✻ Worked for 26s · done 15:06 · 1 monitor still running                       
+                                                          
+────────────────────────────────────────────────────────────────────────────────
+❯ retire c6-a                                                    
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 monitor · ← 1 agent · ↓ to manage                   

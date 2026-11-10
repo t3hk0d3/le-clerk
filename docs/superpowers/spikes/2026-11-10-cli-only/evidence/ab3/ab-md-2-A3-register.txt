@@ -1,0 +1,24 @@
+  - c6-b: .../scratchpad/sp/ab-md-2/hub/serial/by-id/usb-Espressif_USB_JTAG_seri
+    al_debug_unit_AA-if00                                                       
+  - c6-c: .../scratchpad/sp/ab-md-2/hub/serial/by-id/usb-Espressif_USB_JTAG_seri
+    al_debug_unit_BB-if00                                                       
+                                                                                
+  The resource keeps the user scope and the existing usage (flash with idf.py -p
+  {unit.path} flash, clean means erase flash).                                  
+                                                                                
+  Needs your decision: the existing unit c6-a points to .../ab-md-2/board-a,    
+  which is an empty regular file, not a hub port. If someone leases c6-a and    
+  flashes it, the flash will fail. I couldn't tell from the filesystem whether  
+  c6-a is one of the two new boards, so I didn't add it as a duplicate. Should I
+  retire c6-a with clerk unit retire? Or is it a real board you want me to      
+  re-point to one of the hub ports?                                             
+                                                                                
+  I also updated my memory note for this resource with the new unit ids and the 
+  stale c6-a entry.                                                             
+
+✻ Baked for 32s · done 15:10                                                    
+                                                          
+────────────────────────────────────────────────────────────────────────────────
+❯ retire c6-a                                                 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

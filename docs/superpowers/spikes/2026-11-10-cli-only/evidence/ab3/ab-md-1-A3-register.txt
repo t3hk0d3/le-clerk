@@ -1,0 +1,24 @@
+  unit.                                                                         
+                                                                              
+  - c6-aa: /tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6
+    cc/scratchpad/sp/ab-md-1/hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debu
+    g_unit_AA-if00                                                              
+  - c6-bb: the same directory, usb-Espressif_USB_JTAG_serial_debug_unit_BB-if00 
+                                                                                
+  Things to know:                                                               
+                                                                                
+  - My memory note was wrong. It said c6-aa and c6-bb were already registered,  
+    but the clerk only had c6-a. I've corrected the memory note.                
+  - c6-a is still there. It points at the placeholder board-a file, which isn't 
+    a hub port. You haven't said whether to retire it, so I left it. Tell me if 
+    you want it retired with clerk unit retire.                                
+  - The hub entries are empty regular files, not device nodes, so they may not 
+    work as serial ports yet. I didn't check this. A real flash would show it.  
+  - I didn't lease anything or flash anything.                                  
+                                                                                
+✻ Churned for 24s · done 14:58                                                  
+                                                          
+────────────────────────────────────────────────────────────────────────────────
+❯ retire c6-a                                                 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

@@ -1,0 +1,24 @@
+  - c6-c: same directory, usb-Espressif_USB_JTAG_serial_debug_unit_BB-if00      
+                                                                                
+  Both were added without warnings and show no health check yet. Clean is still 
+  erase-flash, as on c6-a.                                                
+                                                                                
+  Things to check:                                                              
+                                                                                
+  - The by-id entries are empty regular files, not device nodes. I saw this when
+    I listed them, and it was the same caveat my memory notes recorded for the  
+    earlier c6-b/c6-c entries. Flashing will likely fail until real device nodes
+    appear. Please confirm the boards are actually attached to the hub.         
+  - c6-a is still registered with its placeholder path from the original        
+    registration. You haven't said whether to retire it. Tell me if you want it 
+    removed.                                                                    
+  - The earlier c6-b/c6-c entries from my memory were not in the clerk, so I    
+    registered them again from the ab-json-3 hub. The memory file now records   
+    the current units and paths.                                                
+
+✻ Cooked for 31s · done 15:25                                                   
+                                                          
+────────────────────────────────────────────────────────────────────────────────
+❯                                                               
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

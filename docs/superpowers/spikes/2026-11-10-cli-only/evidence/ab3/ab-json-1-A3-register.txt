@@ -1,0 +1,24 @@
+  - c6-aa: hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_AA-if00    
+  - c6-bb: hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_BB-if00    
+                                                                                
+  Both registered without warnings. Neither has a health check result yet       
+  (last_health is null), and I haven't acquired or flashed either one.      
+                                                                                
+  Two things to check:                                                          
+  - Both hub entries are empty regular files, not symlinks to real ports. That's
+    normal for a mock or test setup, but on a real hub by-id entries are        
+    symlinks to /dev/ttyACM*. If these are real boards, the clerk's health      
+    checks will tell you whether the paths work.                                
+  - The existing c6-a points at ab-json-1/board-a, which is not one of the hub  
+    ports. I left it unchanged.                                                 
+                                                                                
+  The skill says to record ids in project docs or memory. Your memory note      
+  already lists c6-aa and c6-bb, which now match the clerk, so I didn't change  
+  it.                                                                           
+
+✻ Worked for 18s · done 15:02                                                   
+                                                          
+────────────────────────────────────────────────────────────────────────────────
+❯                                                               
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

@@ -1441,3 +1441,15 @@ private tmux server, model haiku). Scripts and screens:
     a fair question). The skill still said "JSON" during the Markdown runs.
     Verdict: Markdown is no worse, so it is the agents' default; a grant is
     76 % of the JSON's bytes.
+15. **Markdown vs JSON vs person view, Haiku, three runs each** (after the
+    Part 3 review fixes; unambiguous registration prompt; `evidence/ab3/`):
+    every one of the nine runs leased, queued, woke on Monitor, claimed,
+    released, and registered both new boards as units of the existing
+    user-scope resource. No failed `clerk` call in any format. Session
+    tokens and call counts were noise (the system prompt dominates input
+    tokens; one Markdown run had a long detour listing the hub directory):
+    averages 2.5M / 2.0M / 2.4M input tokens and 23 / 16 / 18 calls for
+    Markdown / JSON / person view, with the Markdown average carried by that
+    one run (others 16 and 20 calls). Verdict: no format is better at the
+    task; Markdown stays the default for readability and its smaller
+    results, and `CLERK_AGENT_FORMAT=json|human` remain.

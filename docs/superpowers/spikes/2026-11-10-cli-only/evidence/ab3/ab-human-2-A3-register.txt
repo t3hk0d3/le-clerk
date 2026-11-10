@@ -1,0 +1,24 @@
+  three units: c6-a, c6-b and c6-c. I didn't retire or change c6-a.
+                                                                                
+  Two things need your attention:
+                                                                                
+  - The serial entries aren't real devices. Both                                
+    usb-Espressif_USB_JTAG_serial_debug_unit_AA-if00 and ..._BB-if00 are 0-byte
+    regular files, not device nodes. The board-a path I was granted earlier is  
+    also an empty regular file. Until real serial nodes appear there, leasing 
+    c6-b or c6-c will hand out paths that can't be flashed. If the boards are   
+    plugged into the hub on this machine, check that the hub's /dev/serial/by-id
+    links are what this directory mirrors.                                      
+  - Someone else holds c6-a now. Agent 0edb2d25 has an active lease on it       
+    (lse_01M72X2TNYPVJHB56FGD1RN1NW, about 19 minutes left). I didn't touch it.
+                                                                                
+  I also updated the memory note clerk-c6-boards.md to match the clerk's current
+  state. The old note listed c6-b and c6-c from the ab-json-2 hub, which the    
+  clerk never had.                                                              
+
+✻ Cogitated for 28s · done 15:17                                                
+                                                          
+────────────────────────────────────────────────────────────────────────────────
+❯                                                                
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

@@ -1,0 +1,24 @@
+  - c6-a: the original unit, path .../sp/ab-human-3/board-a                     
+  - c6-b: .../sp/ab-human-3/hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debug
+    _unit_AA-if00                                                               
+  - c6-c: .../sp/ab-human-3/hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debug
+    _unit_BB-if00                                                               
+                                                                                
+  Two things to check:                                                          
+                                                                                
+  - The ports may not work yet. When I listed the hub directory, both entries   
+    were empty regular files, not device nodes. Flashing c6-b or c6-c will
+    likely fail until the real devices show up there.                           
+  - My notes were out of date. They listed c6-b and c6-c on an older ab-json-3  
+    hub, and the clerk no longer had those units. I replaced those notes with   
+    the current setup.                                                          
+                                                                              
+  I haven't leased either new unit or touched the hardware. I also haven't      
+  looked at whether c6-a is still stale, which is still open from earlier.      
+
+✻ Sautéed for 29s · done 15:29                                                
+                                                          
+────────────────────────────────────────────────────────────────────────────────
+❯                                                                
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

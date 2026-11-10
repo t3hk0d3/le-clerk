@@ -1,0 +1,24 @@
+                                                                                
+  The resource now has three units: c6-a (the existing one, path            
+  .../ab-md-3/board-a), c6-b and c6-c. I didn't lease anything.                 
+                                                                                
+  Things to check before you rely on them:                                      
+                                                                                
+  - The by-id entries are empty regular files, not device nodes. I saw this when
+    listing them, and c6-a's path is the same kind of placeholder. idf.py -p    
+    will fail on these until the hub exposes real serial devices. I registered  
+    them as you asked but did not verify they work.                             
+  - The clerk doesn't match my notes. My earlier memory said c6-b and c6-c were 
+    already registered from other hubs (ab-human-2, ab-json-2). The clerk showed
+    only c6-a, so those were never registered. I updated the memory note to   
+    match the clerk's current state, including the new unit paths.              
+  - Usage is still the generic one. It says "Flash with idf.py -p {unit.path}   
+    flash. Clean = erase flash." If the two new units need different            
+    instructions, tell me and I'll update the resource usage.                   
+                                                                                
+✻ Brewed for 22s · done 15:21                                                   
+                                                          
+────────────────────────────────────────────────────────────────────────────────
+❯                                                             
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        
