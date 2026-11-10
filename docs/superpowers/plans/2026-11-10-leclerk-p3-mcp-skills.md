@@ -1,6 +1,6 @@
 # Le Clerk: Phase 3 (agent interface: MCP, then CLI-only) Implementation Plan
 
-> **2026-11-10 revision:** MCP is dropped. Part 2 (Tasks 8–13, at the end) replaces Tasks 2–4's MCP code with the CLI, one skill and hooks; its Global Constraints override Part 1's where they differ.
+> **2026-11-10 revisions:** Part 3 (Tasks 14–16) gives agents text output. MCP is dropped. Part 2 (Tasks 8–13, at the end) replaces Tasks 2–4's MCP code with the CLI, one skill and hooks; its Global Constraints override Part 1's where they differ.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -1167,6 +1167,169 @@ plugin
   record results in Appendix C; list what needs the user.
 - [ ] **Step 6:** Commit: `feat(plugin): one clerk skill for the CLI-only interface`
 
+
+## Part 3 (2026-11-10): text output for agents
+
+The user asked that agents get Markdown-like text instead of JSON, to save
+tokens and read better. Agents read results, they don't parse them. The CLI
+already has a person-facing view of every result (block lists, IDs never
+shortened, usage indented; `docs/cli-output.md`). Agents get that view
+without colour, plus the next step. `--json` stays for scripts and tests.
+Spec sections: §8.1 (results), §8.3 (the skill), §8.4.
+
+**Styleguide:** `STYLEGUIDE.md`, unchanged. The output format reference
+stays `docs/cli-output.md`; Task 14 adds an "Agent sessions" section there.
+
+### Part 3 Global Constraints
+
+- **Agent text mode:** a command run in an agent session (`CLAUDE_CODE_SESSION_ID`
+  set) without `--json` prints the person view of its result, with:
+  - no ANSI escapes, whether or not stdout is a terminal;
+  - no wrapping (width unlimited), since agents gain nothing from it;
+  - Unicode glyphs as for people (`--ascii` still works);
+  - for an object result, a last line `Next: <next>`, where `<next>` is the
+    text `src/cli/next.rs` gives today. The `summary` lines are not printed
+    (the view already says what happened), except lines that tell the agent
+    to tell the user something (`Tell the user …`, e.g. a promotion), which
+    come before `Next:`;
+  - for a list result (`resources`, `log`, …), the list view and no `Next:`.
+- **`--json`** (global flag) prints exactly today's JSON, `summary` and
+  `next` included. Unchanged for people and scripts.
+- **Errors in agent text mode:** one line on **stdout** (Monitor streams
+  stdout only): `error <code>: <message>`, the message ending with the next
+  step as today. Exit codes unchanged. People's errors stay on stderr.
+- **Notices in text:** every notice renders as a block:
+  `[<kind>] <resource>/<unit> · lease <id> | request <id> · until <time> (<in …>)`
+  then the action, indented. Fields that are absent are left out. The
+  claimed grant of an offer follows as the grant view.
+- **`clerk wait` (agent, text):**
+  - one batch: the notice blocks, blank-line separated, then `Next:`;
+  - `--follow`: one notice block per event, flushed per notice, each ending
+    with its own `Next:` line (a Monitor event carries one notice);
+  - timeout, ended, armed, stopped: one sentence, then `Next:`.
+- **Hooks are unchanged:** their output is Claude Code's hook JSON; the
+  context they add is already text.
+- **Token check:** for the standard test grant (a device unit with a
+  three-line usage), the agent text is at most 60 % of the JSON's bytes.
+
+### Part 3 Review Focus
+
+1. **Something the agent needs is missing from the text:** a lease ID, a
+   request ID, a deadline, the usage, a "tell the user" line. Every field
+   the skill tells the agent to use must be in the text. → Tasks 14, 15.
+2. **Output mode leaks:** colour codes in an agent's Bash output when it runs
+   in a pseudo-terminal; JSON for a person at a terminal; text where a
+   script asked for `--json`. → Task 14.
+3. **Monitor sees nothing on error:** an error from `clerk wait --follow`
+   written to stderr never reaches Monitor. → Tasks 14, 15.
+
+### Part 3 BDD skeleton
+
+```
+cli output (agent session, no --json)
+    any object result
+        - prints the person view with no ANSI escapes and no wrapping
+        - ends with "Next: " followed by next.rs's next step
+        - prints no JSON
+        On a "tell the user" summary line (promotion filed)
+            - that line is printed before "Next:"
+    any list result
+        - prints the list view, no "Next:" line
+    with --json
+        - prints today's JSON with summary and next
+    on an error
+        - prints "error <code>: <message>" on stdout, the message ending with the next step
+        - exit code unchanged
+    acquire
+        On a grant
+            - shows lease id, resource/unit, end time, descriptions, settings, usage unescaped
+            - is at most 60 % of the JSON's size for the test grant
+        On queued
+            - shows request id, position and what blocks it; "Next:" names the wait
+cli output (person)
+    - unchanged: human at a terminal, JSON otherwise, --json forces JSON
+
+notice text
+    - "[<kind>] <resource>/<unit> · lease <id> · until <time> (<in …>)", then the action indented
+    - leaves absent fields out
+
+cli wait (agent, text)
+    one batch
+        - one notice block per notice, then the claimed grants, then "Next:"
+    --follow
+        - one block per notice ending with its own "Next:", flushed per notice
+    On timeout | ended | armed | stopped
+        - one sentence, then "Next:"
+    with --json
+        - today's JSON lines
+
+plugin (the clerk skill)
+    - says results are text ending with a "Next:" line; follow it
+    - never says results are JSON
+```
+
+### Task 14: Agent text mode
+
+**Files:**
+- Modify: `src/cli/output.rs` (`Mode::Agent`: person view, no colour, no
+  wrap, `Next:` line; agent errors on stdout), `src/cli/mod.rs` (agent →
+  `Mode::Agent` unless `--json`), `src/cli/render.rs` (width unlimited in
+  agent mode), `src/cli/next.rs` (`tell_user` lines kept for text),
+  `docs/cli-output.md` (an "Agent sessions" section with a mock-up of a
+  grant and a queued result)
+- Test: `tests/cli.rs` (new `mod agent_text`), and the test helper
+  `Env::agent` passes `--json` so today's agent tests keep reading JSON
+
+**Interfaces:**
+- Consumes: `next::annotate`'s note (split into `summary`, `next`).
+- Produces: `Mode::Agent`; `next::note(command, &Value) -> (Vec<String>, String)`
+  made public to the output layer; `next::tell_user(&[String]) -> Vec<String>`.
+
+- [ ] **Step 1:** Write the failing tests for `cli output (agent session, no
+  --json)` and `cli output (person)`, including Review Focus 2 (run under
+  `script` for a pseudo-terminal: no escapes) and the 60 % size check.
+- [ ] **Step 2:** Run them; expected FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run fmt, clippy and the full suite; expected PASS.
+- [ ] **Step 5:** Commit: `feat(cli): agents get text with a Next line; --json for scripts`
+
+### Task 15: Notices and waits in text
+
+**Files:**
+- Modify: `src/cli/lease.rs` (`notice_text` with IDs and deadline),
+  `src/cli/wait.rs` (text batch and `--follow` blocks; `--json` keeps
+  today's lines)
+- Test: `tests/cli.rs` (`mod wait` text cases)
+
+**Interfaces:**
+- Consumes: Task 14's `Mode::Agent`, `granted_text`.
+- Produces: `notice_block(&Value) -> String` (notice JSON → text block).
+
+- [ ] **Step 1:** Write the failing tests for `notice text` and `cli wait
+  (agent, text)`, including Review Focus 3 (an error in `--follow` reaches
+  stdout).
+- [ ] **Step 2:** Run them; expected FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run fmt, clippy and the full suite; expected PASS.
+- [ ] **Step 5:** Commit: `feat(cli): notices and clerk wait in text for agents`
+
+### Task 16: Skill, spec and a live check
+
+**Files:**
+- Modify: `integrations/claude-code/skills/clerk/{SKILL.md,leasing.md}`
+  (results are text ending with `Next:`; `--json` exists for scripts),
+  `tests/plugin.rs` (the skill never says results are JSON), spec §8.1
+  "Results" and §8.4, `docs/claude-code.md` ("What the model sees")
+- Test: `tests/plugin.rs`
+
+- [ ] **Step 1:** Write the failing `tests/plugin.rs` check.
+- [ ] **Step 2:** Update the skill, spec and docs; run the suite; expected
+  PASS.
+- [ ] **Step 3:** Live check, isolated as before: one session leases, queues
+  behind another and is woken by Monitor; read its transcript for any
+  confusion about the text. Record it in spec Appendix C.
+- [ ] **Step 4:** Commit: `docs: agents read text results`
+
 ---
 
 ## Self-review notes
@@ -1180,3 +1343,4 @@ plugin
   minors (SIGKILL escalation in `clerk run`, `clerk wait` and lent leases,
   unit update read-modify-write, splitting `src/cli/lease.rs`).
 - **Part 2 coverage (2026-11-10):** §6 layers 1–4 (Tasks 11, 12), §7.1 (Task 9), §7.3 holder, hosts, liveness, detection (Tasks 10, 12), §8.1 (Task 11), §8.3 one skill (Task 13), §9 (Tasks 9, 13), §11 (Task 8). Deferred: `asyncRewake`, `clerk install claude-code`.
+- **Part 3 coverage (2026-11-10):** §8.1 results as text (Tasks 14, 15), §8.3 skill wording (Task 16), §8.4 `--json` (Task 14). Self-review: no implementation code; one BDD subtree per public behaviour; Review Focus lines each owned by a task.
