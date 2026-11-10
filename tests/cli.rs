@@ -4118,6 +4118,34 @@ mod cli {
         }
 
         #[test]
+        fn clerk_agent_format_human_prints_the_person_view_without_colour() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let dir = env.dir("alpha");
+            let (text, code) = stdout(
+                env.agent_md("sess-1", &dir)
+                    .env("CLERK_AGENT_FORMAT", "human")
+                    .args(["acquire", "board", "--for", "10m"]),
+            );
+            assert_eq!(code, Some(0), "{text}");
+            assert!(text.starts_with("Granted: board/u1"), "{text}");
+            assert!(!text.contains("##") && !text.contains('{') && !text.contains('\u{1b}'));
+        }
+
+        #[test]
+        fn clerk_agent_format_human_waits_in_the_person_view() {
+            let env = Env::new();
+            let dir = env.dir("alpha");
+            let (text, code) = stdout(
+                env.agent_md("sess-1", &dir)
+                    .env("CLERK_AGENT_FORMAT", "human")
+                    .args(["wait", "--timeout", "1s"]),
+            );
+            assert_eq!(code, Some(0), "{text}");
+            assert!(text.contains("clerk wait") && !text.contains('{') && !text.contains("##"));
+        }
+
+        #[test]
         fn clerk_agent_format_json_prints_json() {
             let env = Env::new();
             seed(&env, "board", "k1");

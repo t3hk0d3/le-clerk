@@ -278,10 +278,14 @@ pub fn run() -> ExitCode {
         out = out.for_agent(cli.command.name());
         // Agents read Markdown unless asked for JSON (`--json`, or
         // CLERK_AGENT_FORMAT=json); a terminal keeps the person view.
-        let json_wanted =
-            cli.json || std::env::var("CLERK_AGENT_FORMAT").is_ok_and(|f| f.trim() == "json");
-        if !json_wanted {
-            out = out.markdown();
+        // CLERK_AGENT_FORMAT=human gives the person view (no colour off a
+        // terminal), e.g. to compare formats.
+        let format = std::env::var("CLERK_AGENT_FORMAT").unwrap_or_default();
+        match format.trim() {
+            _ if cli.json => {}
+            "json" => {}
+            "human" => out = Output::new(Mode::Human).for_agent(cli.command.name()),
+            _ => out = out.markdown(),
         }
     }
     if let Command::Daemon { action: None } = cli.command {

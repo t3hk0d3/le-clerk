@@ -296,7 +296,10 @@ mod plugin {
         #[test]
         fn says_results_are_markdown_ending_with_next_and_never_json() {
             let text = skill_file("SKILL.md");
-            assert!(text.contains("Markdown") && text.contains("Next:"), "SKILL.md");
+            assert!(
+                text.contains("Markdown") && text.contains("Next:"),
+                "SKILL.md"
+            );
             for file in SKILL_FILES {
                 let text = skill_file(file);
                 assert!(!text.contains("Every result is JSON"), "{file}");

@@ -45,7 +45,7 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
         anyhow::bail!("not an agent session");
     };
     let client = ctx.client().await?;
-    let md = ctx.out.is_markdown();
+    let md = Format::of(ctx.out);
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let deadline = args.timeout.map(|t| Instant::now() + t);
@@ -204,25 +204,76 @@ fn stopped() -> Value {
 
 /// End the wait with `value`: printed for a one-batch wait; a `--follow`
 /// wait just ends (Monitor reports the end itself).
-fn finish(md: bool, args: &WaitArgs, value: &Value) -> anyhow::Result<()> {
+fn finish(md: Format, args: &WaitArgs, value: &Value) -> anyhow::Result<()> {
     if args.follow {
         return Ok(());
     }
     print(md, value)
 }
 
-/// Print `value` (a wait result) and flush: one JSON line, or Markdown
-/// followed by a blank line.
-fn print(markdown: bool, value: &Value) -> anyhow::Result<()> {
+/// How a wait prints its results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Json,
+    Markdown,
+    /// The person view (`CLERK_AGENT_FORMAT=human`).
+    Human,
+}
+
+impl Format {
+    fn of(out: super::output::Output) -> Self {
+        if out.is_markdown() {
+            Self::Markdown
+        } else if out.mode() == super::output::Mode::Human {
+            Self::Human
+        } else {
+            Self::Json
+        }
+    }
+}
+
+/// Print `value` (a wait result) and flush: one JSON line, Markdown or the
+/// person view, each followed by a blank line.
+fn print(format: Format, value: &Value) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
-    if markdown {
-        let now = leclerk::clock::Clock::now_ms(&leclerk::clock::SystemClock);
-        writeln!(stdout, "{}\n", super::md::wait(value, now))?;
-    } else {
-        writeln!(stdout, "{value}")?;
+    let now = leclerk::clock::Clock::now_ms(&leclerk::clock::SystemClock);
+    match format {
+        Format::Json => writeln!(stdout, "{value}")?,
+        Format::Markdown => writeln!(stdout, "{}\n", super::md::wait(value, now))?,
+        Format::Human => writeln!(stdout, "{}\n", human(value))?,
     }
     stdout.flush()?;
     Ok(())
+}
+
+/// A wait result in the person view: each notice as `[kind] action`, each
+/// claimed lease as a grant, then the summary and the next step.
+fn human(value: &Value) -> String {
+    let list = |k: &str| match value.get(k) {
+        Some(Value::Array(a)) => a.clone(),
+        Some(v) if !v.is_null() => vec![v.clone()],
+        _ => Vec::new(),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for n in list("notices").into_iter().chain(list("notice")) {
+        parts.push(format!(
+            "[{}] {}",
+            n["kind"].as_str().unwrap_or("notice"),
+            n["action"].as_str().unwrap_or_default()
+        ));
+    }
+    for l in list("claimed") {
+        parts.push(super::lease::granted_text(&l));
+    }
+    for line in value["summary"].as_array().into_iter().flatten() {
+        if let Some(t) = line.as_str().filter(|t| !t.is_empty()) {
+            parts.push(t.to_owned());
+        }
+    }
+    if let Some(next) = value["next"].as_str() {
+        parts.push(next.to_owned());
+    }
+    parts.join("\n")
 }
 
 /// Acknowledge `notices` (printed and flushed).
