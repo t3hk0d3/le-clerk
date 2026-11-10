@@ -476,17 +476,32 @@ impl OpenWaits {
         self.arms.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether `key` has a wait armed by another token than `arm` now.
-    fn armed_by_other(&self, key: &str, arm: &str) -> bool {
+    /// Arm `key`'s wait for `arm` until `until`, checking and inserting
+    /// under one lock: `false` when another token holds a live arm, or
+    /// when `first` and a blocking wait is open with no arm of its own.
+    fn try_arm(&self, key: &str, arm: &str, first: bool, until: tokio::time::Instant) -> bool {
         let now = tokio::time::Instant::now();
-        self.arms()
-            .get(key)
-            .is_some_and(|(owner, until)| owner != arm && *until > now)
+        let mut arms = self.arms();
+        let live = arms.get(key).filter(|(_, until)| *until > now);
+        if live.is_some_and(|(owner, _)| owner != arm) {
+            return false;
+        }
+        // Lock order: arms, then counts (nothing takes them the other way).
+        if first && live.is_none() && self.lock().get(key).is_some_and(|n| *n > 0) {
+            return false;
+        }
+        arms.insert(key.to_owned(), (arm.to_owned(), until));
+        true
     }
 
-    /// `arm` holds `key`'s wait until `until`.
-    fn hold(&self, key: &str, arm: &str, until: tokio::time::Instant) {
-        self.arms().insert(key.to_owned(), (arm.to_owned(), until));
+    /// Hold `key`'s wait for `arm` until `until`, only while `arm` still
+    /// owns it: a disarmed or taken-over arm is not re-created.
+    fn extend_if_owner(&self, key: &str, arm: &str, until: tokio::time::Instant) {
+        if let Some((owner, held)) = self.arms().get_mut(key)
+            && owner == arm
+        {
+            *held = until;
+        }
     }
 
     /// `arm` gives `key`'s wait up (another token's arm stays).
@@ -886,13 +901,10 @@ impl EngineHandle {
         }
         let key = holder_key(&holder);
         let timeout = timeout.min(MAX_WAIT);
-        if self.open_waits.armed_by_other(&key, &arm)
-            || (first && self.open_waits(&holder) > 0 && !self.open_waits.armed(&key))
-        {
+        let until = tokio::time::Instant::now() + timeout + ARM_HOLD;
+        if !self.open_waits.try_arm(&key, &arm, first, until) {
             return Ok(AgentWait::Armed);
         }
-        self.open_waits
-            .hold(&key, &arm, tokio::time::Instant::now() + timeout + ARM_HOLD);
         let _open = self.open_wait(&holder);
         let got = self
             .wait_until(&holder, timeout, || async {
@@ -901,7 +913,7 @@ impl EngineHandle {
             })
             .await;
         self.open_waits
-            .hold(&key, &arm, tokio::time::Instant::now() + ARM_HOLD);
+            .extend_if_owner(&key, &arm, tokio::time::Instant::now() + ARM_HOLD);
         Ok(got
             .map_err(|e| self.announced(e))?
             .map_or(AgentWait::Timeout, AgentWait::Notices))

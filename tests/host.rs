@@ -1003,6 +1003,158 @@ mod engine {
         }
     }
 
+    /// CQ-M3, CQ-M4: arming is one atomic step, and a step that ends never
+    /// re-creates an arm it no longer owns.
+    mod arming {
+        use super::*;
+        use leclerk::engine::AgentWait;
+        use leclerk::model::HolderRef;
+
+        fn session(id: &str) -> HolderRef {
+            HolderRef::AgentSession {
+                session_id: id.to_owned(),
+            }
+        }
+
+        mod try_arm {
+            use super::*;
+
+            mod on_two_first_steps_with_different_tokens_at_once {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                async fn exactly_one_arms_the_other_gets_already_armed() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    for round in 0..500 {
+                        let id = "s1".to_owned();
+                        let gate = Arc::new(tokio::sync::Barrier::new(2));
+                        let step = |arm: &'static str| {
+                            let (engine, gate, id, host) =
+                                (engine.clone(), gate.clone(), id.clone(), p.host.clone());
+                            tokio::spawn(async move {
+                                gate.wait().await;
+                                engine
+                                    .agent_wait(
+                                        id,
+                                        host,
+                                        Duration::from_millis(1),
+                                        true,
+                                        arm.into(),
+                                    )
+                                    .await
+                                    .unwrap()
+                            })
+                        };
+                        let (a, b) = (step("arm-a"), step("arm-b"));
+                        let got = [a.await.unwrap(), b.await.unwrap()];
+                        let armed = got.iter().filter(|g| **g == AgentWait::Armed).count();
+                        assert_eq!(armed, 1, "round {round}: {got:?}");
+                        engine.disarm("s1".into(), "arm-a");
+                        engine.disarm("s1".into(), "arm-b");
+                    }
+                }
+            }
+        }
+
+        mod extend_if_owner {
+            use super::*;
+
+            mod on_an_arm_disarmed_during_the_step {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn does_not_re_create_it() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    let step = {
+                        let (engine, host) = (engine.clone(), p.host.clone());
+                        tokio::spawn(async move {
+                            engine
+                                .agent_wait(
+                                    "s1".into(),
+                                    host,
+                                    Duration::from_millis(400),
+                                    true,
+                                    "arm-a".into(),
+                                )
+                                .await
+                                .unwrap()
+                        })
+                    };
+                    eventually("the step is open", async || {
+                        engine.open_waits(&session("s1")) > 0
+                    })
+                    .await;
+                    engine.disarm("s1".into(), "arm-a");
+                    step.await.unwrap();
+                    assert_eq!(engine.open_waits(&session("s1")), 0);
+                }
+            }
+
+            mod on_an_arm_taken_by_another_token {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn leaves_the_other_tokens_arm() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    let a = {
+                        let (engine, host) = (engine.clone(), p.host.clone());
+                        tokio::spawn(async move {
+                            engine
+                                .agent_wait(
+                                    "s1".into(),
+                                    host,
+                                    Duration::from_millis(300),
+                                    true,
+                                    "arm-a".into(),
+                                )
+                                .await
+                                .unwrap()
+                        })
+                    };
+                    eventually("a's step is open", async || {
+                        engine.open_waits(&session("s1")) > 0
+                    })
+                    .await;
+                    engine.disarm("s1".into(), "arm-a");
+                    let b = {
+                        let (engine, host) = (engine.clone(), p.host.clone());
+                        tokio::spawn(async move {
+                            engine
+                                .agent_wait(
+                                    "s1".into(),
+                                    host,
+                                    Duration::from_millis(1500),
+                                    false,
+                                    "arm-b".into(),
+                                )
+                                .await
+                                .unwrap()
+                        })
+                    };
+                    a.await.unwrap();
+                    let again = engine
+                        .agent_wait(
+                            "s1".into(),
+                            p.host.clone(),
+                            Duration::from_millis(50),
+                            false,
+                            "arm-a".into(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(again, AgentWait::Armed);
+                    b.abort();
+                }
+            }
+        }
+    }
+
     /// AR-H1: the daemon, not only the CLI, ties an agent's lease to a
     /// running process.
     mod command_validation {

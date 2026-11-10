@@ -4748,6 +4748,29 @@ mod cli {
             }
         }
 
+        /// CQ-L3: `--timeout` also bounds the time a step spends
+        /// reconnecting to a daemon that does not come back.
+        mod on_timeout_5s_while_the_daemon_is_unreachable {
+            use super::*;
+
+            #[test]
+            fn ends_within_5_s_plus_one_step() {
+                let s = Stopping::new();
+                let mut wait = s.armed_wait(&["--timeout", "5s"]);
+                let started = Instant::now();
+                // Killed, and no daemon can start again: the private copy
+                // is gone, so the waiter's relaunch fails.
+                s.signal_daemon(libc::SIGKILL);
+                fs::remove_file(&s.clerk).unwrap();
+                let status = wait_within(&mut wait, Duration::from_secs(12));
+                assert!(status.is_some(), "the wait outlived --timeout by far");
+                let took = started.elapsed();
+                assert!(took < Duration::from_secs(9), "took {took:?}");
+                let out = stdout_of(&mut wait);
+                assert!(out.contains("--timeout"), "{out}");
+            }
+        }
+
         mod on_an_agent_wait_started_after_a_stop {
             use super::*;
 

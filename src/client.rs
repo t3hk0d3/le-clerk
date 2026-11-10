@@ -809,7 +809,9 @@ impl Client {
 
     /// One step of agent session `session`'s notice wait from `host`, up to
     /// `secs` seconds (the daemon caps it at 60): the daemon's
-    /// `{"status": ...}` answer (see `GET /v1/agent/wait`).
+    /// `{"status": ...}` answer (see `GET /v1/agent/wait`). A step still
+    /// unanswered at `until` (also while riding out a restart) gives up
+    /// with `{"status": "unreached"}`: the caller decides what next.
     ///
     /// # Errors
     /// As [`Client::call`].
@@ -820,9 +822,15 @@ impl Client {
         secs: u64,
         first: bool,
         arm: &str,
+        until: Option<tokio::time::Instant>,
     ) -> Result<Value, ApiError> {
-        self.riding_restarts(|| self.agent_wait_once(session, host, secs, first, arm))
+        let step = self.riding_restarts(|| self.agent_wait_once(session, host, secs, first, arm));
+        let Some(until) = until else {
+            return step.await;
+        };
+        tokio::time::timeout_at(until, step)
             .await
+            .unwrap_or_else(|_| Ok(json!({ "status": "unreached" })))
     }
 
     /// One [`Client::agent_wait`] request.

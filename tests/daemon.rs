@@ -219,7 +219,7 @@ async fn parked_agent_wait(
     let poller = Client::connect(&h.paths).await.unwrap();
     let wait = tokio::spawn(async move {
         poller
-            .agent_wait("parked", &host, 60, true, "test-arm")
+            .agent_wait("parked", &host, 60, true, "test-arm", None)
             .await
     });
     let deadline = Instant::now() + PATIENCE;

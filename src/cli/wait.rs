@@ -35,6 +35,10 @@ const ARM_GRACE: Duration = Duration::from_secs(6);
 /// One long-poll step; also how soon a dead host is noticed.
 const STEP: Duration = Duration::from_secs(2);
 
+/// How long a step may take, reconnecting included, before the host and
+/// `--timeout` are checked again: the long poll, its slack and a margin.
+const STEP_BOUND: Duration = Duration::from_secs(8);
+
 /// The next step after any wait that ended without leaving one armed.
 pub const ARM_AGAIN: &str = "While you are queued or hold an interruptible lease, keep one \
      `clerk wait` running with the Bash tool's run_in_background (timeout 7200000); it costs \
@@ -83,25 +87,32 @@ async fn steps(
         if !host_alive(&host) {
             return finish(
                 md,
-                args,
                 &ended("Claude Code process running this session has exited"),
             );
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            return finish(md, args, &empty(&["No notices arrived before --timeout."]));
+            return finish(md, &empty(&["No notices arrived before --timeout."]));
         }
+        // A step, reconnecting included, ends by --timeout, and soon enough
+        // to notice the host gone.
+        let bound = deadline.map_or(Instant::now() + STEP_BOUND, |d| {
+            d.min(Instant::now() + STEP_BOUND)
+        });
         let step = tokio::select! {
-            got = client.agent_wait(session_id, &host, STEP.as_secs(), first, arm) => match got {
+            got = client.agent_wait(session_id, &host, STEP.as_secs(), first, arm, Some(bound)) => match got {
                 Ok(step) => step,
                 Err(e) => return daemon_gone(md, args, e),
             },
-            _ = term.recv() => return finish(md, args, &stopped()),
-            _ = int.recv() => return finish(md, args, &stopped()),
+            _ = term.recv() => return finish(md, &stopped()),
+            _ = int.recv() => return finish(md, &stopped()),
         };
         let was_first = first;
         first = false;
         match step["status"].as_str() {
             Some("timeout") => {}
+            // Not answered in time (the daemon is away): the checks above
+            // run again, and the arm is still to be taken.
+            Some("unreached") => first = was_first,
             // Another wait holds the arm. It may be a wait that was killed
             // outright and could not give it up: wait that hold out once
             // before giving way.
@@ -109,23 +120,10 @@ async fn steps(
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 first = true;
             }
-            Some("armed") => {
-                return print(
-                    md,
-                    &json!({
-                        "notices": [],
-                        "claimed": [],
-                        "armed": true,
-                        "summary": ["A clerk wait is already armed for this session; this one \
-                                     took nothing."],
-                        "next": "Nothing: the armed wait reports the notices.",
-                    }),
-                );
-            }
+            Some("armed") => return already_armed(md),
             Some("ended") => {
                 return finish(
                     md,
-                    args,
                     &ended("this Claude Code process runs another session now"),
                 );
             }
@@ -173,6 +171,20 @@ async fn steps(
             other => anyhow::bail!("the daemon answered the wait with {other:?}"),
         }
     }
+}
+
+/// This wait found another one armed and took nothing.
+fn already_armed(md: Format) -> anyhow::Result<()> {
+    print(
+        md,
+        &json!({
+            "notices": [],
+            "claimed": [],
+            "armed": true,
+            "summary": ["A clerk wait is already armed for this session; this one took nothing."],
+            "next": "Nothing: the armed wait reports the notices.",
+        }),
+    )
 }
 
 /// The notices of `all` that need the agent; the others are acknowledged
@@ -321,7 +333,6 @@ fn daemon_gone(md: Format, args: &WaitArgs, e: ApiError) -> anyhow::Result<()> {
         "daemon_stopping" => daemon_stopped(md, args),
         "protocol_mismatch" => finish(
             md,
-            args,
             &gone(
                 "the clerk was upgraded to a version this wait cannot talk to",
                 "Start the wait again (the new `clerk` on PATH speaks the new protocol).",
@@ -336,7 +347,6 @@ fn daemon_gone(md: Format, args: &WaitArgs, e: ApiError) -> anyhow::Result<()> {
 fn daemon_stopped(md: Format, args: &WaitArgs) -> anyhow::Result<()> {
     finish(
         md,
-        args,
         &gone(
             "the clerk daemon was stopped",
             "Tell the user the clerk daemon is stopped; arm a wait again once it runs.",
@@ -363,11 +373,9 @@ fn stopped() -> Value {
     empty(&["The wait was stopped (time limit or signal) before any notice arrived."])
 }
 
-/// End the wait with `value`: printed for a one-batch wait; a `--follow`
-/// wait just ends (Monitor reports the end itself).
-fn finish(md: Format, _args: &WaitArgs, value: &Value) -> anyhow::Result<()> {
-    // A `--follow` wait says why it ended too: Monitor shows the line, and
-    // the agent knows to arm again (or not).
+/// End the wait with `value`: printed, for a `--follow` wait too (Monitor
+/// shows the line, and the agent knows to arm again or not).
+fn finish(md: Format, value: &Value) -> anyhow::Result<()> {
     print(md, value)
 }
 
