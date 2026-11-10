@@ -43,9 +43,10 @@ use super::{Ctx, UsageError};
 
 /// Seconds one notice long-poll waits.
 pub const POLL_SECS: u64 = 30;
-/// Seconds one long-poll for an offer waits; also how soon a wait notices
-/// that another consumer of its notice stream settled its request.
-const OFFER_POLL_SECS: u64 = 5;
+/// Seconds one long-poll waits for a waiter that also reads the state of
+/// what it waits on: how soon it notices that another consumer of its
+/// notice stream read the news first.
+pub const STATE_POLL_SECS: u64 = 5;
 /// The notices about its lease `clerk run` acts on in an agent session: the
 /// session's other notices are for its `clerk wait`.
 const RUN_ACTS_ON: [notices::NoticeKind; 3] = [
@@ -580,7 +581,7 @@ pub async fn ack_then_wait(
 }
 
 /// Where `request` stands, whoever moved it there.
-enum RequestState {
+pub(super) enum RequestState {
     Waiting,
     Offered(String),
     Held(Value),
@@ -589,7 +590,7 @@ enum RequestState {
 
 /// Where `request` stands now. `Waiting` when that cannot be told: the
 /// notice poll reports a daemon in trouble.
-async fn request_state(client: &Client, caller: &Caller, request: &str) -> RequestState {
+pub(super) async fn request_state(client: &Client, caller: &Caller, request: &str) -> RequestState {
     let mine = match client.call("list_my_leases", caller, json!({})).await {
         Ok(mine) => mine,
         Err(e) => {
@@ -615,6 +616,16 @@ async fn request_state(client: &Client, caller: &Caller, request: &str) -> Reque
     }
 }
 
+/// The error for a `request` found gone, its drop read by another consumer
+/// of the notices (exit 4).
+pub(super) fn request_gone(request: &str) -> ApiError {
+    ApiError {
+        code: "queue_dropped".to_owned(),
+        message: format!("Request {request} is no longer queued and holds no lease."),
+        details: None,
+    }
+}
+
 /// Wait for `request`'s offer and claim it; returns the held lease. Only
 /// notices about the request are read (the holder's others stay pending);
 /// those that are not the offer are shown on stderr, and each is
@@ -637,7 +648,7 @@ async fn await_offer(
     let mut handled = Vec::new();
     loop {
         let waited = tokio::select! {
-            batch = ack_then_wait(client, caller, &only_ours, OFFER_POLL_SECS, std::mem::take(&mut handled)) => batch,
+            batch = ack_then_wait(client, caller, &only_ours, STATE_POLL_SECS, std::mem::take(&mut handled)) => batch,
             _ = interrupt.recv() => {
                 cancel(client, caller, request).await?;
                 return Err(Exit(EXIT_INTERRUPTED).into());
@@ -698,12 +709,7 @@ async fn await_offer(
             RequestState::Held(view) => return Ok(view),
             RequestState::Offered(lease) => return Ok(claim(client, caller, &lease).await?),
             RequestState::Gone => {
-                return Err(ApiError {
-                    code: "queue_dropped".to_owned(),
-                    message: format!("Request {request} is no longer queued and holds no lease."),
-                    details: None,
-                }
-                .into());
+                return Err(request_gone(request).into());
             }
         }
     }
@@ -757,6 +763,56 @@ pub fn filter(leases: &[&str], requests: &[&str]) -> NoticeFilter {
     }
 }
 
+/// What `clerk run` watches to learn that its lease is over.
+struct LeaseWatch<'a> {
+    client: &'a Client,
+    caller: &'a Caller,
+    lease: &'a str,
+    filter: NoticeFilter,
+    /// An agent session's `clerk wait` shares the notices, and may read and
+    /// acknowledge the end of the lease first: the lease itself is read too.
+    shared: bool,
+}
+
+impl<'a> LeaseWatch<'a> {
+    fn new(client: &'a Client, caller: &'a Caller, lease: &'a str) -> Self {
+        let mut filter = filter(&[lease], &[]);
+        let shared = caller::is_agent(caller);
+        if shared {
+            filter.kinds = Some(RUN_ACTS_ON.to_vec());
+        }
+        Self {
+            client,
+            caller,
+            lease,
+            filter,
+            shared,
+        }
+    }
+
+    /// Acknowledge `handled`, then the next notices and, in a shared stream
+    /// with no `stop_at` known yet, when the lease itself says to stop. One
+    /// future, so a stalled daemon cannot hold up the caller's `select!`.
+    async fn next(
+        &self,
+        handled: Vec<NoticeId>,
+        stop_at: Option<Instant>,
+    ) -> (Result<Vec<NoticeView>, ApiError>, Option<Instant>) {
+        let secs = if self.shared {
+            STATE_POLL_SECS
+        } else {
+            POLL_SECS
+        };
+        let batch = ack_then_wait(self.client, self.caller, &self.filter, secs, handled).await;
+        let over = if self.shared && stop_at.is_none() && batch.is_ok() {
+            lease_stop_time(self.client, self.caller, self.lease).await
+        } else {
+            None
+        };
+        (batch, over)
+    }
+}
+
 /// Run `command` while holding `lease`, then give the lease back: cleanup
 /// confirmed on exit 0, else ended at once with the unit dirty. SIGTERM
 /// goes on to the command, and SIGINT too unless the terminal already
@@ -805,12 +861,9 @@ async fn supervise(
     };
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
-    let mut only_ours = filter(&[&lease_id], &[]);
-    if caller::is_agent(caller) {
-        only_ours.kinds = Some(RUN_ACTS_ON.to_vec());
-    }
-    let wait = |handled| ack_then_wait(client, caller, &only_ours, POLL_SECS, handled);
-    let mut notices = Box::pin(wait(Vec::new()));
+    let watch = LeaseWatch::new(client, caller, &lease_id);
+    let wait = |handled, stop_at| watch.next(handled, stop_at);
+    let mut notices = Box::pin(wait(Vec::new(), None));
     // The last batch handled: the poll in flight acknowledges it first, but
     // the command may end before that poll gets to.
     let mut unacknowledged = Vec::new();
@@ -827,7 +880,7 @@ async fn supervise(
         };
         tokio::select! {
             status = child.wait() => break status?,
-            batch = &mut notices, if polling => {
+            (batch, over) = &mut notices, if polling => {
                 match batch {
                     Ok(batch) => {
                         for n in &batch {
@@ -836,8 +889,11 @@ async fn supervise(
                                 stop_at = Some(stop_at.map_or(at, |s| s.min(at)));
                             }
                         }
+                        if let Some(at) = over {
+                            stop_at = Some(stop_at.map_or(at, |s| s.min(at)));
+                        }
                         unacknowledged = batch.iter().map(|n| n.id.clone()).collect();
-                        notices = Box::pin(wait(unacknowledged.clone()));
+                        notices = Box::pin(wait(unacknowledged.clone(), stop_at));
                     }
                     Err(e) if e.code == "daemon_stopping" => {
                         note(|| {
@@ -850,7 +906,7 @@ async fn supervise(
                     Err(e) => {
                         tracing::warn!(error = %e, "cannot read notices; retrying");
                         tokio::time::sleep(POLL_RETRY).await;
-                        notices = Box::pin(wait(Vec::new()));
+                        notices = Box::pin(wait(Vec::new(), stop_at));
                     }
                 }
             }
@@ -926,14 +982,37 @@ fn terminal_delivers_sigint() -> bool {
 fn stop_time(n: &NoticeView) -> Option<Instant> {
     match n.kind {
         NoticeKind::Overridden | NoticeKind::CleanupWindowStarted | NoticeKind::LeaseEnded => {
-            let left = n
-                .deadline
-                .map_or(0, |d| d.saturating_sub(SystemClock.now_ms()).max(0));
-            let left = Duration::from_millis(u64::try_from(left).unwrap_or(0));
-            Some(Instant::now() + left)
+            Some(instant_of(n.deadline))
         }
         _ => None,
     }
+}
+
+/// When the running command must stop, going by `lease` itself: at the end
+/// of its cleanup window, or now if it ended. `None` while it lasts, or when
+/// that cannot be told (the notice poll reports a daemon in trouble).
+async fn lease_stop_time(client: &Client, caller: &Caller, lease: &str) -> Option<Instant> {
+    let view = match client
+        .call("get_lease", caller, json!({ "lease_id": lease }))
+        .await
+    {
+        Ok(view) => view,
+        Err(e) => {
+            tracing::debug!(error = %e, "cannot read the lease's state");
+            return None;
+        }
+    };
+    match view["state"].as_str() {
+        Some("ended") => Some(Instant::now()),
+        Some("cleaning") => Some(instant_of(view["cleanup_deadline"].as_i64())),
+        _ => None,
+    }
+}
+
+/// The instant of `deadline` (unix ms); now when there is none or it passed.
+fn instant_of(deadline: Option<i64>) -> Instant {
+    let left = deadline.map_or(0, |d| d.saturating_sub(SystemClock.now_ms()).max(0));
+    Instant::now() + Duration::from_millis(u64::try_from(left).unwrap_or(0))
 }
 
 fn exit_code(status: ExitStatus) -> u8 {

@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use ulid::Ulid;
 
 use super::caller;
-use super::lease;
+use super::lease::{self, RequestState};
 use super::output::{EXIT_INTERRUPTED, Exit, Mode};
 use super::render::{self, Style};
 
@@ -134,7 +134,9 @@ pub enum Phase {
 /// what `phase` names, owning what it needs so it can outlive a loop
 /// iteration. The holder's other notices stay pending: an agent session
 /// reads them itself, so for a held lease it is asked only for the lease's
-/// end, the one notice the view acts on.
+/// end, the one notice the view acts on. While queued, the request itself
+/// is read too: another consumer of the notices may have read its offer or
+/// its drop first.
 fn poll(client: &Client, caller: &Caller, phase: &Phase, handled: Vec<NoticeId>) -> PollFuture {
     let mut filter = match phase {
         Phase::Queued { request } => lease::filter(&[], &[request]),
@@ -144,13 +146,31 @@ fn poll(client: &Client, caller: &Caller, phase: &Phase, handled: Vec<NoticeId>)
     if matches!(phase, Phase::Held { .. }) && caller::is_agent(caller) {
         filter.kinds = Some(vec![notices::NoticeKind::LeaseEnded]);
     }
+    let queued = match phase {
+        Phase::Queued { request } => Some(request.clone()),
+        _ => None,
+    };
+    let secs = if queued.is_some() {
+        lease::STATE_POLL_SECS
+    } else {
+        lease::POLL_SECS
+    };
     let (client, caller) = (client.clone(), caller.clone());
     Box::pin(async move {
-        lease::ack_then_wait(&client, &caller, &filter, lease::POLL_SECS, handled).await
+        let batch = lease::ack_then_wait(&client, &caller, &filter, secs, handled).await;
+        let state = match &queued {
+            Some(request) if batch.is_ok() => {
+                Some(lease::request_state(&client, &caller, request).await)
+            }
+            _ => None,
+        };
+        (batch, state)
     })
 }
 
-type PollFuture = Pin<Box<dyn Future<Output = Result<Vec<NoticeView>, ApiError>>>>;
+/// A poll's answer and, while queued, where the request stands.
+type PollOutcome = (Result<Vec<NoticeView>, ApiError>, Option<RequestState>);
+type PollFuture = Pin<Box<dyn Future<Output = PollOutcome>>>;
 
 /// Bytes typed on stdin, read by a thread of their own (the read blocks;
 /// the thread ends with the process).
@@ -253,7 +273,7 @@ impl View<'_> {
                     Some(_) => {}
                     None => typing = false,
                 },
-                batch = &mut notices => {
+                (batch, state) = &mut notices => {
                     let batch = match batch {
                         Ok(batch) => {
                             if failures > 0 {
@@ -291,6 +311,15 @@ impl View<'_> {
                         if outcome.is_ok() || n.kind == NoticeKind::QueueDropped {
                             handled.push(n.id.clone());
                         }
+                        if !matches!(outcome, Ok(false)) {
+                            lease::acknowledge(self.client, self.caller, &handled).await;
+                            return outcome.map(drop);
+                        }
+                    }
+                    // Still queued after the batch: the request itself has
+                    // the last word.
+                    if let (Phase::Queued { request }, Some(state)) = (self.phase(), state) {
+                        let outcome = self.on_state(request, state, &mut keys).await;
                         if !matches!(outcome, Ok(false)) {
                             lease::acknowledge(self.client, self.caller, &handled).await;
                             return outcome.map(drop);
@@ -407,6 +436,39 @@ impl View<'_> {
             _ => {
                 self.screen.notice(n);
                 Ok(false)
+            }
+        }
+    }
+
+    /// Act on where the queued `request` stands, when another consumer of
+    /// the notices got there first; true when the view is done.
+    async fn on_state(
+        &self,
+        request: String,
+        state: RequestState,
+        keys: &mut mpsc::UnboundedReceiver<u8>,
+    ) -> anyhow::Result<bool> {
+        match state {
+            RequestState::Waiting => Ok(false),
+            RequestState::Offered(lease) => {
+                self.set(Phase::Offered {
+                    request,
+                    lease: lease.clone(),
+                });
+                self.claim(&lease, keys).await
+            }
+            RequestState::Held(view) => {
+                self.set(Phase::Held {
+                    lease: view["lease_id"].as_str().unwrap_or_default().to_owned(),
+                });
+                self.screen.say(&view, &lease::granted_text(&view));
+                self.screen.hint_held();
+                Ok(false)
+            }
+            RequestState::Gone => {
+                let gone = lease::request_gone(&request);
+                self.screen.say(&json!({"dropped": request}), &gone.message);
+                Err(gone.into())
             }
         }
     }

@@ -259,6 +259,21 @@ impl Daemon {
         request.expect("the session's request is queued")
     }
 
+    /// The armed `clerk wait` reads the session's notices and acknowledges
+    /// them all.
+    async fn armed_wait_reads_all(&self) {
+        let ids = self
+            .armed_wait_step()
+            .await
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        self.engine
+            .ack_notices(session_holder(), ids)
+            .await
+            .unwrap();
+    }
+
     /// One step of the armed `clerk wait`: returns the session's notices.
     async fn armed_wait_step(&self) -> Vec<Notice> {
         let answer = self
@@ -354,6 +369,46 @@ mod clerk_run {
             end_the_lease(&daemon).await;
             let out = finished(child).await;
             assert_eq!(daemon.lost.load(Ordering::SeqCst), 1);
+            assert_eq!(out.status.code(), Some(128 + 15), "{out:?}");
+        }
+    }
+
+    mod in_an_agent_session_on_the_armed_wait_reading_the_end_first {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn still_stops_the_child() {
+            let daemon = Daemon::new().await;
+            daemon.set_mode(HIDE);
+            let child = daemon.spawn(RUN, true);
+            let (lease, _) = daemon.occupied().await;
+            daemon
+                .rpc("admin_release", &user("admin"), json!({"lease_id": lease}))
+                .await;
+            daemon.armed_wait_reads_all().await;
+            let out = finished(child).await;
+            assert_eq!(out.status.code(), Some(128 + 15), "{out:?}");
+        }
+    }
+
+    mod in_an_agent_session_on_the_armed_wait_reading_the_cleanup_window_first {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stops_the_child_at_the_windows_deadline() {
+            let daemon = Daemon::with_config(Config {
+                cleanup_window: 1,
+                ..Config::default()
+            })
+            .await;
+            daemon.set_mode(HIDE);
+            let child = daemon.spawn(RUN, true);
+            let (lease, _) = daemon.occupied().await;
+            daemon
+                .rpc("release", &agent(), json!({"lease_id": lease}))
+                .await;
+            daemon.armed_wait_reads_all().await;
+            let out = finished(child).await;
             assert_eq!(out.status.code(), Some(128 + 15), "{out:?}");
         }
     }
@@ -538,6 +593,85 @@ mod clerk_wait_for_the_user {
 
 mod live_view {
     use super::*;
+
+    /// An agent session's live `clerk acquire`, whose notices are hidden
+    /// from it, queued behind `other`'s lease; returns the lease's id.
+    async fn queued_view(daemon: &Daemon) -> (common::Tty, String) {
+        let other = daemon.hold("other").await;
+        daemon.set_mode(HIDE);
+        let clerk = cargo_bin("clerk");
+        let pid = std::process::id().to_string();
+        let tty = common::Tty::spawn_in(
+            daemon.env.home(),
+            "\"$CLERK\" acquire board --for 10m; echo EXIT=$?",
+            &[
+                ("CLERK", clerk.to_str().unwrap()),
+                (SESSION_VAR, SESSION),
+                (PID_VAR, &pid),
+            ],
+        );
+        daemon.queued_request().await;
+        (tty, other)
+    }
+
+    mod on_the_armed_wait_claiming_the_offer_first {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn moves_on_to_the_held_lease() {
+            let daemon = Daemon::new().await;
+            let (tty, other) = queued_view(&daemon).await;
+            daemon.give_back("other", &other).await;
+            let notices = daemon.armed_wait_step().await;
+            let offer = notices
+                .iter()
+                .find(|n| n.kind == NoticeKind::Offered)
+                .expect("the offer");
+            daemon
+                .rpc("claim", &agent(), json!({"lease_id": offer.lease_id}))
+                .await;
+            let ids = notices.iter().map(|n| n.id.clone()).collect();
+            daemon
+                .engine
+                .ack_notices(session_holder(), ids)
+                .await
+                .unwrap();
+            tty.expect("Ctrl+C releases");
+        }
+    }
+
+    mod on_the_armed_wait_reading_the_offer_without_claiming_it {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn claims_it() {
+            let daemon = Daemon::new().await;
+            let (tty, other) = queued_view(&daemon).await;
+            daemon.give_back("other", &other).await;
+            daemon.armed_wait_reads_all().await;
+            tty.expect("Ctrl+C releases");
+        }
+    }
+
+    mod on_the_armed_wait_reading_the_drop_first {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn ends_as_dropped() {
+            let daemon = Daemon::new().await;
+            let (tty, _) = queued_view(&daemon).await;
+            let request = daemon.queued_request().await;
+            daemon
+                .rpc(
+                    "admin_dequeue",
+                    &user("admin"),
+                    json!({"request_id": request}),
+                )
+                .await;
+            daemon.armed_wait_reads_all().await;
+            tty.expect("EXIT=4");
+        }
+    }
 
     mod in_an_agent_session_on_a_notice_it_does_not_act_on {
         use super::*;
