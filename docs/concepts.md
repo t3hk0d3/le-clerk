@@ -96,8 +96,14 @@ logged.
    claims it automatically. Unclaimed offers go to the next in line.
 3. **Held.** The lease runs for the declared duration. An **expiry warning**
    arrives before the end (20 % of the duration, at most 5 minutes);
-   `clerk extend` moves the end. Expiry is hard: a lease ends on time even if
-   nobody waits, and the unit is marked dirty.
+   `clerk extend` moves the end. At the end, what happens depends on the
+   holder and the queue:
+   - someone is queued for the unit, or the holder is a person or script:
+     the lease expires on time, and a cleanup window opens;
+   - an agent's lease with nobody queued goes **overdue** and stays held.
+     When someone later queues for the unit, the holder is told and gets the
+     cleanup window; if it doesn't confirm, the unit is handed over marked
+     **abandoned**, and the new owner is told.
 4. **Hand-back.** `clerk release` gives the unit back with its cleanup
    confirmed. `release --cleanup` opens a **cleanup window** (2 minutes)
    ended by `clerk confirm <lease> clean`. A hand-over without

@@ -269,15 +269,15 @@ impl Hook {
         let brief = session
             .call("session_brief", json!({}), self.left())
             .await?;
-        let leases = count(&brief, "leases")?;
+        let interruptible = count(&brief, "interruptible")?;
         let requests = count(&brief, "requests")?;
         let open_waits = count(&brief, "open_waits")?;
-        if leases + requests == 0 || open_waits > 0 {
+        if interruptible + requests == 0 || open_waits > 0 {
             return Ok(None);
         }
         Ok(Some(json!({
             "decision": "block",
-            "reason": stop_reason(leases, requests),
+            "reason": stop_reason(interruptible, requests),
         })))
     }
 
@@ -359,24 +359,22 @@ fn count(brief: &Value, field: &str) -> anyhow::Result<u64> {
 fn stop_reason(leases: u64, requests: u64) -> String {
     let what = match (leases, requests) {
         (0, r) => plural(r, "queued request"),
-        (l, 0) => plural(l, "live lease"),
+        (l, 0) => plural(l, "interruptible lease"),
         (l, r) => format!(
             "{} and {}",
-            plural(l, "live lease"),
+            plural(l, "interruptible lease"),
             plural(r, "queued request")
         ),
     };
     format!(
-        "Le Clerk: this session has {what} but no clerk wait is armed, so offers, yield \
-         requests and expiry warnings would go unanswered. {WAIT_HOW} Release leases you no \
-         longer need."
+        "Le Clerk: this session has {what} but no clerk wait is armed, so offers and yield \
+         requests would go unanswered. {WAIT_HOW}"
     )
 }
 
 /// How an agent keeps a wait armed.
-const WAIT_HOW: &str = "Arm a wait: the Monitor tool on `clerk wait --follow` (timeout_ms \
-     1800000, re-armed when it expires), or `clerk wait` in the background (read its output \
-     when it completes, then start it again).";
+const WAIT_HOW: &str = "Run `clerk wait` with the Bash tool's run_in_background (timeout \
+     7200000); it costs nothing while idle. When it completes, read its output and act on it.";
 
 /// The `SessionStart` brief for a session that holds `mine` (the
 /// `list_my_leases` answer), with a wait `armed` or not, after its process's
@@ -418,9 +416,13 @@ fn start_brief(mine: &Value, armed: bool, released: &[Value]) -> Option<String> 
     if leases.is_empty() && requests.is_empty() {
         return Some(text.trim_end().to_owned());
     }
+    let needs_wait = !requests.is_empty()
+        || leases
+            .iter()
+            .any(|l| l["interruptible"] == Value::Bool(true));
     if armed {
         text.push_str("- A clerk wait is armed; act on its notices as they arrive.");
-    } else {
+    } else if needs_wait {
         let _ = write!(text, "- No clerk wait is armed. {WAIT_HOW}");
     }
     Some(text)
@@ -547,8 +549,8 @@ mod tests {
     #[test]
     fn stop_reason_names_the_wait_and_what_is_held() {
         let reason = stop_reason(1, 2);
-        assert!(reason.contains("1 live lease and 2 queued requests"));
-        assert!(reason.contains("clerk wait --follow"));
+        assert!(reason.contains("1 interruptible lease and 2 queued requests"));
+        assert!(reason.contains("run_in_background"));
     }
 
     #[test]

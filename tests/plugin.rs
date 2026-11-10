@@ -280,16 +280,19 @@ mod plugin {
             }
         }
 
+        /// A Monitor watch expires every 30 minutes and wakes the agent for
+        /// nothing; a background wait costs nothing while idle.
         #[test]
-        fn teaches_monitor_on_clerk_wait_follow_with_the_background_fallback() {
+        fn teaches_a_background_wait_only_when_queued_or_interruptible() {
             let text = skill_file("SKILL.md");
-            for needle in [
-                "Monitor",
-                "clerk wait --follow",
-                "1800000",
-                "run_in_background",
-            ] {
+            for needle in ["run_in_background", "clerk wait", "queued", "interruptible"] {
                 assert!(text.contains(needle), "SKILL.md mentions {needle}");
+            }
+            for file in SKILL_FILES {
+                assert!(
+                    !skill_file(file).contains("Monitor"),
+                    "{file} recommends Monitor"
+                );
             }
         }
 

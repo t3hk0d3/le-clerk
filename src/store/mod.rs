@@ -70,6 +70,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0014_notice_hook_shown.sql")),
         M::up(include_str!("migrations/0015_agent_hosts.sql")),
         M::up(include_str!("migrations/0016_request_skip_checks.sql")),
+        M::up(include_str!("migrations/0017_lease_overdue.sql")),
     ])
 }
 

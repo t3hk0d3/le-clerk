@@ -4046,6 +4046,56 @@ mod cli {
                 assert!(!text.contains('{'), "{text}");
             }
 
+            /// Notices that need no action must not end a wait: each wake
+            /// re-reads the agent's whole conversation.
+            #[test]
+            fn a_cleanup_notice_of_a_finished_lease_does_not_end_the_wait() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                seed(&env, "board", "k1");
+                let lease = lease_of(&json_of(
+                    env.agent("sess-1", &dir)
+                        .args(["acquire", "board", "--for", "10m"]),
+                ));
+                json_of(env.agent("sess-1", &dir).args(["release", &lease]));
+                let text = text_of(
+                    env.agent_md("sess-1", &dir)
+                        .args(["wait", "--timeout", "1s"]),
+                );
+                assert!(!text.contains("## Notice"), "{text}");
+            }
+
+            #[test]
+            fn a_position_change_alone_does_not_end_the_wait() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                seed(&env, "board", "k1");
+                hold(&env, "x");
+                let ahead = env
+                    .rpc(
+                        "acquire",
+                        &user("ahead"),
+                        json!({"target": {"resource": "board"}, "duration_ms": 600_000,
+                               "purpose": "first in line"}),
+                    )
+                    .unwrap();
+                env.agent("sess-1", &dir)
+                    .args(["acquire", "board", "--for", "10m"])
+                    .assert()
+                    .code(6);
+                env.rpc(
+                    "cancel",
+                    &user("ahead"),
+                    json!({"request_id": ahead["request_id"]}),
+                )
+                .unwrap();
+                let text = text_of(
+                    env.agent_md("sess-1", &dir)
+                        .args(["wait", "--timeout", "1s"]),
+                );
+                assert!(!text.contains("## Notice"), "{text}");
+            }
+
             #[test]
             fn a_timeout_is_one_sentence_and_next() {
                 let env = Env::new();
@@ -4173,10 +4223,7 @@ mod cli {
                 assert_eq!(out.status.code(), Some(6), "{out:?}");
                 let body: Value = serde_json::from_slice(&out.stdout).unwrap();
                 assert!(
-                    body["next"]
-                        .as_str()
-                        .unwrap()
-                        .contains("clerk wait --follow"),
+                    body["next"].as_str().unwrap().contains("run_in_background"),
                     "{body}"
                 );
             }
@@ -4996,7 +5043,7 @@ mod cli {
             assert_eq!(code, Some(6), "{text}");
             assert!(text.starts_with("## Queued: board\n"), "{text}");
             assert!(text.contains("- request_id: req_"), "{text}");
-            assert!(text.contains("clerk wait --follow"), "{text}");
+            assert!(text.contains("run_in_background"), "{text}");
         }
 
         #[test]

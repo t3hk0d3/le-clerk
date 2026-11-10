@@ -424,7 +424,7 @@ mod cli {
                 use super::*;
 
                 #[test]
-                fn the_brief_lists_the_lease_and_the_wait_command() {
+                fn the_brief_lists_the_lease_and_asks_for_no_wait() {
                     let env = Env::new();
                     seed(&env);
                     let old = Host::spawn();
@@ -433,7 +433,10 @@ mod cli {
                     let new = Host::spawn();
                     let context = context_of(&start(&env, "s1", "resume", &new));
                     assert!(context.contains(&lease), "{context}");
-                    assert!(context.contains("clerk wait --follow"), "{context}");
+                    assert!(
+                        !context.contains("No clerk wait"),
+                        "a plain lease needs none: {context}"
+                    );
                     assert!(context.contains("clerk skill"), "{context}");
                 }
 
@@ -480,19 +483,31 @@ mod cli {
             }
 
             #[test]
-            fn on_holding_with_no_wait_blocks_naming_the_wait() {
+            fn on_a_plain_lease_with_no_wait_prints_nothing() {
                 let env = Env::new();
                 seed(&env);
                 let host = Host::spawn();
                 holds(&env, "s1", &host);
+                assert_eq!(stop(&env, "s1", &host, false).stdout, b"");
+            }
+
+            #[test]
+            fn on_an_interruptible_lease_with_no_wait_blocks_naming_the_wait() {
+                let env = Env::new();
+                seed(&env);
+                let host = Host::spawn();
+                let (body, code) = agent(
+                    &env,
+                    "s1",
+                    &host,
+                    &["acquire", "board", "--for", "10m", "--interruptible"],
+                );
+                assert_eq!(code, Some(0), "{body}");
                 let out = stop(&env, "s1", &host, false);
                 let v: Value = serde_json::from_slice(&out.stdout).unwrap();
                 assert_eq!(v["decision"], "block", "{v}");
                 assert!(
-                    v["reason"]
-                        .as_str()
-                        .unwrap()
-                        .contains("clerk wait --follow"),
+                    v["reason"].as_str().unwrap().contains("run_in_background"),
                     "{v}"
                 );
             }

@@ -108,7 +108,7 @@ Code's limit).
 | Event | What it does |
 |-------|--------------|
 | `SessionStart` | Reports the Claude Code process now running the session (which leaves the process's previous session, e.g. on `/clear`). For `clear`, `compact` and `resume`, adds a brief to the context: what the session holds or waits for, whether a wait is armed, and what the previous conversation released. |
-| `Stop` | When the session holds a lease or a queued request but no `clerk wait` is armed, blocks the end of the turn once with a reminder to arm one. |
+| `Stop` | When the session has a queued request or an interruptible lease but no `clerk wait` is armed, blocks the end of the turn once with a reminder to start one. |
 | `PreToolUse` | Before a tool call, adds notices no hook has shown yet (offers, expiry warnings, yield requests, cleanup windows) to the agent's context. Skipped inside subagents. |
 | `SessionEnd` | Releases the session's leases and queued requests at once (`/clear`, quitting, `/resume` of another conversation), when this process runs the session. |
 
@@ -123,12 +123,15 @@ Code's limit).
 - A crash or `kill -9` runs no hook: the session's leases are kept for
   `reconnect_grace` (60 s), so `claude --continue` or `--resume` in that time
   keeps them. After a normal quit, `--continue` starts with nothing held.
-- Notices reach the agent through a wait: the Monitor tool on
-  `clerk wait --follow` (each notice is a Monitor event; the watch expires
-  after at most 30 minutes and the agent re-arms it), or `clerk wait` run in
-  the background (Claude Code wakes the agent when it completes). Either
-  claims offers for the agent and ends when the session's process exits or
-  moves to another session. Only one wait per session.
+- An idle agent is reached through `clerk wait`, run in the background: it
+  costs nothing while idle, and Claude Code wakes the agent when it
+  completes. It claims offers for the agent and ends when the session's
+  process exits or moves to another session. Only one wait per session.
+  Agents need one only while queued or holding an interruptible lease; a
+  plain lease needs none. (`clerk wait --follow` suits Claude Code's Monitor
+  tool, but a Monitor watch expires every 30 minutes and each expiry wakes
+  the agent and re-reads its whole conversation, so the skill doesn't use
+  it.)
 - **Daemon restarts are ridden out.** `clerk daemon restart` tells the
   clients waiting on the daemon that it is restarting; they reconnect to the
   new daemon (starting one themselves if it is not back within a few
@@ -204,12 +207,12 @@ Afterwards: exit the sessions, `$T7/clerk-user.sh daemon stop`,
 
 1. **Two sessions, one board: the second queues, then its wait wakes it.**
    Start sessions A and B (`tm.sh start A`). Ask A to lease `c6-boards`;
-   ask B the same. B reports "queued at position 1" and arms Monitor on
-   `clerk wait --follow`. Ask A to release. Expect B, without a prompt, to
-   get a Monitor event with the offer already claimed and report the grant.
+   ask B the same. B reports "queued at position 1" and runs `clerk wait` in
+   the background. Ask A to release. Expect B, without a prompt, to read the
+   wait's output, with the offer already claimed, and report the grant.
 2. **An idle session is woken by an expiry warning.** Let a session lease
    for `2m` (the warning comes at 20 % of the duration, at most 5 min) with a
-   wait armed, then leave it idle. Expect it to wake about 24 s before the
+   wait running, then leave it idle. Expect it to wake about 24 s before the
    end and extend, release, or ask.
 3. **`/clear` releases.** A session holds a lease; type `/clear`. Expect
    `clerk leases` to show the lease gone at once, and the new conversation's

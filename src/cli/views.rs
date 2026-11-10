@@ -456,6 +456,7 @@ fn dirty_explanation(reason: &str) -> &'static str {
     match reason {
         "window_passed" => "the last holder did not confirm cleanup in time",
         "expired" => "the last lease expired before its cleanup was confirmed",
+        "abandoned" => "the previous owner abandoned it: past its lease and did not answer",
         "holder_gone" => "the last holder went away",
         "override" => "the last holder was overridden",
         "command_failed" => "the last holder's command failed",

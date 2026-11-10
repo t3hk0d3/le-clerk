@@ -62,8 +62,8 @@ the board, and the agent carries on. No polling, no messages between agents.
   unit's path or address, its description, and your own usage notes, with
   `{unit.path}`-style placeholders filled in.
 - **Agents are woken, not polled.** Notices (your turn, expiry soon, please
-  yield, your board is back) reach an idle Claude Code session through its
-  Monitor tool. Nothing for the agent to remember to check.
+  yield, your board is back) reach an idle Claude Code session through a
+  background `clerk wait`, which costs nothing until something happens.
 - **Crashes don't leak boards.** A lease lives as long as the Claude Code
   process holding it. Kill the session and the board is free a minute
   later; `claude --continue` within that minute keeps it; `/clear` releases
@@ -73,7 +73,8 @@ the board, and the agent carries on. No polling, no messages between agents.
   across projects) are detected and linked, so a lease on either blocks the other.
 - **Fair, polite sharing.** Honest durations, warnings before expiry,
   extension, a cleanup step on every hand-back, and a "dirty" flag passed to
-  the next holder when cleanup wasn't confirmed. Long, pausable work can be
+  the next holder when cleanup wasn't confirmed. An agent running past its
+  end keeps the board until someone else wants it. Long, pausable work can be
   marked interruptible so an urgent short job can borrow the board and give
   it back. And when you say so, an agent can take a board anyway, with the
   reason in the audit log.

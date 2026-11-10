@@ -8,12 +8,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::json;
 
-use crate::model::{EndCause, LeaseState, Priority, Resource, ResourceId, Unit, UnitId};
+use crate::model::{
+    DirtyReason, EndCause, LeaseState, Priority, Resource, ResourceId, Unit, UnitId,
+};
 use crate::scheduler::{
     Ask, HandedOver, Scheduler, SchedulerError, clerk_actor, group, group_busy, notify,
 };
 use crate::store::inventory as inventory_sql;
-use crate::store::leases::{self, RequestRow};
+use crate::store::leases::{self, LeaseRow, RequestRow};
 use crate::store::notices::{Notice, NoticeKind};
 use crate::store::{Tx, audit};
 
@@ -153,6 +155,7 @@ impl Scheduler {
         self.expire_offers(tx, horizon)?;
         self.return_paused_units(tx)?;
         self.sweep_retiring(tx)?;
+        self.call_in_overdue_leases(tx)?;
         self.offer_free_groups(tx, cache)?;
         let after = QueueSnapshot::load(tx)?;
         self.publish_moves(tx, &before, &after)
@@ -311,6 +314,34 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Whether a queued request could use `lease`'s unit (or a unit linked
+    /// to it).
+    pub(super) fn has_waiter(tx: &Tx, lease: &LeaseRow) -> Result<bool, SchedulerError> {
+        let members = group(tx, lease.unit_row)?;
+        let mut resources: HashSet<i64> = HashSet::new();
+        for row in &members {
+            if let Some(u) = inventory_sql::unit_by_row(tx, *row)? {
+                resources.insert(u.resource_row);
+            }
+        }
+        Ok(leases::queued_requests(tx)?
+            .iter()
+            .any(|r| match r.unit_row {
+                Some(u) => members.contains(&u),
+                None => resources.contains(&r.resource_row),
+            }))
+    }
+
+    /// Start the cleanup of every overdue lease whose unit someone wants.
+    fn call_in_overdue_leases(&self, tx: &Tx) -> Result<(), SchedulerError> {
+        for lease in leases::live_leases(tx)? {
+            if lease.state == LeaseState::Held && lease.overdue && Self::has_waiter(tx, &lease)? {
+                self.call_in_overdue(tx, &lease)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Offer each free group to the best waiter that can use it.
     fn offer_free_groups(&self, tx: &Tx, cache: &mut HealthCache) -> Result<(), SchedulerError> {
         let mut seen: HashSet<i64> = HashSet::new();
@@ -385,12 +416,21 @@ impl Scheduler {
         };
         let handed = self.hand_over(tx, resource, unit, &ask, LeaseState::Offered)?;
         self.remove_request(tx, waiter)?;
+        let abandoned = if handed
+            .dirty
+            .as_ref()
+            .is_some_and(|d| d.reason == DirtyReason::Abandoned)
+        {
+            " The previous owner abandoned it: check the unit before you rely on it."
+        } else {
+            ""
+        };
         let mut notice = Notice::new(
             waiter.holder.clone(),
             NoticeKind::Offered,
             format!(
                 "Unit {} of {} is ready for you; claim lease {} before the deadline or it \
-                 goes to the next in line.",
+                 goes to the next in line.{abandoned}",
                 unit.id, resource.id, handed.id
             ),
             self.now(),

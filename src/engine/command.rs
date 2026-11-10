@@ -1233,6 +1233,12 @@ impl HookCommand {
                     .iter()
                     .filter(|r| r.holder == holder)
                     .count();
+                // Only these need waking while idle: a plain holder has
+                // nothing it must answer (soft expiry keeps its lease).
+                let interruptible = leases_sql::live_leases(tx)?
+                    .iter()
+                    .filter(|l| l.holder == holder && l.interruptible)
+                    .count();
                 let unshown = notices::unshown(tx, &holder)?;
                 Ok(HookAnswer {
                     value: json!({
@@ -1240,6 +1246,7 @@ impl HookCommand {
                         "connected": sessions.is_alive(&a.session_id),
                         "leases": leases,
                         "requests": requests,
+                        "interruptible": interruptible,
                         "open_waits": 0,
                         "unshown": unshown,
                     }),
