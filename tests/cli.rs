@@ -4590,6 +4590,80 @@ mod cli {
             }
         }
 
+        mod on_daemon_stop_with_an_agents_clerk_run_queued {
+            use super::*;
+
+            /// An agent session's `clerk run`, queued behind another
+            /// holder; returns it and the request id.
+            fn queued_run(s: &Stopping) -> (Bg, String) {
+                seed(&s.env, "board", "k1");
+                hold(&s.env, "x");
+                let child = s.spawn(
+                    &["run", "board", "--for", "10m", "--", "true"],
+                    Some("sess-1"),
+                );
+                let mut request = None;
+                poll_until("the request is queued", || {
+                    let queue = s.env.ok(&["queue", "board"])[0]["queue"].clone();
+                    request = queue[0]["request_id"].as_str().map(str::to_owned);
+                    request.is_some()
+                });
+                (child, request.unwrap())
+            }
+
+            #[test]
+            fn the_waiter_says_the_request_stays_queued_and_how_to_cancel_it() {
+                let s = Stopping::new();
+                let (mut child, request) = queued_run(&s);
+                s.stop_by_rpc();
+                assert_eq!(code_of(&mut child), 5);
+                let said = stderr_of(&mut child);
+                assert!(said.contains("stays queued"), "{said}");
+                assert!(said.contains(&format!("clerk cancel {request}")), "{said}");
+                assert!(!said.contains("ends with the daemon"), "{said}");
+            }
+
+            #[test]
+            fn the_request_is_still_queued_after_the_next_start() {
+                let s = Stopping::new();
+                let (mut child, request) = queued_run(&s);
+                s.stop_by_rpc();
+                assert_eq!(code_of(&mut child), 5);
+                let queue = s.env.ok(&["queue", "board"])[0]["queue"].clone();
+                assert_eq!(queue[0]["request_id"], request.as_str(), "{queue}");
+            }
+        }
+
+        mod on_daemon_stop_with_an_agents_live_view_holding {
+            use super::*;
+
+            #[test]
+            fn the_view_says_the_lease_stays_and_how_to_release_it() {
+                let s = Stopping::new();
+                seed(&s.env, "board", "k1");
+                let pid = std::process::id().to_string();
+                let tty = common::Tty::spawn_in(
+                    s.env.home(),
+                    "\"$CLERK\" acquire board --for 10m; echo EXIT=$?",
+                    &[
+                        ("CLERK", s.clerk.to_str().unwrap()),
+                        (SESSION_VAR, "sess-1"),
+                        (CLAUDE_PID, &pid),
+                    ],
+                );
+                let mut lease = None;
+                poll_until("the session holds the board", || {
+                    let occupancy = unit_status(&s.env)["occupancy"].clone();
+                    lease = occupancy["lease_id"].as_str().map(str::to_owned);
+                    lease.is_some()
+                });
+                s.stop_by_rpc();
+                tty.expect("stays yours");
+                tty.expect(&format!("clerk release {}", lease.unwrap()));
+                tty.expect("EXIT=5");
+            }
+        }
+
         mod on_sigterm_with_acquire_wait_queued {
             use super::*;
 

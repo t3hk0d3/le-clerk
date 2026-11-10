@@ -262,11 +262,9 @@ impl View<'_> {
                             batch
                         }
                         Err(e) if e.code == "daemon_stopping" => {
-                            self.screen.say(
-                                &json!({"daemon": "stopped"}),
-                                "The clerk daemon was stopped; this view ends, and what it held \
-                                 ends with it.",
-                            );
+                            let text = stopped_text(&self.caller.holder, &self.phase());
+                            self.screen
+                                .say(&json!({"daemon": "stopped", "message": text}), &text);
                             return Err(e.into());
                         }
                         Err(e) => {
@@ -523,6 +521,28 @@ fn retry_pause(failures: u32) -> Duration {
     (lease::POLL_RETRY * 2u32.pow(doublings)).min(POLL_RETRY_MAX)
 }
 
+/// What a view in `phase` says when the daemon is stopped: a process's
+/// leases and requests end once it is gone (liveness); a session's or a
+/// user's stay.
+fn stopped_text(holder: &HolderRef, phase: &Phase) -> String {
+    if matches!(holder, HolderRef::CliProcess { .. }) {
+        return "The clerk daemon was stopped; this view ends, and what it held ends with it."
+            .to_owned();
+    }
+    match phase {
+        Phase::Queued { request } | Phase::Offered { request, .. } => {
+            format!(
+                "This view ends. {}",
+                lease::request_after_stop(holder, request)
+            )
+        }
+        Phase::Held { lease } => format!(
+            "The clerk daemon was stopped; this view ends. Lease {lease} stays yours: once the \
+             daemon runs, `clerk release {lease}` gives it back."
+        ),
+    }
+}
+
 fn released_text(lease: &str) -> String {
     format!("Released: lease {lease} has ended and its cleanup is confirmed.")
 }
@@ -540,5 +560,55 @@ mod tests {
     #[test]
     fn retry_pause_stays_capped_for_any_count() {
         assert_eq!(retry_pause(u32::MAX), POLL_RETRY_MAX);
+    }
+
+    fn session() -> HolderRef {
+        HolderRef::AgentSession {
+            session_id: "s".to_owned(),
+        }
+    }
+
+    #[test]
+    fn stopped_text_says_a_process_loses_what_it_held() {
+        let holder = HolderRef::CliProcess {
+            pid: 1,
+            start_time: 1,
+        };
+        let phase = Phase::Held {
+            lease: "L".to_owned(),
+        };
+        assert!(stopped_text(&holder, &phase).contains("ends with it"));
+    }
+
+    #[test]
+    fn stopped_text_says_a_sessions_queued_request_stays_and_how_to_cancel_it() {
+        let phase = Phase::Queued {
+            request: "R".to_owned(),
+        };
+        let text = stopped_text(&session(), &phase);
+        assert!(text.contains("stays queued"), "{text}");
+        assert!(text.contains("clerk cancel R"), "{text}");
+    }
+
+    #[test]
+    fn stopped_text_says_a_sessions_offer_stays_and_how_to_cancel_it() {
+        let phase = Phase::Offered {
+            request: "R".to_owned(),
+            lease: "L".to_owned(),
+        };
+        assert!(stopped_text(&session(), &phase).contains("clerk cancel R"));
+    }
+
+    #[test]
+    fn stopped_text_says_a_users_lease_stays_and_how_to_release_it() {
+        let holder = HolderRef::User {
+            tag: "u".to_owned(),
+        };
+        let phase = Phase::Held {
+            lease: "L".to_owned(),
+        };
+        let text = stopped_text(&holder, &phase);
+        assert!(text.contains("stays yours"), "{text}");
+        assert!(text.contains("clerk release L"), "{text}");
     }
 }

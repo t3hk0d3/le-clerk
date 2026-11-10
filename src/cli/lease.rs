@@ -506,8 +506,8 @@ pub fn dropped(n: &Notice) -> ApiError {
 /// notices about the request are taken (the holder's others stay pending);
 /// those that are not the offer are shown on stderr. SIGINT, SIGTERM or
 /// SIGHUP cancels the request, and so does a failed wait, so a detached
-/// holder never leaves a request queued behind it. A stopped daemon needs
-/// no cancel: its next start ends the requests of processes that are gone.
+/// holder never leaves a request queued behind it. A stopped daemon takes
+/// no cancel: see [`request_after_stop`] for what becomes of the request.
 async fn await_offer(
     ctx: &Ctx,
     client: &Client,
@@ -537,7 +537,7 @@ async fn await_offer(
         let batch = match waited {
             Ok(batch) => batch,
             Err(e) if e.code == "daemon_stopping" => {
-                note(|| format!("Request {request} ends with the daemon, which was stopped."));
+                note(|| request_after_stop(&caller.holder, request));
                 return Err(e.into());
             }
             Err(e) => {
@@ -568,6 +568,20 @@ async fn await_offer(
         if let Some(lease) = offer {
             return Ok(claim(client, caller, &lease).await?);
         }
+    }
+}
+
+/// What becomes of `holder`'s `request` when the daemon is stopped: a
+/// process's ends at the next start, once the process is gone (liveness); a
+/// session's or a user's stays queued, and can still be offered.
+pub fn request_after_stop(holder: &HolderRef, request: &str) -> String {
+    if matches!(holder, HolderRef::CliProcess { .. }) {
+        format!("Request {request} ends with the daemon, which was stopped.")
+    } else {
+        format!(
+            "The clerk daemon was stopped; request {request} stays queued and may be offered \
+             after it starts again. Once it runs, `clerk cancel {request}` withdraws it."
+        )
     }
 }
 

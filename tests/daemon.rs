@@ -9,15 +9,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use leclerk::client::{Client, DaemonError, DaemonInfo, Launcher};
+use leclerk::client::{ApiError, Client, DaemonError, DaemonInfo, Launcher};
 use leclerk::clock::{Clock, ManualClock, SystemClock};
 use leclerk::config::{Config, Paths};
 use leclerk::health::HealthResult;
 use leclerk::inventory::{Inventory, NewResource, NewUnit};
 use leclerk::model::{
-    Caller, HealthSpec, HolderRef, LeaseId, Priority, RequestId, ResourceId, ResourceType, Scope,
-    UnitId, UnitSettings,
+    Caller, HealthSpec, HolderRef, Host, LeaseId, Priority, RequestId, ResourceId, ResourceType,
+    Scope, UnitId, UnitSettings,
 };
+use leclerk::scheduler::liveness::self_start_time;
 use leclerk::scheduler::{AcquireOutcome, AcquireRequest, Confirm, HealthProbe, Scheduler, Target};
 use leclerk::store::notices::{Notice, NoticeFilter, NoticeKind};
 use leclerk::store::{Store, StoreError, Tx, audit};
@@ -200,6 +201,36 @@ fn user(tag: &str) -> Caller {
         holder: holder(tag),
         project: None,
         override_reason: None,
+    }
+}
+
+/// An agent wait of session `parked`, up to 60 s, once the daemon counts it
+/// as open: the request is inside the daemon, so only the daemon can end it.
+async fn parked_agent_wait(
+    h: &Harness,
+    client: &Client,
+) -> tokio::task::JoinHandle<Result<Value, ApiError>> {
+    let host = Host {
+        pid: std::process::id(),
+        start_time: self_start_time().expect("this process has a start time"),
+    };
+    let poller = Client::connect(&h.paths).await.unwrap();
+    let wait = tokio::spawn(async move {
+        poller
+            .agent_wait("parked", host, 60, true, "test-arm")
+            .await
+    });
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let brief = client
+            .call("session_brief", &user("x"), json!({"session_id": "parked"}))
+            .await
+            .expect("session_brief");
+        if brief["open_waits"].as_u64() > Some(0) {
+            return wait;
+        }
+        assert!(Instant::now() < deadline, "the wait never opened");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -898,12 +929,7 @@ mod daemon {
             async fn wakes_a_parked_long_poll() {
                 let h = Harness::new();
                 let client = h.start().await;
-                let poller = Client::connect(&h.paths).await.unwrap();
-                let wait =
-                    tokio::spawn(async move { poller.wait_notices(&holder("idle"), 60).await });
-                // Give the long-poll a moment to park; the stop must wake it
-                // whether or not it has parked yet.
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                let wait = parked_agent_wait(&h, &client).await;
                 let started = Instant::now();
                 h.stop(&client).await;
                 let outcome = tokio::time::timeout(PATIENCE, wait).await.unwrap().unwrap();
@@ -1035,10 +1061,7 @@ mod daemon {
             async fn a_parked_long_poll_answers_daemon_stopping() {
                 let h = Harness::new();
                 let client = h.start().await;
-                let poller = Client::connect(&h.paths).await.unwrap();
-                let wait =
-                    tokio::spawn(async move { poller.wait_notices(&holder("idle"), 60).await });
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                let wait = parked_agent_wait(&h, &client).await;
                 unsafe {
                     libc::kill(client.daemon().pid.cast_signed(), libc::SIGTERM);
                 }
@@ -1059,25 +1082,61 @@ mod daemon {
             /// (under a test binary, `current_exe` is not clerk).
             const REFUSAL: Duration = Duration::from_secs(2);
 
+            /// A daemon whose `/v1/version` answers and whose notices route
+            /// always says `code`. Returns how many notice requests it
+            /// served.
+            fn fake_daemon(paths: &Paths, code: &'static str) -> Arc<AtomicUsize> {
+                use axum::http::StatusCode;
+                use axum::routing::get;
+
+                fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
+                let listener = tokio::net::UnixListener::bind(&paths.socket).unwrap();
+                let polls = Arc::new(AtomicUsize::new(0));
+                let counted = polls.clone();
+                let app = axum::Router::new()
+                    .route(
+                        "/v1/version",
+                        get(|| async {
+                            axum::Json(json!({
+                                "version": leclerk::VERSION,
+                                "protocol": leclerk::PROTOCOL,
+                                "pid": 1,
+                            }))
+                        }),
+                    )
+                    .route(
+                        "/v1/notices",
+                        get(move || {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            async move {
+                                (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    axum::Json(json!({"error": {
+                                        "code": code,
+                                        "message": "the fake daemon says so",
+                                    }})),
+                                )
+                            }
+                        }),
+                    );
+                tokio::spawn(async move { axum::serve(listener, app).await });
+                polls
+            }
+
             mod on_daemon_stopping_seen {
                 use super::*;
 
                 #[tokio::test(flavor = "multi_thread")]
                 async fn returns_daemon_stopping_without_starting_a_daemon() {
                     let h = Harness::new();
-                    let client = h.start().await;
+                    fake_daemon(&h.paths, "daemon_stopping");
                     let poller = Client::connect(&h.paths).await.unwrap();
-                    let waiting = poller.clone();
-                    let wait =
-                        tokio::spawn(
-                            async move { waiting.wait_notices(&holder("idle"), 60).await },
-                        );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    h.stop(&client).await;
-                    let outcome = tokio::time::timeout(PATIENCE, wait).await.unwrap().unwrap();
+                    let outcome = poller.wait_notices(&holder("idle"), 1).await;
                     assert_eq!(outcome.unwrap_err().code, "daemon_stopping");
-                    // Only the announcement is left to go by.
-                    fs::remove_file(h.paths.stop_marker()).unwrap();
+                    // The daemon is gone and left no marker: only the
+                    // announcement is left to go by.
+                    fs::remove_file(&h.paths.socket).unwrap();
+                    assert!(!h.paths.stop_marker().exists());
                     let got = tokio::time::timeout(REFUSAL, poller.reconnect())
                         .await
                         .expect("reconnect went on after daemon_stopping");
@@ -1105,51 +1164,10 @@ mod daemon {
             mod on_engine_unavailable_repeatedly_while_version_answers {
                 use super::*;
 
-                /// A daemon whose engine is gone: `/v1/version` answers, the
-                /// notices route says `engine_unavailable`. Returns how many
-                /// notice requests it served.
-                fn engineless(paths: &Paths) -> Arc<AtomicUsize> {
-                    use axum::http::StatusCode;
-                    use axum::routing::get;
-
-                    fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
-                    let listener = tokio::net::UnixListener::bind(&paths.socket).unwrap();
-                    let polls = Arc::new(AtomicUsize::new(0));
-                    let counted = polls.clone();
-                    let app = axum::Router::new()
-                        .route(
-                            "/v1/version",
-                            get(|| async {
-                                axum::Json(json!({
-                                    "version": leclerk::VERSION,
-                                    "protocol": leclerk::PROTOCOL,
-                                    "pid": 1,
-                                }))
-                            }),
-                        )
-                        .route(
-                            "/v1/notices",
-                            get(move || {
-                                counted.fetch_add(1, Ordering::SeqCst);
-                                async {
-                                    (
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        axum::Json(json!({"error": {
-                                            "code": "engine_unavailable",
-                                            "message": "the engine is gone",
-                                        }})),
-                                    )
-                                }
-                            }),
-                        );
-                    tokio::spawn(async move { axum::serve(listener, app).await });
-                    polls
-                }
-
                 #[tokio::test(flavor = "multi_thread")]
                 async fn backs_off_instead_of_retrying_in_a_tight_loop() {
                     let h = Harness::new();
-                    let polls = engineless(&h.paths);
+                    let polls = fake_daemon(&h.paths, "engine_unavailable");
                     let client = Client::connect(&h.paths).await.unwrap();
                     let _ = tokio::time::timeout(
                         Duration::from_secs(1),
