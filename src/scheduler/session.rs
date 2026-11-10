@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::model::{EndCause, HolderRef, Host};
+use crate::model::{EndCause, HolderRef, Host, LeaseId};
 use crate::scheduler::liveness::{HolderEnded, process_alive};
 use crate::scheduler::{Scheduler, SchedulerError, clerk_actor};
 use crate::store::{Store, StoreError, Tx, audit, leases, sessions as host_store};
@@ -66,6 +66,9 @@ struct Session {
 pub struct Sessions {
     grace_ms: i64,
     known: HashMap<String, Session>,
+    /// The leases each process's last ended session released
+    /// ([`Sessions::end`]), for the next session's brief.
+    released: HashMap<Host, Vec<LeaseId>>,
 }
 
 impl Sessions {
@@ -75,6 +78,7 @@ impl Sessions {
         Self {
             grace_ms: i64::try_from(reconnect_grace.as_millis()).unwrap_or(i64::MAX),
             known: HashMap::new(),
+            released: HashMap::new(),
         }
     }
 
@@ -291,7 +295,18 @@ impl Sessions {
             &json!({ "session": session_id, "reason": reason }),
         )?;
         self.forget(tx, session_id)?;
+        if let Some(host) = host
+            && !ended.leases.is_empty()
+        {
+            self.released.insert(host, ended.leases.clone());
+        }
         Ok(Some(ended))
+    }
+
+    /// The leases the last session `host` ended released, once: the next
+    /// session's brief says so (`/clear`).
+    pub fn take_released(&mut self, host: Host) -> Vec<LeaseId> {
+        self.released.remove(&host).unwrap_or_default()
     }
 
     /// Drop everything known about `session_id`.

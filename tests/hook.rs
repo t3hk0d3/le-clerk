@@ -19,7 +19,7 @@ use leclerk::config::Paths;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use common::{PATIENCE, SESSION_VAR};
+use common::{Env, PATIENCE, SESSION_VAR};
 
 /// Claude Code's budget for session-start, stop and pre-tool-use hooks.
 const BUDGET: Duration = Duration::from_secs(2);
@@ -200,6 +200,72 @@ impl Slow {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The real daemon, an agent session and its host
+// ---------------------------------------------------------------------------
+
+/// A process standing for a Claude Code process; killed when dropped.
+struct Host(Child);
+
+impl Host {
+    fn spawn() -> Self {
+        Self(Command::new("sleep").arg("300").spawn().unwrap())
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Run `clerk <args>` as agent session `session` hosted by `host`, in a
+/// project directory of `env`; its JSON output and exit code.
+fn agent(env: &Env, session: &str, host: &Host, args: &[&str]) -> (Value, Option<i32>) {
+    let out = env
+        .cmd()
+        .args(args)
+        .env(SESSION_VAR, session)
+        .env(CLAUDE_PID, host.pid().to_string())
+        .current_dir(env.dir("p"))
+        .output()
+        .unwrap();
+    let body = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+    (body, out.status.code())
+}
+
+/// `board` with one unit, registered by the user.
+fn seed(env: &Env) {
+    env.ok(&["resource", "create", "board", "--type", "generic"]);
+    env.ok(&["unit", "add", "board", "u1", "--key", "k1"]);
+}
+
+/// `session` hosted by `host` holds `board/u1`; the lease id.
+fn holds(env: &Env, session: &str, host: &Host) -> String {
+    let (body, code) = agent(env, session, host, &["acquire", "board", "--for", "10m"]);
+    assert_eq!(code, Some(0), "{body}");
+    body["lease_id"].as_str().unwrap().to_owned()
+}
+
+/// The live leases, as the user sees them.
+fn live_leases(env: &Env) -> usize {
+    env.ok(&["leases"]).as_array().map_or(0, Vec::len)
+}
+
+/// The hook's `additionalContext`.
+fn context_of(out: &Output) -> String {
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no additionalContext: {v}"))
+        .to_owned()
+}
+
 /// This test process as the hook's Claude Code process.
 #[allow(clippy::unnecessary_wraps)] // run_hook takes an optional pid
 fn me() -> Option<u32> {
@@ -254,6 +320,164 @@ mod cli {
                     }
                     assert_no_daemon(slow.home.path());
                 }
+            }
+        }
+
+        mod on_no_agent_variables {
+            use super::*;
+
+            #[test]
+            fn exits_0_at_once_with_no_output_without_asking_the_daemon() {
+                let slow = Slow::new();
+                for (event, _) in EVENTS {
+                    let (out, took) =
+                        run_hook(slow.home.path(), event, &typical(event, "s1"), None);
+                    assert_silent_within(&out, took, Duration::from_millis(500), event);
+                }
+            }
+        }
+
+        mod session_start {
+            use super::*;
+
+            fn start(env: &Env, session: &str, source: &str, host: &Host) -> Output {
+                let doc = input("session-start", session, &json!({ "source": source }));
+                run_hook(env.home(), "session-start", &doc, Some(host.pid())).0
+            }
+
+            mod on_clear_after_the_previous_session_released_leases {
+                use super::*;
+
+                #[test]
+                fn the_brief_names_what_was_released() {
+                    let env = Env::new();
+                    seed(&env);
+                    let host = Host::spawn();
+                    let lease = holds(&env, "s1", &host);
+                    let end = input("session-end", "s1", &json!({ "reason": "clear" }));
+                    run_hook(env.home(), "session-end", &end, Some(host.pid()));
+                    let context = context_of(&start(&env, "s2", "clear", &host));
+                    assert!(context.contains(&lease), "{context}");
+                    assert!(context.contains("released"), "{context}");
+                }
+            }
+
+            mod on_resume_while_holding {
+                use super::*;
+
+                #[test]
+                fn the_brief_lists_the_lease_and_the_wait_command() {
+                    let env = Env::new();
+                    seed(&env);
+                    let old = Host::spawn();
+                    let lease = holds(&env, "s1", &old);
+                    drop(old);
+                    let new = Host::spawn();
+                    let context = context_of(&start(&env, "s1", "resume", &new));
+                    assert!(context.contains(&lease), "{context}");
+                    assert!(context.contains("clerk wait --follow"), "{context}");
+                    assert!(context.contains("clerk skill"), "{context}");
+                }
+
+                #[test]
+                fn re_hosts_the_session_so_its_lease_survives_the_grace() {
+                    let env = Env::new();
+                    std::fs::create_dir_all(env.home().join("config")).unwrap();
+                    std::fs::write(
+                        env.home().join("config/config.toml"),
+                        "reconnect_grace = 2\n",
+                    )
+                    .unwrap();
+                    seed(&env);
+                    let old = Host::spawn();
+                    holds(&env, "s1", &old);
+                    drop(old);
+                    let new = Host::spawn();
+                    start(&env, "s1", "resume", &new);
+                    thread::sleep(Duration::from_secs(5));
+                    assert_eq!(live_leases(&env), 1);
+                }
+            }
+
+            mod on_startup_or_holding_nothing {
+                use super::*;
+
+                #[test]
+                fn prints_nothing() {
+                    let env = Env::new();
+                    seed(&env);
+                    let host = Host::spawn();
+                    assert_eq!(start(&env, "s1", "startup", &host).stdout, b"");
+                    assert_eq!(start(&env, "s1", "compact", &host).stdout, b"");
+                }
+            }
+        }
+
+        mod stop {
+            use super::*;
+
+            fn stop(env: &Env, session: &str, host: &Host, active: bool) -> Output {
+                let doc = input("stop", session, &json!({ "stop_hook_active": active }));
+                run_hook(env.home(), "stop", &doc, Some(host.pid())).0
+            }
+
+            #[test]
+            fn on_holding_with_no_wait_blocks_naming_the_wait() {
+                let env = Env::new();
+                seed(&env);
+                let host = Host::spawn();
+                holds(&env, "s1", &host);
+                let out = stop(&env, "s1", &host, false);
+                let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(v["decision"], "block", "{v}");
+                assert!(
+                    v["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("clerk wait --follow"),
+                    "{v}"
+                );
+            }
+
+            #[test]
+            fn on_stop_hook_active_or_holding_nothing_prints_nothing() {
+                let env = Env::new();
+                seed(&env);
+                let host = Host::spawn();
+                assert_eq!(stop(&env, "s1", &host, false).stdout, b"");
+                holds(&env, "s1", &host);
+                assert_eq!(stop(&env, "s1", &host, true).stdout, b"");
+            }
+        }
+
+        mod session_end {
+            use super::*;
+
+            fn end(env: &Env, session: &str, host: &Host, reason: &str) {
+                let doc = input("session-end", session, &json!({ "reason": reason }));
+                let (out, took) = run_hook(env.home(), "session-end", &doc, Some(host.pid()));
+                assert_silent_within(&out, took, END_BUDGET, reason);
+            }
+
+            #[test]
+            fn on_any_reason_from_the_host_the_lease_ends_at_once() {
+                let env = Env::new();
+                seed(&env);
+                let host = Host::spawn();
+                holds(&env, "s1", &host);
+                end(&env, "s1", &host, "clear");
+                assert_eq!(live_leases(&env), 0);
+            }
+
+            #[test]
+            fn from_a_process_that_is_not_the_host_nothing_changes() {
+                let env = Env::new();
+                seed(&env);
+                let host = Host::spawn();
+                let other = Host::spawn();
+                holds(&env, "s1", &host);
+                end(&env, "s1", &other, "prompt_input_exit");
+                assert_eq!(live_leases(&env), 1);
             }
         }
     }

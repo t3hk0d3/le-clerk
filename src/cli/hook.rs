@@ -36,7 +36,7 @@ use anyhow::{Context, bail};
 use clap::ValueEnum;
 use leclerk::client::{self, Client, PROBE_TIMEOUT};
 use leclerk::config::Paths;
-use leclerk::model::{Caller, Host};
+use leclerk::model::{Caller, HolderRef, Host};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -104,6 +104,11 @@ struct HookInput {
 /// Run the hook; always exit 0. Only the hook's documented output reaches
 /// stdout, and only when everything succeeded in time.
 pub fn main(event: Event) -> ExitCode {
+    // Run by something other than an agent (no Claude Code variables):
+    // nothing to do, and the daemon is not asked.
+    if !agent_detected(|k| std::env::var_os(k)) {
+        return ExitCode::SUCCESS;
+    }
     let deadline = Instant::now() + event.budget().saturating_sub(MARGIN);
     if let Ok(Some(output)) = run(event, deadline) {
         let mut stdout = io::stdout().lock();
@@ -111,6 +116,15 @@ pub fn main(event: Event) -> ExitCode {
         let _ = writeln!(stdout, "{output}").and_then(|()| stdout.flush());
     }
     ExitCode::SUCCESS
+}
+
+/// Whether an agent runs the hook: Claude Code, which sets
+/// `CLAUDE_CODE_SESSION_ID` or `CLAUDE_PID` for hook commands, is the only
+/// agent so far.
+fn agent_detected(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    [caller::SESSION_VAR, caller::PID_VAR]
+        .iter()
+        .any(|k| var(k).is_some_and(|v| !v.is_empty()))
 }
 
 /// The hook's output, if it has one.
@@ -209,14 +223,40 @@ impl Hook {
             return Ok(None);
         }
         let session = self.client().await?;
-        session
+        let started = session
             .call("session_start", json!({ "source": source }), self.left())
             .await?;
-        Ok(None)
+        if !matches!(source, "clear" | "compact" | "resume") {
+            return Ok(None);
+        }
+        let caller = Caller {
+            holder: HolderRef::AgentSession {
+                session_id: self.input.session_id.clone(),
+            },
+            project: None,
+            override_reason: None,
+        };
+        let mine = session
+            .client
+            .call_within("list_my_leases", &caller, json!({}), self.left())
+            .await?;
+        let brief = session
+            .call("session_brief", json!({}), self.left())
+            .await?;
+        let armed = brief["open_waits"].as_u64().unwrap_or(0) > 0;
+        let released = started["released"].as_array().cloned().unwrap_or_default();
+        Ok(start_brief(&mine, armed, &released).map(|context| {
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": context,
+                }
+            })
+        }))
     }
 
     /// Block once while the session holds or waits for something without
-    /// an open `lease_wait`.
+    /// an armed `clerk wait`.
     async fn stop(&self) -> anyhow::Result<Option<Value>> {
         if self.input.stop_hook_active {
             return Ok(None);
@@ -240,7 +280,7 @@ impl Hook {
     /// Show the notices no hook has shown yet, and mark them shown.
     async fn pre_tool_use(&self) -> anyhow::Result<Option<Value>> {
         // A subagent's tool call: the notices are for the main agent, which
-        // holds the leases and runs lease_wait.
+        // holds the leases and arms the wait.
         if self.input.agent_id.is_some() {
             return Ok(None);
         }
@@ -323,11 +363,63 @@ fn stop_reason(leases: u64, requests: u64) -> String {
         ),
     };
     format!(
-        "Le Clerk: this session has {what} but no lease_wait call is running, so offers, \
-         yield requests and expiry warnings would go unanswered. Call lease_wait (with \
-         ack=[the notice ids of its previous result]) and keep calling it while you hold or \
-         wait for anything; release leases you no longer need."
+        "Le Clerk: this session has {what} but no clerk wait is armed, so offers, yield \
+         requests and expiry warnings would go unanswered. {WAIT_HOW} Release leases you no \
+         longer need."
     )
+}
+
+/// How an agent keeps a wait armed.
+const WAIT_HOW: &str = "Arm a wait: the Monitor tool on `clerk wait --follow` (timeout_ms \
+     1800000, re-armed when it expires), or `clerk wait` in the background (read its output \
+     when it completes, then start it again).";
+
+/// The `SessionStart` brief for a session that holds `mine` (the
+/// `list_my_leases` answer), with a wait `armed` or not, after its process's
+/// previous session `released` these leases. `None` when there is nothing
+/// to say.
+fn start_brief(mine: &Value, armed: bool, released: &[Value]) -> Option<String> {
+    let leases = mine["leases"].as_array().map_or(&[][..], Vec::as_slice);
+    let requests = mine["requests"].as_array().map_or(&[][..], Vec::as_slice);
+    if leases.is_empty() && requests.is_empty() && released.is_empty() {
+        return None;
+    }
+    let mut text = String::from("Le Clerk (shared resources; use the clerk skill):\n");
+    if !released.is_empty() {
+        let ids: Vec<String> = released.iter().map(super::output::plain).collect();
+        let _ = writeln!(
+            text,
+            "- The previous conversation ended, so its leases were released: {}.",
+            ids.join(", ")
+        );
+    }
+    for l in leases {
+        let _ = writeln!(
+            text,
+            "- You hold lease {} on {}/{} ({}).",
+            super::output::plain(&l["lease_id"]),
+            super::output::plain(&l["resource"]),
+            super::output::plain(&l["unit"]),
+            super::output::plain(&l["state"]),
+        );
+    }
+    for r in requests {
+        let _ = writeln!(
+            text,
+            "- You are queued for {} (request {}).",
+            super::output::plain(&r["resource"]),
+            super::output::plain(&r["request_id"]),
+        );
+    }
+    if leases.is_empty() && requests.is_empty() {
+        return Some(text.trim_end().to_owned());
+    }
+    if armed {
+        text.push_str("- A clerk wait is armed; act on its notices as they arrive.");
+    } else {
+        let _ = write!(text, "- No clerk wait is armed. {WAIT_HOW}");
+    }
+    Some(text)
 }
 
 fn plural(n: u64, what: &str) -> String {
@@ -351,8 +443,8 @@ fn notice_context(notices: &[Value]) -> Option<(String, Vec<String>)> {
         return None;
     }
     let mut context = format!(
-        "Le Clerk: {} for this session. They stay pending: call lease_wait to receive and \
-         acknowledge them, and act on them.\n",
+        "Le Clerk: {} for this session. Act on them; your armed clerk wait also reports \
+         them.\n",
         plural(notices.len() as u64, "pending notice")
     );
     let mut ids = Vec::new();
@@ -373,7 +465,7 @@ fn notice_context(notices: &[Value]) -> Option<(String, Vec<String>)> {
         // Writing to a String cannot fail.
         let _ = writeln!(
             context,
-            "…and {} not shown here; lease_wait returns them.",
+            "…and {} not shown here; the clerk wait reports them.",
             plural(rest as u64, "more notice")
         );
     }
@@ -424,7 +516,7 @@ mod tests {
         let (context, ids) = notice_context(&[notice("N1", "Claim it.")]).unwrap();
         assert_eq!(ids, vec!["N1".to_owned()]);
         assert!(context.contains("[N1] offered (board/u1, lease L1): Claim it."));
-        assert!(context.contains("lease_wait"));
+        assert!(context.contains("clerk wait"));
     }
 
     #[test]
@@ -449,9 +541,27 @@ mod tests {
     }
 
     #[test]
-    fn stop_reason_names_lease_wait_and_what_is_held() {
+    fn stop_reason_names_the_wait_and_what_is_held() {
         let reason = stop_reason(1, 2);
         assert!(reason.contains("1 live lease and 2 queued requests"));
-        assert!(reason.contains("lease_wait"));
+        assert!(reason.contains("clerk wait --follow"));
+    }
+
+    #[test]
+    fn agent_detected_by_either_variable() {
+        let only =
+            |name: &'static str| move |k: &str| (k == name).then(|| std::ffi::OsString::from("1"));
+        assert!(agent_detected(only("CLAUDE_PID")));
+        assert!(agent_detected(only("CLAUDE_CODE_SESSION_ID")));
+        assert!(!agent_detected(|_| None));
+        assert!(!agent_detected(|_| Some(std::ffi::OsString::new())));
+    }
+
+    #[test]
+    fn start_brief_is_none_with_nothing_to_say() {
+        assert_eq!(
+            start_brief(&json!({"leases": [], "requests": []}), false, &[]),
+            None
+        );
     }
 }

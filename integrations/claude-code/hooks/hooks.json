@@ -1,5 +1,5 @@
 {
-  "description": "Le Clerk: carry resumed sessions' leases over, re-arm lease_wait, show pending notices, end liveness on exit. Every hook fails open.",
+  "description": "Le Clerk: report the session's Claude Code process, brief new conversations on what they hold, remind to arm clerk wait, show pending notices, release on session end. Every hook fails open.",
   "hooks": {
     "SessionStart": [
       {

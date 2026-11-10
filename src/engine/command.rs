@@ -1194,12 +1194,19 @@ impl HookCommand {
                 })
             }
             Self::SessionStart(a) => {
-                let unhosted = match a.host {
-                    Some(host) => sessions.report(tx, &a.session_id, host, now_ms)?.unhosted,
-                    None => Vec::new(),
+                let (unhosted, released) = match a.host {
+                    Some(host) => (
+                        sessions.report(tx, &a.session_id, host, now_ms)?.unhosted,
+                        sessions.take_released(host),
+                    ),
+                    None => (Vec::new(), Vec::new()),
                 };
                 Ok(HookAnswer {
-                    value: json!({ "session": a.session_id, "unhosted": unhosted }),
+                    value: json!({
+                        "session": a.session_id,
+                        "unhosted": unhosted,
+                        "released": released,
+                    }),
                     open_waits_of: None,
                     changed: false,
                 })
