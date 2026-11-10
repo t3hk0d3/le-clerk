@@ -3,7 +3,8 @@
 //! - `GET /v1/version` → `{"version": "<semver>", "pid": <daemon pid>}`
 //! - `POST /v1/rpc/{method}` with `{"caller": Caller, "args": {...}}` →
 //!   `200 {"result": ...}` or an error status with
-//!   `{"error": {"code": "...", "message": "..."}}`
+//!   `{"error": {"code": "...", "message": "..."}}`. The hook methods
+//!   ([`HookCommand::METHODS`]) take the session from their arguments.
 //! - `POST /mcp`: the MCP endpoint (see [`crate::mcp`]).
 //! - `GET /v1/notices?holder=<url-encoded HolderRef JSON>&wait=<secs, max 60>`
 //!   → `200 {"result": [Notice, ...]}` (the long-poll). Optional
@@ -33,7 +34,7 @@ use http_body_util::Channel;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::engine::{ApiError, Command, EngineHandle, ErrorKind, MAX_WAIT};
+use crate::engine::{ApiError, Command, EngineHandle, ErrorKind, HookCommand, MAX_WAIT};
 use crate::mcp;
 use crate::model::{Caller, HolderRef};
 use crate::scope::ProjectResolver;
@@ -118,7 +119,8 @@ async fn rpc(
     Path(method): Path<String>,
     body: Bytes,
 ) -> Response {
-    if !Command::METHODS.contains(&method.as_str()) {
+    let hook = HookCommand::METHODS.contains(&method.as_str());
+    if !hook && !Command::METHODS.contains(&method.as_str()) {
         return ApiError::unknown_method(&method).into_response();
     }
     let request: RpcRequest = match serde_json::from_slice(&body) {
@@ -128,6 +130,18 @@ async fn rpc(
                 .into_response();
         }
     };
+    if hook {
+        // Hooks answer about the session their arguments resolve to; the
+        // caller is not used.
+        let result = match HookCommand::parse(&method, request.args) {
+            Ok(command) => engine.hook(command).await,
+            Err(e) => Err(e),
+        };
+        return match result {
+            Ok(value) => ok(value),
+            Err(e) => e.into_response(),
+        };
+    }
     let command = match Command::parse(&method, request.caller, request.args) {
         Ok(c) => c,
         Err(e) => return e.into_response(),

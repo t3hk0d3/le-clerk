@@ -262,8 +262,12 @@ impl Client {
         Self::connect_within(paths, PROBE_TIMEOUT).await
     }
 
-    /// [`Client::connect`], giving up after `limit`.
-    async fn connect_within(paths: &Paths, limit: Duration) -> Result<Self, DaemonError> {
+    /// [`Client::connect`], giving up after `limit`. Never starts a
+    /// daemon.
+    ///
+    /// # Errors
+    /// As [`Client::connect`].
+    pub async fn connect_within(paths: &Paths, limit: Duration) -> Result<Self, DaemonError> {
         let daemon = Self::probe_within(paths, limit).await?;
         if daemon.version != crate::VERSION {
             return Err(DaemonError::VersionMismatch {
@@ -452,6 +456,20 @@ impl Client {
         args: Value,
     ) -> Result<Value, ApiError> {
         self.request(method, caller, args, CALL_TIMEOUT).await
+    }
+
+    /// [`Client::call`], giving up after `limit`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub async fn call_within(
+        &self,
+        method: &str,
+        caller: &Caller,
+        args: Value,
+        limit: Duration,
+    ) -> Result<Value, ApiError> {
+        self.request(method, caller, args, limit).await
     }
 
     async fn request(

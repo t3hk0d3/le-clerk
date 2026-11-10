@@ -53,6 +53,45 @@ pub enum Aliased {
     Refused(AliasRefusal),
 }
 
+/// What [`Sessions::start_resume`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome", content = "reason")]
+pub enum Resume {
+    /// The live proxy session took the resumed session over.
+    TakenOver,
+    /// Both ids already stand for the same session.
+    Unchanged,
+    /// Nothing moved; a `session_alias_refused` audit entry says why.
+    Refused(AliasRefusal),
+    /// The resumed session holds nothing (no live lease, queued request
+    /// or pending notice): there is nothing to take over.
+    NothingHeld,
+    /// No proxy of that Claude Code process is connected yet. The resume
+    /// is remembered (see [`Sessions::resume_pending`]) and may be asked
+    /// again.
+    Pending,
+}
+
+impl From<Aliased> for Resume {
+    fn from(a: Aliased) -> Self {
+        match a {
+            Aliased::TakenOver => Self::TakenOver,
+            Aliased::Unchanged => Self::Unchanged,
+            Aliased::Refused(r) => Self::Refused(r),
+        }
+    }
+}
+
+/// A `SessionStart` resume whose proxy had not connected yet.
+#[derive(Debug, Clone)]
+struct PendingResume {
+    /// The resumed session id, as the hook named it.
+    session_id: String,
+    /// When it is forgotten, unix ms: the resumed session's grace is over
+    /// by then anyway.
+    until: i64,
+}
+
 /// Why an alias was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +136,8 @@ pub struct Sessions {
     /// Resumed session id → the session that took it over (a mirror of
     /// the store's `session_aliases`, loaded at boot).
     aliases: HashMap<String, String>,
+    /// Resumes waiting for their proxy, by Claude Code PID.
+    pending: HashMap<u32, PendingResume>,
     connects: u64,
 }
 
@@ -109,6 +150,7 @@ impl Sessions {
             known: HashMap::new(),
             owners: HashMap::new(),
             aliases: HashMap::new(),
+            pending: HashMap::new(),
             connects: 0,
         }
     }
@@ -217,6 +259,104 @@ impl Sessions {
         }
         live.sort_by_key(|(_, s)| s.connected);
         live.last().map_or(own, |(id, _)| (*id).clone())
+    }
+
+    /// The live proxy session of Claude Code process `claude_pid`, as
+    /// [`Sessions::resolve`] picks it for a hook of `session_id`; `None`
+    /// when no proxy of that process is connected.
+    #[must_use]
+    pub fn proxy_of(&self, claude_pid: u32, session_id: &str) -> Option<String> {
+        let id = self.resolve(Some(claude_pid), session_id);
+        self.known
+            .get(&id)
+            .is_some_and(|s| !s.open.is_empty() && s.claude_pid == Some(claude_pid))
+            .then_some(id)
+    }
+
+    /// `SessionStart` with `source: "resume"` from a hook of Claude Code
+    /// process `claude_pid` naming the resumed session `session_id`, at
+    /// `now_ms`: the process's live proxy session takes `session_id` over
+    /// ([`Sessions::alias`]). When no proxy of the process is connected yet
+    /// (the hook can run before the proxy's liveness stream opens), nothing
+    /// moves and the resume is remembered for [`Sessions::resume_pending`]
+    /// until the reconnect grace from now is over. Without a Claude PID the
+    /// proxy cannot be found: `Pending`, remembering nothing. A resumed
+    /// session that holds nothing is left alone (`NothingHeld`).
+    ///
+    /// # Errors
+    /// [`SchedulerError::Store`] on storage failure.
+    pub fn start_resume(
+        &mut self,
+        tx: &Tx,
+        sched: &Scheduler,
+        claude_pid: Option<u32>,
+        session_id: &str,
+        now_ms: i64,
+    ) -> Result<Resume, SchedulerError> {
+        let resumed = HolderRef::AgentSession {
+            session_id: self.follow(session_id),
+        };
+        if !holds_anything(tx, &resumed)? {
+            return Ok(Resume::NothingHeld);
+        }
+        let Some(pid) = claude_pid else {
+            return Ok(Resume::Pending);
+        };
+        let Some(proxy) = self.proxy_of(pid, session_id) else {
+            self.pending.retain(|_, p| p.until > now_ms);
+            self.pending.insert(
+                pid,
+                PendingResume {
+                    session_id: session_id.to_owned(),
+                    until: now_ms.saturating_add(self.grace_ms),
+                },
+            );
+            return Ok(Resume::Pending);
+        };
+        self.pending.remove(&pid);
+        Ok(self.alias(tx, sched, &proxy, session_id)?.into())
+    }
+
+    /// A later hook of Claude Code process `claude_pid` for session
+    /// `session_id` at `now_ms`: when a [`Sessions::start_resume`] of that
+    /// process and session is still pending and its proxy is connected now,
+    /// the alias is made (once, whatever its outcome). `None` when nothing
+    /// was pending or the proxy is still not connected.
+    ///
+    /// # Errors
+    /// [`SchedulerError::Store`] on storage failure.
+    pub fn resume_pending(
+        &mut self,
+        tx: &Tx,
+        sched: &Scheduler,
+        claude_pid: Option<u32>,
+        session_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<Aliased>, SchedulerError> {
+        let Some(pid) = claude_pid else {
+            return Ok(None);
+        };
+        let Some(pending) = self.pending.get(&pid) else {
+            return Ok(None);
+        };
+        if pending.until <= now_ms {
+            self.pending.remove(&pid);
+            return Ok(None);
+        }
+        if pending.session_id != session_id {
+            return Ok(None);
+        }
+        let Some(proxy) = self.proxy_of(pid, session_id) else {
+            return Ok(None);
+        };
+        self.pending.remove(&pid);
+        Ok(Some(self.alias(tx, sched, &proxy, session_id)?))
+    }
+
+    /// Forget a pending resume of Claude Code process `claude_pid` (its
+    /// session ended).
+    pub fn drop_pending(&mut self, claude_pid: u32) {
+        self.pending.remove(&claude_pid);
     }
 
     /// Daemon start at `now_ms`: the resume aliases are loaded from the
@@ -402,6 +542,16 @@ fn agent_holders(tx: &Tx) -> Result<Vec<String>, StoreError> {
         }
     }
     Ok(ids)
+}
+
+/// Whether `holder` has a live lease, a queued request or a pending
+/// notice.
+fn holds_anything(tx: &Tx, holder: &HolderRef) -> Result<bool, StoreError> {
+    Ok(leases::live_leases(tx)?.iter().any(|l| l.holder == *holder)
+        || leases::queued_requests(tx)?
+            .iter()
+            .any(|r| r.holder == *holder)
+        || !notices::pending(tx, holder)?.is_empty())
 }
 
 /// End `session_id`'s leases and requests as [`Scheduler::holder_gone`]

@@ -280,6 +280,8 @@ enum Job {
     SessionResolve(Option<u32>, String, Reply<String>),
     /// Whether an agent session has an open liveness stream.
     SessionAlive(String, Reply<bool>),
+    /// A Claude Code hook's RPC.
+    Hook(Box<HookCommand>, Reply<HookAnswer>),
 }
 
 /// A liveness stream that opened.
@@ -683,6 +685,22 @@ impl EngineHandle {
         self.ask(|reply| Job::SessionAlive(session_id, reply)).await
     }
 
+    /// Run a hook RPC (`clerk hook …`); a `session_brief` gets the open
+    /// waits of the session it resolved.
+    ///
+    /// # Errors
+    /// The command's [`ApiError`], or `engine_unavailable`.
+    pub async fn hook(&self, command: HookCommand) -> Result<Value, ApiError> {
+        let answer = self
+            .ask(|reply| Job::Hook(Box::new(command), reply))
+            .await?;
+        let mut value = answer.value;
+        if let Some(holder) = answer.open_waits_of {
+            value["open_waits"] = Value::from(self.open_waits(&holder));
+        }
+        Ok(value)
+    }
+
     /// The configuration the engine runs with.
     #[must_use]
     pub fn config(&self) -> &Config {
@@ -1005,6 +1023,20 @@ impl Engine {
             }
             Job::SessionAlive(session_id, reply) => {
                 let _ = reply.send(Ok(self.sessions.is_alive(&session_id)));
+            }
+            Job::Hook(command, reply) => {
+                let result = self.guarded(command.method(), |engine| {
+                    let now = engine.clock.now_ms();
+                    let (sessions, sched) = (&mut engine.sessions, &engine.scheduler);
+                    engine
+                        .store
+                        .tx(|tx| command.execute(tx, sessions, sched, now))
+                });
+                let changed = result.as_ref().is_ok_and(|a| a.changed);
+                let _ = reply.send(result);
+                if changed {
+                    self.maintain();
+                }
             }
         }
     }

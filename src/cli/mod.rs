@@ -3,11 +3,12 @@
 //! Every command prints human text when stdout is a terminal and JSON
 //! otherwise (or with `--json`). Nothing but command output reaches stdout;
 //! logs go to stderr. Stdin is never read unless it is a terminal, except
-//! for `-f -` on the inventory commands.
+//! for `-f -` on the inventory commands and the hook input of `clerk hook`.
 
 mod admin;
 mod caller;
 mod gate;
+mod hook;
 mod input;
 mod inventory;
 mod lease;
@@ -135,6 +136,13 @@ enum Command {
     /// The MCP server Claude Code runs: relays MCP between stdin/stdout and
     /// the clerk daemon, keeping the agent session alive while it runs.
     Mcp,
+    /// A Claude Code hook: reads the hook input from stdin, never starts
+    /// the daemon, always exits 0 and prints only the hook's output.
+    Hook {
+        /// The hook event.
+        #[arg(value_enum)]
+        event: hook::Event,
+    },
     /// Approve a promotion: the resource moves to user scope.
     Approve {
         /// The promotion id, from `clerk promotions`.
@@ -194,6 +202,10 @@ pub fn run() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => out.fail(Failure::from(e)),
         };
+    }
+    if let Command::Hook { event } = cli.command {
+        // Hooks fail open and silent: no logging, nothing but hook output.
+        return hook::main(event);
     }
     init_logging();
     if let Command::Mcp = cli.command {
@@ -261,7 +273,7 @@ fn execute(cli: Cli, out: Output) -> anyhow::Result<()> {
 
 async fn dispatch(ctx: &Ctx, command: Command) -> anyhow::Result<()> {
     match command {
-        Command::Daemon { action: None } | Command::Mcp => Ok(()),
+        Command::Daemon { action: None } | Command::Mcp | Command::Hook { .. } => Ok(()),
         Command::Daemon {
             action: Some(action),
         } => manage_daemon(ctx, action).await,

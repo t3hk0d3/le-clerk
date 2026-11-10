@@ -244,6 +244,50 @@ pub fn ack(
     )?)
 }
 
+/// Undelivered notices of `holder` that no hook has shown yet, oldest
+/// first, changing nothing. Showing is not delivery: see [`mark_shown`].
+///
+/// # Errors
+/// [`StoreError`] on SQL failure or a damaged row.
+pub fn unshown(tx: &Tx, holder: &HolderRef) -> Result<Vec<Notice>, StoreError> {
+    let mut stmt = tx.conn().prepare(
+        "SELECT payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
+         AND hook_shown_at IS NULL ORDER BY created_at, row_id",
+    )?;
+    let payloads = stmt
+        .query_map([serde_json::to_string(holder)?], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    payloads
+        .iter()
+        .map(|p| serde_json::from_str(p).map_err(StoreError::from))
+        .collect()
+}
+
+/// Mark those of `ids` that are undelivered, not yet shown notices of
+/// `holder` as shown by a hook (`hook_shown_at = now_ms`); other ids are
+/// ignored. The notices stay pending: delivery is unaffected. Returns how
+/// many were marked.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure.
+pub fn mark_shown(
+    tx: &Tx,
+    holder: &HolderRef,
+    ids: &[NoticeId],
+    now_ms: i64,
+) -> Result<usize, StoreError> {
+    let ids: Vec<&str> = ids.iter().map(NoticeId::as_str).collect();
+    Ok(tx.conn().execute(
+        "UPDATE notices SET hook_shown_at = ?3 WHERE holder = ?1 AND delivered_at IS NULL \
+         AND hook_shown_at IS NULL AND notice_id IN (SELECT value FROM json_each(?2))",
+        rusqlite::params![
+            serde_json::to_string(holder)?,
+            serde_json::to_string(&ids)?,
+            now_ms
+        ],
+    )?)
+}
+
 /// `(row_id, payload)` of up to `limit` undelivered notices of `holder`,
 /// oldest first; with `filter`, only those it matches. The filter runs in
 /// SQL on the stored payload, so only the rows selected are read.
@@ -328,26 +372,37 @@ pub fn holders_after(tx: &Tx, after: i64) -> Result<Vec<HolderRef>, StoreError> 
 }
 
 /// Hand every undelivered notice of `from` to `to`, as [`rehome`] does for
-/// one lease's notices. Returns how many moved.
+/// one lease's notices, keeping whether a hook already showed it (the same
+/// conversation took over). Returns how many moved.
 ///
 /// # Errors
 /// [`StoreError`] on SQL failure or a damaged row.
 pub fn rehome_all(tx: &Tx, from: &HolderRef, to: &HolderRef) -> Result<usize, StoreError> {
     let rows = {
         let mut stmt = tx.conn().prepare(
-            "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
-             ORDER BY created_at, row_id",
+            "SELECT row_id, payload, hook_shown_at FROM notices WHERE holder = ?1 \
+             AND delivered_at IS NULL ORDER BY created_at, row_id",
         )?;
         stmt.query_map([serde_json::to_string(from)?], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?
     };
-    for (row, payload) in &rows {
+    for (row, payload, shown) in &rows {
         let mut notice: Notice = serde_json::from_str(payload)?;
         notice.id = NoticeId::new();
         notice.holder = to.clone();
         publish(tx, &notice)?;
+        if shown.is_some() {
+            tx.conn().execute(
+                "UPDATE notices SET hook_shown_at = ?2 WHERE notice_id = ?1",
+                rusqlite::params![notice.id.as_str(), shown],
+            )?;
+        }
         tx.conn()
             .execute("DELETE FROM notices WHERE row_id = ?1", [row])?;
     }

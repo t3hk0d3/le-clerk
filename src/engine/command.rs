@@ -20,12 +20,14 @@ use crate::inventory::{
     Inventory, InventoryError, NewResource, NewUnit, Promotions, ResourcePatch, UnitPatch, View,
 };
 use crate::model::{
-    Caller, HealthSpec, HolderRef, LeaseId, Priority, ProjectKey, PromotionId, RequestId,
+    Caller, HealthSpec, HolderRef, LeaseId, NoticeId, Priority, ProjectKey, PromotionId, RequestId,
     ResourceId, ResourceType, Scope, UnitId, UnitSettings,
 };
+use crate::scheduler::session::{Aliased, Resume, Sessions};
 use crate::scheduler::{AcquireRequest, Confirm, LeaseEdit, Scheduler, Target};
 use crate::store::inventory::{self as inventory_sql, ScopeFilter};
-use crate::store::{Tx, audit};
+use crate::store::leases as leases_sql;
+use crate::store::{Tx, audit, notices};
 
 /// Which resources a listing or status covers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -1021,4 +1023,212 @@ fn scoped(
 fn encode<T: serde::Serialize>(value: T) -> Result<Value, ApiError> {
     serde_json::to_value(value)
         .map_err(|e| ApiError::internal(format!("cannot encode result: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Hook RPCs
+// ---------------------------------------------------------------------------
+
+/// `session_brief`: who a hook speaks for. `session_id` is Claude Code's
+/// hook input `session_id`, `claude_pid` the hook's `CLAUDE_PID`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookSessionArgs {
+    pub session_id: String,
+    #[serde(default)]
+    pub claude_pid: Option<u32>,
+}
+
+/// `mark_notices_shown`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkShownArgs {
+    pub session_id: String,
+    #[serde(default)]
+    pub claude_pid: Option<u32>,
+    /// The notices the hook showed.
+    pub ids: Vec<NoticeId>,
+}
+
+/// `session_start`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStartArgs {
+    pub session_id: String,
+    #[serde(default)]
+    pub claude_pid: Option<u32>,
+    /// The hook input's `source` (`startup`, `resume`, `clear`, …).
+    pub source: String,
+}
+
+/// `session_end`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEndArgs {
+    pub session_id: String,
+    #[serde(default)]
+    pub claude_pid: Option<u32>,
+    /// The hook input's `reason` (`clear`, `resume`, `logout`, …).
+    pub reason: String,
+}
+
+/// An RPC of the Claude Code hooks (`clerk hook …`). Each resolves the
+/// session it speaks for as [`Sessions::resolve`] does (the live proxy
+/// session of the Claude PID, else the session id) and answers only about
+/// that session. They need the liveness record, so they are not
+/// [`Command`]s, and they are not MCP tools.
+#[derive(Debug, Clone)]
+pub enum HookCommand {
+    /// The session's live leases, queued requests, open waits and the
+    /// pending notices no hook has shown. Also makes a resume the
+    /// `SessionStart` hook left pending ([`Sessions::resume_pending`]).
+    SessionBrief(HookSessionArgs),
+    /// Mark notices shown by a hook; they stay pending.
+    MarkNoticesShown(MarkShownArgs),
+    /// `SessionStart`: on `source: "resume"`, the proxy session takes the
+    /// resumed one over; other sources change nothing.
+    SessionStart(SessionStartArgs),
+    /// `SessionEnd`: end the session's leases and requests now, unless
+    /// `reason` is `clear` or `resume` and its proxy is still connected.
+    SessionEnd(SessionEndArgs),
+}
+
+/// What a [`HookCommand`] answered, for the engine to finish.
+#[derive(Debug)]
+pub(crate) struct HookAnswer {
+    /// The result.
+    pub value: Value,
+    /// For `session_brief`: the holder whose open waits go in
+    /// `open_waits` (counted outside the engine thread).
+    pub open_waits_of: Option<HolderRef>,
+    /// Scheduling state changed: the engine ticks and dispatches.
+    pub changed: bool,
+}
+
+impl HookCommand {
+    /// Every hook RPC method name.
+    pub const METHODS: &'static [&'static str] = &[
+        "session_brief",
+        "mark_notices_shown",
+        "session_start",
+        "session_end",
+    ];
+
+    /// Build the hook command for `method` from its JSON `args`.
+    ///
+    /// # Errors
+    /// `unknown_method` for a name not in [`HookCommand::METHODS`];
+    /// `invalid_request` when `args` does not fit the method.
+    pub fn parse(method: &str, args: Value) -> Result<Self, ApiError> {
+        Ok(match method {
+            "session_brief" => Self::SessionBrief(parse_args(method, args)?),
+            "mark_notices_shown" => Self::MarkNoticesShown(parse_args(method, args)?),
+            "session_start" => Self::SessionStart(parse_args(method, args)?),
+            "session_end" => Self::SessionEnd(parse_args(method, args)?),
+            _ => return Err(ApiError::unknown_method(method)),
+        })
+    }
+
+    /// The `snake_case` RPC method name.
+    #[must_use]
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::SessionBrief(_) => "session_brief",
+            Self::MarkNoticesShown(_) => "mark_notices_shown",
+            Self::SessionStart(_) => "session_start",
+            Self::SessionEnd(_) => "session_end",
+        }
+    }
+
+    /// Run the hook command in `tx` against the liveness record.
+    pub(crate) fn execute(
+        self,
+        tx: &Tx,
+        sessions: &mut Sessions,
+        sched: &Scheduler,
+        now_ms: i64,
+    ) -> Result<HookAnswer, ApiError> {
+        match self {
+            Self::SessionBrief(a) => {
+                let resumed =
+                    sessions.resume_pending(tx, sched, a.claude_pid, &a.session_id, now_ms)?;
+                let session = sessions.resolve(a.claude_pid, &a.session_id);
+                let holder = agent_session(&session);
+                let leases = leases_sql::live_leases(tx)?
+                    .iter()
+                    .filter(|l| l.holder == holder)
+                    .count();
+                let requests = leases_sql::queued_requests(tx)?
+                    .iter()
+                    .filter(|r| r.holder == holder)
+                    .count();
+                let unshown = notices::unshown(tx, &holder)?;
+                Ok(HookAnswer {
+                    value: json!({
+                        "session": session,
+                        "connected": sessions.is_alive(&session),
+                        "leases": leases,
+                        "requests": requests,
+                        "open_waits": 0,
+                        "unshown": unshown,
+                    }),
+                    open_waits_of: Some(holder),
+                    changed: resumed == Some(Aliased::TakenOver),
+                })
+            }
+            Self::MarkNoticesShown(a) => {
+                let holder = agent_session(&sessions.resolve(a.claude_pid, &a.session_id));
+                let marked = notices::mark_shown(tx, &holder, &a.ids, now_ms)?;
+                Ok(HookAnswer {
+                    value: json!({ "marked": marked }),
+                    open_waits_of: None,
+                    changed: false,
+                })
+            }
+            Self::SessionStart(a) => {
+                let outcome = if a.source == "resume" {
+                    sessions.start_resume(tx, sched, a.claude_pid, &a.session_id, now_ms)?
+                } else {
+                    Resume::Unchanged
+                };
+                Ok(HookAnswer {
+                    value: encode(outcome)?,
+                    open_waits_of: None,
+                    changed: outcome == Resume::TakenOver,
+                })
+            }
+            Self::SessionEnd(a) => {
+                let session = sessions.resolve(a.claude_pid, &a.session_id);
+                if let Some(pid) = a.claude_pid {
+                    sessions.drop_pending(pid);
+                }
+                let keep =
+                    matches!(a.reason.as_str(), "clear" | "resume") && sessions.is_alive(&session);
+                if keep {
+                    return Ok(HookAnswer {
+                        value: json!({ "session": session, "ended": false }),
+                        open_waits_of: None,
+                        changed: false,
+                    });
+                }
+                let ended = sessions.end_now(tx, sched, &session)?;
+                Ok(HookAnswer {
+                    value: json!({
+                        "session": session,
+                        "ended": true,
+                        "leases_ended": ended.leases,
+                        "requests_dropped": ended.requests,
+                    }),
+                    open_waits_of: None,
+                    changed: true,
+                })
+            }
+        }
+    }
+}
+
+fn agent_session(session_id: &str) -> HolderRef {
+    HolderRef::AgentSession {
+        session_id: session_id.to_owned(),
+    }
 }
