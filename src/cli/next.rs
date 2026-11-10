@@ -25,9 +25,38 @@ pub fn annotate(command: &str, value: &mut Value) {
 #[must_use]
 pub fn after_error(code: &str) -> &'static str {
     match code {
-        "usage_error" | "invalid_request" | "invalid_argument" | "invalid_id"
-        | "invalid_settings" | "invalid_tag" => {
-            "Fix the command as the message says and run it again."
+        "usage_error"
+        | "invalid_request"
+        | "invalid_argument"
+        | "invalid_id"
+        | "invalid_settings"
+        | "invalid_tag"
+        | "too_many_tags"
+        | "conflicting_tag_edit"
+        | "description_multiline"
+        | "description_too_long"
+        | "usage_too_long"
+        | "unknown_placeholder"
+        | "health_empty"
+        | "health_blank_command"
+        | "health_check_not_allowed"
+        | "settings_type_mismatch"
+        | "settings_empty_field"
+        | "settings_zero_port"
+        | "extend_not_later" => "Fix the command as the message says and run it again.",
+        "duplicate_in_scope" => {
+            "It is registered already: use the existing resource and unit the message names."
+        }
+        "ambiguous_duplicate" => {
+            "Check which of the units the details list is this thing, or ask the user."
+        }
+        "override_required" => {
+            "Ask the user whether to take it anyway; only with their word, run it again with \
+             --override \"<their reason>\"."
+        }
+        "extend_refused" => {
+            "Someone with priority is waiting (see the details): finish up and release, or ask \
+             the user."
         }
         "daemon_unavailable"
         | "daemon_unresponsive"
@@ -62,6 +91,21 @@ pub fn error_message(code: &str, message: &str) -> String {
     format!("{message}{sep}{next}")
 }
 
+/// A unix-ms time as local date and time plus how far away.
+fn time(v: &Value) -> String {
+    v.as_i64().map_or_else(
+        || "?".to_owned(),
+        |at| {
+            let now = leclerk::clock::Clock::now_ms(&leclerk::clock::SystemClock);
+            format!(
+                "{} ({})",
+                super::render::date_time(at),
+                super::render::when(at, now)
+            )
+        },
+    )
+}
+
 fn s(v: &Value, key: &str) -> String {
     v[key].as_str().unwrap_or("?").to_owned()
 }
@@ -73,7 +117,9 @@ pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
         "acquire" | "claim" | "attach" if v["outcome"] == "queued" => (
             vec![format!(
                 "Queued for {} at position {} (request {}).",
-                s(v, "resource"),
+                v["unit"]
+                    .as_str()
+                    .map_or_else(|| s(v, "resource"), |u| format!("{}/{u}", s(v, "resource"))),
                 v["position"],
                 s(v, "request_id")
             )],
@@ -111,7 +157,7 @@ pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
             format!("Wait for your unit to come back (the wait tells you). {ARM_AGAIN}"),
         ),
         "extend" => (
-            vec![format!("Lease {lease} now ends at {}.", v["ends_at"])],
+            vec![format!("Lease {lease} now ends {}.", time(&v["ends_at"]))],
             format!("`clerk release {lease}` when you are done."),
         ),
         "interruptible" => (
@@ -130,7 +176,13 @@ pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
             format!("`clerk release {lease}` when you are done."),
         ),
         "cancel" => (
-            vec![format!("Request {} is withdrawn.", s(v, "request_id"))],
+            vec![format!(
+                "Request {} is withdrawn.",
+                v["request_id"]
+                    .as_str()
+                    .or(v["cancelled"].as_str())
+                    .unwrap_or("?")
+            )],
             "Nothing more for this request.".to_owned(),
         ),
         "types" => (
@@ -188,6 +240,46 @@ mod tests {
             v["next"].as_str().unwrap().contains("no `clerk confirm`"),
             "{v}"
         );
+    }
+
+    /// Research finding 4: summaries show times, not epoch milliseconds.
+    #[test]
+    fn an_extend_summary_shows_a_date_and_time() {
+        let mut v = json!({"lease_id": "L1", "ends_at": 1_800_000_000_000_i64});
+        annotate("extend", &mut v);
+        let line = v["summary"][0].as_str().unwrap();
+        assert!(!line.contains("1800000000000"), "{line}");
+        assert!(line.contains(':') && line.contains('('), "{line}");
+    }
+
+    /// Research finding 6: each error's next step fits the error.
+    #[test]
+    fn validation_errors_say_to_fix_the_command() {
+        for code in [
+            "description_too_long",
+            "description_multiline",
+            "usage_too_long",
+            "unknown_placeholder",
+            "too_many_tags",
+            "conflicting_tag_edit",
+            "settings_type_mismatch",
+            "settings_empty_field",
+            "settings_zero_port",
+            "health_empty",
+            "health_blank_command",
+            "health_check_not_allowed",
+            "extend_not_later",
+        ] {
+            assert!(after_error(code).starts_with("Fix the command"), "{code}");
+        }
+    }
+
+    #[test]
+    fn duplicate_and_override_errors_get_their_own_next_step() {
+        assert!(after_error("duplicate_in_scope").contains("existing"));
+        assert!(after_error("ambiguous_duplicate").contains("ask the user"));
+        assert!(after_error("override_required").contains("--override"));
+        assert!(after_error("extend_refused").contains("release"));
     }
 
     #[test]

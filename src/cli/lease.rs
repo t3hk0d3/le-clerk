@@ -219,6 +219,12 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
     }
     if !args.wait {
         let mut outcome = outcome;
+        // The daemon's queued answer names only the request: add what was
+        // asked for, so the result reads on its own.
+        outcome["resource"] = target["resource"].clone();
+        if let Some(unit) = target.get("unit") {
+            outcome["unit"] = unit.clone();
+        }
         outcome["next"] = Value::String(queued_next(&outcome));
         let shown = args.target.clone();
         ctx.out.emit(&View::new(outcome, move |v| {

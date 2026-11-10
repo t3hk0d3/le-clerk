@@ -3973,6 +3973,33 @@ mod cli {
                 );
             }
 
+            /// Research finding 3: no `?` in the summary.
+            #[test]
+            fn on_queued_the_summary_names_the_resource_and_cancel_names_the_request() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                hold(&env, "x");
+                let dir = env.dir("alpha");
+                let out = env
+                    .agent("sess-1", &dir)
+                    .args(["acquire", "board/u1", "--for", "10m"])
+                    .output()
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                let summary = body["summary"][0].as_str().unwrap();
+                assert!(
+                    summary.starts_with("Queued for board/u1 at position 1"),
+                    "{body}"
+                );
+                let request = body["request_id"].as_str().unwrap();
+                let cancelled = json_of(env.agent("sess-1", &dir).args(["cancel", request]));
+                assert_eq!(
+                    cancelled["summary"][0],
+                    format!("Request {request} is withdrawn."),
+                    "{cancelled}"
+                );
+            }
+
             #[test]
             fn with_wait_is_refused_pointing_to_clerk_wait() {
                 let env = Env::new();
@@ -4176,7 +4203,7 @@ mod cli {
                     .args(["acquire", "board", "--for", "10m"]),
             );
             assert_eq!(code, Some(6), "{text}");
-            assert!(text.starts_with("## Queued: request req_"), "{text}");
+            assert!(text.starts_with("## Queued: board\n"), "{text}");
             assert!(text.contains("- request_id: req_"), "{text}");
             assert!(text.contains("clerk wait --follow"), "{text}");
         }
@@ -4214,6 +4241,34 @@ mod cli {
             assert_eq!(code, Some(2), "{text}");
             assert!(text.starts_with("## Error: usage_error\n"), "{text}");
             assert!(text.trim_end().ends_with("run it again."), "{text}");
+        }
+
+        /// Research finding 4: no epoch milliseconds in an agent's error.
+        #[test]
+        fn an_earlier_extension_shows_the_current_end_as_a_time() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let dir = env.dir("alpha");
+            let lease = lease_of(&json_of(
+                env.agent("sess-1", &dir)
+                    .args(["acquire", "board", "--for", "1h"]),
+            ));
+            let (text, code) = stdout(
+                env.agent_md("sess-1", &dir)
+                    .args(["extend", &lease, "--for", "1m"]),
+            );
+            assert_eq!(code, Some(2), "{text}");
+            assert!(text.starts_with("## Error: extend_not_later"), "{text}");
+            assert!(
+                text.contains("- ends_at: ") && text.contains("(in "),
+                "{text}"
+            );
+            assert!(!regex_like_epoch(&text), "{text}");
+        }
+
+        fn regex_like_epoch(text: &str) -> bool {
+            text.split(|c: char| !c.is_ascii_digit())
+                .any(|w| w.len() >= 13)
         }
 
         #[test]
