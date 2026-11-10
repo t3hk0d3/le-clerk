@@ -1860,6 +1860,7 @@ mod health_backoff {
 /// Two-phase dispatch: a probe that blocks runs off the transaction.
 mod dispatch {
     use super::*;
+    use leclerk::model::EndCause;
     use leclerk::scheduler::checks::{CheckJob, HEALTHY_TTL};
     use leclerk::scheduler::{BlockedBy, HEALTH_RECHECK_BACKOFF};
 
@@ -2132,6 +2133,51 @@ mod dispatch {
         }
     }
 
+    mod on_a_passing_check_offering_the_unit_to_another_request {
+        use super::*;
+
+        /// Units `u1` and `u2` held by interruptible leases. `any` (any
+        /// unit) has asked the lease on `u1` to yield; `pinned` (only `u1`,
+        /// ahead in the queue) has no ask. The lease on `u1` then ends, so
+        /// `u1` is being checked.
+        fn pinned_ahead() -> Fixture {
+            let mut f = fixture();
+            f.seed("board", &["u1", "u2"]);
+            let mut long = req(on_unit("board", "u1"), MIN * 60, Priority::Normal, "l1");
+            long.interruptible = true;
+            let l1 = f.grant(&caller("l1"), long);
+            let mut short = req(on_unit("board", "u2"), MIN * 30, Priority::Normal, "l2");
+            short.interruptible = true;
+            f.grant(&caller("l2"), short);
+            f.probe.blocking.store(true, Ordering::SeqCst);
+            f.queue(
+                &caller("any"),
+                req(on("board"), MIN, Priority::Normal, "any"),
+            );
+            assert_eq!(f.count(&holder("l1"), NoticeKind::YieldRequested), 1);
+            f.queue(
+                &caller("pinned"),
+                req(on_unit("board", "u1"), MIN, Priority::High, "pinned"),
+            );
+            let sched = &f.sched;
+            f.store
+                .tx(|tx| sched.end_lease(tx, &l1.lease_id, EndCause::HolderGone, true))
+                .unwrap();
+            f
+        }
+
+        #[test]
+        fn asks_the_other_holder_to_yield_for_the_request_left_waiting() {
+            let mut f = pinned_ahead();
+            assert_eq!(f.count(&holder("l2"), NoticeKind::YieldRequested), 0);
+            let jobs = f.jobs();
+            assert_eq!(jobs.len(), 1);
+            f.finish(jobs);
+            assert_eq!(f.count(&holder("pinned"), NoticeKind::Offered), 1);
+            assert_eq!(f.count(&holder("l2"), NoticeKind::YieldRequested), 1);
+        }
+    }
+
     mod on_a_result_for_a_forgotten_check {
         use super::*;
 
@@ -2167,6 +2213,15 @@ mod dispatch {
         #[test]
         fn asks_no_holder_to_yield_while_it_is_checked() {
             let mut f = mixed();
+            assert_eq!(f.count(&holder("h"), NoticeKind::YieldRequested), 0);
+        }
+
+        #[test]
+        fn asks_nobody_when_the_check_passes_and_the_unit_is_offered() {
+            let mut f = mixed();
+            let jobs = f.jobs();
+            f.finish(jobs);
+            assert_eq!(f.count(&holder("a"), NoticeKind::Offered), 1);
             assert_eq!(f.count(&holder("h"), NoticeKind::YieldRequested), 0);
         }
 

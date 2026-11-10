@@ -788,9 +788,10 @@ impl Scheduler {
         self.check_book().take_jobs()
     }
 
-    /// A check came back: keep its result for its TTL and record it on the
-    /// unit. An out-of-date ticket changes nothing. After a failure, queued
-    /// requests may now ask holders to yield. The caller dispatches next.
+    /// A check came back: keep its result for its TTL, record it on the
+    /// unit and dispatch. An out-of-date ticket changes nothing. Then, and
+    /// only after that dispatch has offered what it can, the requests still
+    /// queued may ask holders to yield: asks were held back during the check.
     ///
     /// # Errors
     /// [`SchedulerError::Store`] on storage failure.
@@ -814,12 +815,11 @@ impl Scheduler {
             return Ok(());
         }
         inventory_sql::record_health(tx, ticket.row, &health_text(result), now)?;
-        if !healthy {
-            let mut waiting = leases::queued_requests(tx)?;
-            waiting.sort_by_key(dispatch::queue_key);
-            for request in waiting {
-                self.maybe_request_yield(tx, &request.id)?;
-            }
+        self.dispatch(tx)?;
+        let mut waiting = leases::queued_requests(tx)?;
+        waiting.sort_by_key(dispatch::queue_key);
+        for request in waiting {
+            self.maybe_request_yield(tx, &request.id)?;
         }
         Ok(())
     }

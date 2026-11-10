@@ -85,8 +85,8 @@ impl Scheduler {
         if leases::asked_for(tx, &request.id)?.is_some() {
             return Ok(());
         }
-        // A free target unit may yet pass its check: nobody need yield. A
-        // failed check brings the request back here.
+        // A free target unit may yet pass its check: nobody need yield.
+        // Every check's result brings the request back here.
         if self.free_target_checking(tx, &request)? {
             return Ok(());
         }
