@@ -1126,3 +1126,104 @@ for the user to decide):
    abandoned result both leave the notices pending.
 6. **SessionEnd hook budget:** the plugin's `clerk hook session-end` gets
    1.5 s in total, not the plan's 2 s. Its RPC must finish in about 1 s.
+
+### Task 7 live checks (2026-11-10, Claude Code 2.1.321)
+
+Install and user docs: `docs/claude-code.md`. Evidence:
+`docs/superpowers/spikes/2026-11-10-p3/task7/` (screens are tmux captures,
+`*-summary.txt` are digests of `claude -p` stream-json, `*-excerpt.log` are
+lines from `--debug-file` logs, `audit-final.txt` is the clerk audit log).
+Every run was isolated: release build first on `PATH`, temp `CLERK_HOME`
+with `reconnect_grace = 20`, plugin loaded per run with `--plugin-dir`,
+`--setting-sources project`, `--model haiku`, sessions in a scratch git repo
+that Claude Code already trusted. The user's Claude Code settings, plugins and
+marketplaces were not changed (checksums compared); Claude Code itself still
+wrote its usual session transcripts and `~/.claude.json` bookkeeping.
+`claude plugin validate` passes for the plugin and the marketplace
+(`plugin-validate.log`: README, LICENSE and icon are only plugin-directory
+submission warnings).
+
+1. **Two sessions, one pool: passed.** B queued at position 1 (lease_acquire
+   and lease_wait ran as MCP tasks); when A released and confirmed, B showed
+   `MCP task … (lease_wait) completed.` unprompted, reported the grant with
+   the rendered usage and re-armed `lease_wait` with `ack`
+   (`check1-session-A-screen.txt`, `check1-2-session-B-screen.txt`,
+   `audit-after-check1-2.txt`).
+2. **Idle session woken by an expiry warning: passed.** B (lease `for: 2m`)
+   sat idle; at the warning (24 s before the end) its `lease_wait` task
+   completed, B woke, acknowledged the notice and re-armed; at expiry it was
+   woken again by `cleanup_window_started` and confirmed cleanup
+   (`check1-2-session-B-screen.txt`).
+3. **Killed session frees its board after the grace: passed.** `kill -9` of
+   the holder's `claude` at 04:52:39.1; its `clerk mcp` exited; the lease
+   stayed for the grace and ended at 04:52:59.96 (20.8 s) with cause
+   `holder_gone`, unit dirty (`check3-kill.log`, `audit-final.txt`).
+4. **`--resume` and `--continue` keep leases: passed.** After `kill -9` and
+   `claude --resume <id>` 1 s later, the lease was still held under that
+   session ID past the grace, and `lease_status` in the resumed session listed
+   it (`check4-resume.log`, `check4-session-C2-resumed.txt`). The same after
+   `kill -9` and `claude --continue`: `SessionStart:resume [clerk hook
+   session-start]` ran (380 ms) and the new MCP connection saw the lease
+   (`check4-continue.log`, `check4-session-C3-continued.txt`,
+   `check4-7-continue-startup-debug-excerpt.log`). Extra (4b): after `kill -9`
+   and `--resume`, Claude Code picked up the old process's `lease_wait` MCP
+   task, which completed with the expiry warning and woke the resumed idle
+   session (`check4b-*`). After `--continue`, the restored task showed as `MCP
+   task · reconnecting…` in the exit dialog (`check4-continue-exit-dialog.txt`);
+   whether it would have delivered was not checked.
+5. **Stop hook reminder once: passed.** `claude -p`, lease held, no wait:
+   the first Stop returned the block ("Le Clerk: this session has 1 live
+   lease but no lease_wait call is running…"), Claude Code fed it back as
+   "Stop hook feedback", the second Stop (`stop_hook_active`) returned
+   nothing and the turn ended (`check5-stop-hook-summary.txt`,
+   `check5-stop-hook-debug-excerpt.log`). Seen interactively too, shown as
+   "Stop hook error: Le Clerk: …" after a session released without re-arming
+   (`check4b-session-E2-resumed-woken.txt`).
+6. **"Register the boards on my hub": passed, two small deviations.** Fake
+   hub: two ESP32-H2 and one nRF52840 by-id files (`check6-fake-hub.txt`).
+   The agent loaded `registering-resources`, called `resource_list` before
+   creating anything, kept the H2s out of the existing `c6-boards`, created
+   `h2-boards` (two units) and `nrf52840-dongle` with one-line descriptions,
+   usage with `{unit.path}` placeholders and a "Clean:" line, 5 tags each,
+   `scope` left out (project scope), unit descriptions naming each serial
+   (`check6-register-summary.txt`, `check6-register-detail.txt`). Deviations:
+   `resource_list` without `tags`, and it did not record the IDs in the
+   project docs (step 7) but offered to.
+7. **Plugin load and start-up: passed.** Hooks, skills and the MCP server
+   load from `--plugin-dir` with no schema error; SessionEnd with `timeout:
+   1.5` runs (`SessionEnd:prompt_input_exit … completed`, the lease ended
+   within 70 ms of `/exit`; `check7-session-end-exit.log`,
+   `check7-hooks-load-debug-excerpt.log`). Claude Code spawns MCP servers in
+   parallel with SessionStart hooks: with an extra 4 s `sleep` SessionStart
+   hook, `plugin:leclerk:clerk` connected while that hook ran (it finished
+   4 s later) (`check7-parallel-startup-debug-excerpt.log`, `-p`); in
+   the interactive `--continue` run the MCP server connected before the
+   clerk's own SessionStart hook finished.
+
+**Install commands** were checked only against a temp `CLAUDE_CONFIG_DIR`
+(no login needed for them): `claude plugin marketplace add <repo>`, `claude
+plugin install leclerk@leclerk --scope user|project`, `claude plugin list`,
+`claude plugin uninstall … --scope …`, `claude plugin marketplace remove
+leclerk` (`install-isolated-config.log`).
+
+**Findings** (for the controller; no product code changed):
+
+- **The model never sees the tool results' text block.** In Claude Code
+  2.1.321, synchronous results and completed task results reach the model as
+  the structured content JSON only (transcripts show the JSON string as the
+  `tool_result`, and task notifications carry the JSON in `<result>`), though
+  the tools declare no `outputSchema`. The "next step" sentence and the text
+  list of notice IDs are lost. Agents still worked, from the skills, the JSON
+  fields (`id`s for `ack`, each notice's `action`) and the Stop hook. Options:
+  put a `next_step` field in the structured content, or accept and rely on
+  the skills.
+- **Closing the terminal ends leases at once.** SIGHUP runs SessionEnd with
+  `reason: "other"`, and the lease ended 65 ms later (`extra-sighup.log`), as
+  `/exit` does. Resume handover therefore only applies after a crash or kill,
+  not after a closed terminal. This follows the plan; noted because a user
+  might expect `--continue` after closing a terminal to keep the board.
+
+**Left for the user:** installing into their real Claude Code setup and a
+session with it; real boards; the desktop app and VS Code (no tasks, blocking
+`lease_wait`); subagents holding leases; the 20-minute `lease_wait` cap and
+30-minute stdio idle limit at default timings.

@@ -1,0 +1,39 @@
+{
+ "id": "h2-boards",
+ "type": "device",
+ "description": "ESP32-H2 dev boards (Thread/Zigbee) on the test hub USB hub",
+ "tags": [
+  "esp32",
+  "esp32h2",
+  "thread",
+  "zigbee",
+  "devboard"
+ ],
+ "usage": "Target and flash: `idf.py set-target esp32h2`, then `idf.py -p {unit.path} flash monitor`.\nClean: `idf.py -p {unit.path} erase-flash`, close the monitor."
+}
+{
+ "id": "nrf52840-dongle",
+ "type": "device",
+ "description": "nRF52840 dongle running Zephyr OpenThread RCP firmware on the test hub",
+ "tags": [
+  "nrf52840",
+  "nordic",
+  "thread",
+  "openthread",
+  "dongle"
+ ],
+ "usage": "Flash with `nrfutil` (Zephyr OpenThread RCP firmware) on {unit.path}.\nClean: leave the RCP firmware on the dongle; close any process holding {unit.path}."
+}
+Registered the three hub devices with the clerk. All units were added with no warnings.
+
+- **`h2-boards`** (device, project scope): two ESP32-H2 boards, which are the Thread/Zigbee dev boards.
+  - `h2-a` → `/tmp/claude-1000/t7hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_48:31:B7:00:11:22-if00`
+  - `h2-b` → `/tmp/claude-1000/t7hub/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_48:31:B7:00:33:44-if00`
+- **`nrf52840-dongle`** (device, project scope): the nRF52840 dongle with Zephyr OpenThread RCP firmware.
+  - `nrf-1` → `/tmp/claude-1000/t7hub/serial/by-id/usb-ZEPHYR_nRF52840_Dongle_E1A2B3C4D5E6F708-if00`
+
+I put the H2s in their own resource rather than `c6-boards`, which is ESP32-C6 hardware. I also left out `scope: "user"` because you didn't say these are shared across projects. Tell me if you want them promoted.
+
+The shell read was blocked by a permission prompt, so I read the README and the serial directory with the file tools. The README matched what the directory listed.
+
+I didn't write the resource IDs into the project's docs or memory, which the registering skill suggests. Say if you want that.

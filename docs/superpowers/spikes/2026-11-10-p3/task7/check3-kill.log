@@ -1,0 +1,7 @@
+kill -9 claude pid 1881399 at 04:52:39.139 (1794286359140 ms)
+at 5s:
+[{"occupancy":{"ends_at":1794286944586,"holder":{"kind":"agent_session","session_id":"11111111-1111-4111-8111-111111111111"},"kind":"held","lease_id":"lse_01M71WSPCAK10RFRVQV7DA2EZ7","purpose":"check 3: will be killed","resource":"c6-boards","state":"held","unit":"c6-a"},"resource":"c6-boards","scope":"user","unit":"c6-a"}]
+    PID CMD
+clerk mcp proxy 1881603 gone
+lease gone at 04:53:00.365 (1794286380365 ms), after ~21s
+{"resources":[{"description":"ESP32-C6 dev boards on the test hub","id":"c6-boards","queue":[],"scope":"user","shadows_user":false,"tags":["devboard","esp32c6"],"type":"device","units":[{"description":"the board labelled A","dirty":{"at":1794286379964,"previous_holder":{"kind":"agent_session","session_id":"11111111-1111-4111-8111-111111111111"},"reason":"holder_gone"},"id":"c6-a","last_health":"healthy","last_health_at":1794286344586,"occupancy":{"kind":"free"},"retiring":false}]}]}

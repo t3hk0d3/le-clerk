@@ -1,0 +1,34 @@
+33
+04:46:10.590 resource_created cli_process {"id": "c6-boards", "scope": "user", "tags": ["devboard", "esp32c6"], "type": "device"}
+04:46:10.594 unit_added cli_process {"resource": "c6-boards", "scope": "user", "unit": "c6-a"}
+04:48:06.863 granted 11111111-1111-4111-8111-111111111111 {"dirty": null, "lease": "lse_01M71WHTPFP90CT6TXDH8JNJ9Y", "override_reason": null, "purpose": "check 1: holder A", "resource": "c6-boards", "unit": "
+04:48:38.785 queued 22222222-2222-4222-8222-222222222222 {"override_reason": null, "position": 1, "purpose": "check 1: waiter B", "request": "req_01M71WJSW187J0Z15HYCG1CWT9", "resource": "c6-boards", "unit":
+04:49:06.755 released 11111111-1111-4111-8111-111111111111 {"lease": "lse_01M71WHTPFP90CT6TXDH8JNJ9Y"}
+04:49:08.412 cleanup_confirmed 11111111-1111-4111-8111-111111111111 {"lease": "lse_01M71WHTPFP90CT6TXDH8JNJ9Y"}
+04:49:08.412 lease_ended user {"cause": "released", "cleanup_confirmed": true, "dirty": null, "holder": {"kind": "agent_session", "session_id": "11111111-1111-4111-8111-11111111111
+04:49:08.413 offered user {"dirty": null, "holder": {"kind": "agent_session", "session_id": "22222222-2222-4222-8222-222222222222"}, "lease": "lse_01M71WKPSXNK73TSFC64HAKHCX", 
+04:49:08.413 claimed 22222222-2222-4222-8222-222222222222 {"lease": "lse_01M71WKPSXNK73TSFC64HAKHCX"}
+04:51:08.413 expired user {"holder": {"kind": "agent_session", "session_id": "22222222-2222-4222-8222-222222222222"}, "lease": "lse_01M71WKPSXNK73TSFC64HAKHCX"}
+04:51:14.451 cleanup_confirmed 22222222-2222-4222-8222-222222222222 {"lease": "lse_01M71WKPSXNK73TSFC64HAKHCX"}
+04:51:14.451 lease_ended user {"cause": "expired", "cleanup_confirmed": true, "dirty": null, "holder": {"kind": "agent_session", "session_id": "22222222-2222-4222-8222-222222222222
+04:52:24.586 granted 11111111-1111-4111-8111-111111111111 {"dirty": null, "lease": "lse_01M71WSPCAK10RFRVQV7DA2EZ7", "override_reason": null, "purpose": "check 3: will be killed", "resource": "c6-boards", "un
+04:52:59.964 lease_ended user {"cause": "holder_gone", "cleanup_confirmed": false, "dirty": {"at": 1794286379964, "previous_holder": {"kind": "agent_session", "session_id": "111111
+04:52:59.964 holder_gone user {"holder": {"kind": "agent_session", "session_id": "11111111-1111-4111-8111-111111111111"}, "leases_ended": ["lse_01M71WSPCAK10RFRVQV7DA2EZ7"], "reque
+04:53:20.580 granted 33333333-3333-4333-8333-333333333333 {"dirty": {"at": 1794286379964, "previous_holder": {"kind": "agent_session", "session_id": "11111111-1111-4111-8111-111111111111"}, "reason": "holder_
+04:56:20.884 lease_ended user {"cause": "holder_gone", "cleanup_confirmed": false, "dirty": {"at": 1794286580884, "previous_holder": {"kind": "agent_session", "session_id": "333333
+04:56:20.884 holder_gone user {"holder": {"kind": "agent_session", "session_id": "33333333-3333-4333-8333-333333333333"}, "leases_ended": ["lse_01M71WVD24RHXQ4YQSGXR7XVDK"], "reque
+04:56:52.507 granted 55555555-5555-4555-8555-555555555555 {"dirty": {"at": 1794286580884, "previous_holder": {"kind": "agent_session", "session_id": "33333333-3333-4333-8333-333333333333"}, "reason": "holder_
+04:57:16.214 resource_created cli_process {"id": "test-token", "scope": "user", "tags": ["token"], "type": "generic"}
+04:57:16.221 unit_added cli_process {"resource": "test-token", "scope": "user", "unit": "tok-1"}
+04:57:20.453 granted 54dfc1c9-c329-49c1-a52a-a3ec4012c887 {"dirty": null, "lease": "lse_01M71X2QA5HX02NPZBDZMS2GQT", "override_reason": null, "purpose": "check 5: stop hook", "resource": "test-token", "unit":
+04:57:24.438 lease_ended user {"cause": "holder_gone", "cleanup_confirmed": false, "dirty": {"at": 1794286644438, "previous_holder": {"kind": "agent_session", "session_id": "54dfc1
+04:57:24.439 holder_gone user {"holder": {"kind": "agent_session", "session_id": "54dfc1c9-c329-49c1-a52a-a3ec4012c887"}, "leases_ended": ["lse_01M71X2QA5HX02NPZBDZMS2GQT"], "reque
+04:58:32.092 resource_created aef43746-8cc4-472e-9666-bddc5bdb150a {"id": "h2-boards", "scope": {"project": "/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/subject/.git"}, "tags": [
+04:58:32.823 resource_created aef43746-8cc4-472e-9666-bddc5bdb150a {"id": "nrf52840-dongle", "scope": {"project": "/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/subject/.git"}, "ta
+04:58:34.639 unit_added aef43746-8cc4-472e-9666-bddc5bdb150a {"resource": "h2-boards", "scope": {"project": "/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/subject/.git"}, "un
+04:58:35.273 unit_added aef43746-8cc4-472e-9666-bddc5bdb150a {"resource": "h2-boards", "scope": {"project": "/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/subject/.git"}, "un
+04:58:35.796 unit_added aef43746-8cc4-472e-9666-bddc5bdb150a {"resource": "nrf52840-dongle", "scope": {"project": "/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/subject/.git"
+04:59:24.145 released 55555555-5555-4555-8555-555555555555 {"lease": "lse_01M71X1W0VCZ5VX8J1HW2F9DPK"}
+05:00:33.591 granted 22222222-2222-4222-8222-222222222222 {"dirty": {"at": 1794286644438, "previous_holder": {"kind": "agent_session", "session_id": "54dfc1c9-c329-49c1-a52a-a3ec4012c887"}, "reason": "holder_
+05:00:39.256 lease_ended user {"cause": "holder_gone", "cleanup_confirmed": false, "dirty": {"at": 1794286839256, "previous_holder": {"kind": "agent_session", "session_id": "222222
+05:00:39.257 holder_gone user {"holder": {"kind": "agent_session", "session_id": "22222222-2222-4222-8222-222222222222"}, "leases_ended": ["lse_01M71X8KXQHA0BPNZA687EW7P9"], "reque

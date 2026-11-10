@@ -1,0 +1,10 @@
+HOOK SessionStart:startup exit 0 out '' outcome success
+init session 54dfc1c9-c329-49c1-a52a-a3ec4012c887 clerk tools: 21 ['mcp__plugin_leclerk_clerk__lease_acquire', 'mcp__plugin_leclerk_clerk__lease_cancel', 'mcp__plugin_leclerk_clerk__lease_claim'] mcp [{'name': 'plugin:leclerk:clerk', 'status': 'connected', 'source': 'plugin'}] plugins [{'name': 'leclerk', 'path': '/home/tehkode/dev/leclerk/integrations/claude-code', 'source': 'leclerk@inline', 'version': '0.1.0'}, {'name': 'cc-plugin-agents-md', 'path': 'builtin', 'source': 'cc-plugin-agents-md@builtin'}, {'name': 'cc-plugin-telemetry', 'path': 'builtin', 'source': 'cc-plugin-telemetry@builtin'}, {'name': 'cc-plugin-privacy', 'path': 'builtin', 'source': 'cc-plugin-privacy@builtin'}, {'name': 'cc-plugin-plugin-authoring', 'path': 'builtin', 'source': 'cc-plugin-plugin-authoring@builtin'}]
+TOOL ToolSearch {"query": "select:mcp__plugin_leclerk_clerk__lease_acquire", "max_results": 1}
+  RES [{"type": "tool_reference", "tool_name": "mcp__plugin_leclerk_clerk__lease_acquire"}]
+TOOL mcp__plugin_leclerk_clerk__lease_acquire {"target": {"resource": "test-token"}, "for": "5m", "purpose": "check 5: stop hook"}
+  RES {"dirty":null,"ends_at":1794286940453,"lease_id":"lse_01M71X2QA5HX02NPZBDZMS2GQT","outcome":"granted","resource":"test-token","resource_description":"A shared test API token (fake, for the Stop hook check)","resource_tags":["token"],"settings":{"identity_key":"tok-1","type":"generic"},"unit":"tok-1","unit_description":"token one","usage":""}
+TEXT The lease on `test-token` was granted (lease `lse_01M71X2QA5HX02NPZBDZMS2GQT`, unit `tok-1`, 5 minutes), and I'm ending the turn as asked without calling lease_wait.
+system notification {'type': 'system', 'subtype': 'notification', 'key': 'stop-hook-error', 'text': 'Stop hook error occurred · ctrl+o to see', 'priority': 'immediate', 'session_id': '54dfc1c9-c329-49c1-a52a-a3ec4012c887
+TEXT noted, not waiting
+RESULT success 54dfc1c9-c329-49c1-a52a-a3ec4012c887 noted, not waiting
