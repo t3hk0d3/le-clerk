@@ -11,7 +11,8 @@ Every result is Markdown: labelled fields (IDs, times with how far away,
 the usage as its own section), what happened, and a last line `Next: …`
 with the step the clerk expects. Errors start `## Error: <code>`, then a
 message ending with the next step, then their details (e.g. who is
-waiting). Follow `Next:`. (`--json` prints JSON, for scripts.)
+waiting). Follow `Next:`. To process a result in a script (`jq`,
+`python3`), add `--json`: it prints the same result as JSON.
 
 **Never coordinate resources by messaging other agents.** No "are you done
 with the board?" messages, no claiming in chat or files. The clerk is the

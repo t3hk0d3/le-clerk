@@ -293,6 +293,13 @@ mod plugin {
             }
         }
 
+        /// Research finding 5: agents pipe results into jq/python.
+        #[test]
+        fn says_to_use_json_when_piping_into_a_script() {
+            let text = skill_file("SKILL.md");
+            assert!(text.contains("--json") && text.contains("jq"), "SKILL.md");
+        }
+
         #[test]
         fn says_results_are_markdown_ending_with_next_and_never_json() {
             let text = skill_file("SKILL.md");
