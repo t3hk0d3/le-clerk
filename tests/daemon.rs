@@ -1967,3 +1967,188 @@ mod restart_grace {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// One daemon per store
+// ---------------------------------------------------------------------------
+
+mod single_instance {
+    use super::*;
+
+    /// One state dir shared by environments that differ in their run
+    /// directory (`XDG_RUNTIME_DIR`); `CLERK_HOME` is never set. Kept in a
+    /// short temp dir: socket paths are limited to 107 bytes.
+    struct Split {
+        dir: TempDir,
+        pids: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl Drop for Split {
+        fn drop(&mut self) {
+            for pid in self.pids.lock().unwrap().iter() {
+                // A pid always fits a pid_t.
+                unsafe {
+                    libc::kill(pid.cast_signed(), libc::SIGTERM);
+                }
+            }
+            for pid in self.pids.lock().unwrap().iter() {
+                until("the daemon exits", || !alive(*pid));
+            }
+        }
+    }
+
+    impl Split {
+        fn new() -> Self {
+            Self {
+                dir: TempDir::with_prefix("s").unwrap(),
+                pids: std::sync::Mutex::default(),
+            }
+        }
+
+        /// The variables of an environment whose run dir is `run` (none:
+        /// `XDG_RUNTIME_DIR` unset).
+        fn vars(&self, run: Option<&str>) -> Vec<(&'static str, OsString)> {
+            let d = self.dir.path();
+            let mut v = vec![
+                // Empty counts as unset.
+                ("CLERK_HOME", OsString::new()),
+                ("HOME", d.join("h").into_os_string()),
+                ("XDG_STATE_HOME", d.join("s").into_os_string()),
+                ("XDG_CONFIG_HOME", d.join("c").into_os_string()),
+                ("XDG_RUNTIME_DIR", OsString::new()),
+            ];
+            if let Some(run) = run {
+                v[4].1 = d.join(run).into_os_string();
+            }
+            v
+        }
+
+        fn paths(&self, run: Option<&str>) -> Paths {
+            let vars = self.vars(run);
+            Paths::from_lookup(|k| {
+                vars.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.clone())
+            })
+            .unwrap()
+        }
+
+        fn launcher(&self, run: Option<&str>) -> Launcher {
+            Launcher {
+                program: PathBuf::from(env!("CARGO_BIN_EXE_clerk")),
+                env: self
+                    .vars(run)
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v))
+                    .collect(),
+            }
+        }
+
+        async fn start(&self, run: Option<&str>) -> Client {
+            let client = Client::ensure_running_with(&self.paths(run), &self.launcher(run))
+                .await
+                .expect("daemon starts");
+            self.pids.lock().unwrap().push(client.daemon().pid);
+            client
+        }
+
+        /// `clerk daemon` in the foreground, in the environment of `run`.
+        fn foreground(&self, run: Option<&str>) -> std::process::Output {
+            let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"));
+            cmd.arg("daemon").arg("--json");
+            for (k, v) in self.vars(run) {
+                cmd.env(k, v);
+            }
+            cmd.output().unwrap()
+        }
+    }
+
+    mod run {
+        use super::*;
+
+        mod on_a_second_daemon_for_the_same_state_dir_with_a_different_run_dir {
+            use super::*;
+
+            #[tokio::test]
+            async fn exits_with_daemon_already_running() {
+                let s = Split::new();
+                s.start(Some("r1")).await;
+                let out = s.foreground(Some("r2"));
+                assert_eq!(out.status.code(), Some(5), "{out:?}");
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(body["error"]["code"], "daemon_already_running", "{body}");
+            }
+
+            #[tokio::test]
+            async fn leaves_the_first_serving() {
+                let s = Split::new();
+                let first = s.start(Some("r1")).await;
+                s.foreground(Some("r2"));
+                let again = Client::connect(&s.paths(Some("r1"))).await.unwrap();
+                assert_eq!(again.daemon().pid, first.daemon().pid);
+                assert!(!s.paths(Some("r2")).socket.exists());
+            }
+        }
+
+        mod on_start {
+            use super::*;
+
+            #[tokio::test]
+            async fn writes_the_socket_path_to_daemon_addr() {
+                let s = Split::new();
+                s.start(Some("r1")).await;
+                let paths = s.paths(Some("r1"));
+                let written = fs::read_to_string(paths.addr_file()).unwrap();
+                assert_eq!(Path::new(written.trim()), paths.socket);
+            }
+        }
+    }
+
+    mod connect {
+        use super::*;
+
+        mod on_xdg_runtime_dir_unset_while_the_daemon_was_started_with_it_set {
+            use super::*;
+
+            #[tokio::test]
+            async fn connects_to_the_running_daemon_via_daemon_addr() {
+                let s = Split::new();
+                let first = s.start(Some("r1")).await;
+                let found = Client::ensure_running_with(&s.paths(None), &s.launcher(None))
+                    .await
+                    .unwrap();
+                assert_eq!(found.daemon().pid, first.daemon().pid);
+            }
+
+            #[tokio::test]
+            async fn does_not_start_a_second_daemon() {
+                let s = Split::new();
+                s.start(Some("r1")).await;
+                let bare = s.paths(None);
+                Client::ensure_running_with(&bare, &s.launcher(None))
+                    .await
+                    .unwrap();
+                assert!(!bare.socket.exists());
+                assert!(!bare.lock.exists());
+            }
+        }
+
+        mod on_a_stale_daemon_addr {
+            use super::*;
+
+            #[tokio::test]
+            async fn falls_back_to_the_default_path_and_starts_a_daemon() {
+                let s = Split::new();
+                let paths = s.paths(None);
+                fs::create_dir_all(paths.addr_file().parent().unwrap()).unwrap();
+                let gone = s.dir.path().join("gone.sock");
+                fs::write(paths.addr_file(), gone.as_os_str().as_encoded_bytes()).unwrap();
+                let client = s.start(None).await;
+                assert!(paths.socket.exists());
+                let written = fs::read_to_string(paths.addr_file()).unwrap();
+                assert_eq!(Path::new(written.trim()), paths.socket);
+                assert!(client.daemon().pid > 0);
+            }
+        }
+    }
+}

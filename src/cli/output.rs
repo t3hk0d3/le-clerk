@@ -9,6 +9,7 @@ use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 use leclerk::client::{ApiError, DaemonError};
+use leclerk::daemon::RunError;
 use leclerk::error::ErrorCode;
 use leclerk::scope::ScopeError;
 use serde::Serialize;
@@ -173,6 +174,18 @@ impl From<anyhow::Error> for Failure {
             Ok(daemon) => return daemon.into(),
             Err(e) => e,
         };
+        let e = match e.downcast::<RunError>() {
+            Ok(run @ RunError::AlreadyRunning { .. }) => {
+                return Self {
+                    code: "daemon_already_running".to_owned(),
+                    message: run.to_string(),
+                    details: None,
+                    exit: EXIT_DAEMON,
+                };
+            }
+            Ok(other) => anyhow::Error::new(other),
+            Err(e) => e,
+        };
         let e = match e.downcast::<UsageError>() {
             Ok(usage) => return usage.into(),
             Err(e) => e,
@@ -210,6 +223,7 @@ fn exit_for(code: &str) -> u8 {
     match code {
         "not_found" | "unknown_method" => EXIT_NOT_FOUND,
         "daemon_unavailable"
+        | "daemon_already_running"
         | "daemon_unresponsive"
         | "protocol_mismatch"
         | "daemon_restarting"

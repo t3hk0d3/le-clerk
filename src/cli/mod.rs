@@ -426,6 +426,10 @@ async fn manage_daemon(ctx: &Ctx, action: DaemonAction) -> anyhow::Result<()> {
         DaemonAction::Status => match Client::probe(&ctx.paths).await {
             Ok(info) => Some(info),
             Err(DaemonError::Unavailable) => None,
+            // The daemon cannot run here: not running, with the reason.
+            Err(DaemonError::SocketPathTooLong(e)) => {
+                return ctx.out.emit(&not_running_view(&e.to_string()));
+            }
             Err(e) => return Err(e.into()),
         },
         DaemonAction::Stop => {
@@ -435,6 +439,14 @@ async fn manage_daemon(ctx: &Ctx, action: DaemonAction) -> anyhow::Result<()> {
         DaemonAction::Restart => Some(Client::restart(&ctx.paths, &caller).await?.daemon().clone()),
     };
     ctx.out.emit(&daemon_view(action, info))
+}
+
+fn not_running_view(reason: &str) -> View {
+    let text = format!("The clerk daemon is not running: {reason}");
+    View::new(
+        json!({"running": false, "reason": reason}),
+        move |_: &Value| text.clone(),
+    )
 }
 
 fn daemon_view(action: DaemonAction, info: Option<DaemonInfo>) -> View {

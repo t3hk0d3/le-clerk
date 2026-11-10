@@ -299,7 +299,6 @@ pub fn cli_caller() -> Caller {
 pub struct Client {
     /// Where the daemon lives, to reconnect to it (see [`Client::reconnect`]).
     paths: Paths,
-    socket: PathBuf,
     daemon: DaemonInfo,
     /// The agent session's host, sent with every request (see
     /// [`Client::with_host`]).
@@ -329,7 +328,6 @@ impl Client {
         daemon.check()?;
         Ok(Self {
             paths: paths.clone(),
-            socket: paths.socket.clone(),
             daemon,
             host: None,
             told_stopped: Arc::default(),
@@ -348,6 +346,7 @@ impl Client {
 
     /// [`Client::probe`], giving up after `limit`.
     async fn probe_within(paths: &Paths, limit: Duration) -> Result<DaemonInfo, DaemonError> {
+        let paths = &effective(paths);
         check_socket_path(&paths.socket)?;
         let (status, body) = send(&paths.socket, Method::GET, "/v1/version", None, limit)
             .await
@@ -418,7 +417,7 @@ impl Client {
             let ours_gone = child
                 .as_mut()
                 .is_none_or(|c| c.try_wait().map_or(true, |s| s.is_some()));
-            if ours_gone && spawns < MAX_SPAWNS && lock_free(&paths.lock) {
+            if ours_gone && spawns < MAX_SPAWNS && lock_free(&effective(paths).lock) {
                 spawns += 1;
                 match launcher.spawn(paths) {
                     Ok(c) => child = Some(c),
@@ -484,11 +483,11 @@ impl Client {
         };
         let client = Self {
             paths: paths.clone(),
-            socket: paths.socket.clone(),
             daemon,
             host: None,
             told_stopped: Arc::default(),
         };
+        let socket = client.socket();
         let deadline = Instant::now() + STOP_TIMEOUT;
         let left = || deadline.saturating_duration_since(Instant::now());
         // `restart` is sent only when set; a daemon that predates it refuses
@@ -509,7 +508,7 @@ impl Client {
             return Err(DaemonError::Unavailable);
         }
         let mut backoff = BACKOFF_MIN;
-        while paths.socket.exists() {
+        while socket.exists() {
             if Instant::now() >= deadline {
                 return Err(DaemonError::Unavailable);
             }
@@ -571,6 +570,11 @@ impl Client {
             tokio::time::sleep(pause).await;
             pause = (pause * 2).min(BACKOFF_MAX);
         }
+    }
+
+    /// The socket the daemon answers on now (see [`effective`]).
+    fn socket(&self) -> PathBuf {
+        effective(&self.paths).socket
     }
 
     /// Whether the daemon that went away was stopped on purpose.
@@ -664,7 +668,7 @@ impl Client {
         let body = serde_json::to_vec(&body)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let path = format!("/v1/rpc/{method}");
-        let (status, body) = send(&self.socket, Method::POST, &path, Some(body), limit)
+        let (status, body) = send(&self.socket(), Method::POST, &path, Some(body), limit)
             .await
             .map_err(|e| ApiError::unavailable(&e))?;
         decode(status, &body)
@@ -729,7 +733,7 @@ impl Client {
         let path = format!("/v1/notices?{query}");
         let wait = Duration::from_secs(secs).min(crate::engine::MAX_WAIT);
         let (status, body) = send(
-            &self.socket,
+            &self.socket(),
             Method::GET,
             &path,
             None,
@@ -781,7 +785,7 @@ impl Client {
         let path = format!("/v1/agent/wait?{query}");
         let wait = Duration::from_secs(secs).min(crate::engine::MAX_WAIT);
         let (status, body) = send(
-            &self.socket,
+            &self.socket(),
             Method::GET,
             &path,
             None,
@@ -800,7 +804,7 @@ impl Client {
         let body = serde_json::to_vec(&json!({ "session": session, "arm": arm }))
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let (status, body) = send(
-            &self.socket,
+            &self.socket(),
             Method::POST,
             "/v1/agent/disarm",
             Some(body),
@@ -819,7 +823,7 @@ impl Client {
         let body = serde_json::to_vec(&json!({ "session": session, "ids": ids }))
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let (status, body) = send(
-            &self.socket,
+            &self.socket(),
             Method::POST,
             "/v1/agent/ack",
             Some(body),
@@ -838,6 +842,29 @@ fn reconnects(code: &str) -> bool {
         code,
         "daemon_restarting" | "daemon_unavailable" | "engine_unavailable"
     )
+}
+
+/// `paths`, with the daemon's own socket and lock where `daemon.addr` names
+/// a daemon that holds its lock: one daemon serves a store whatever run
+/// directory its environment gave it. A missing, unreadable or stale address
+/// (no socket, or nobody holds the lock beside it) leaves `paths` as given.
+fn effective(paths: &Paths) -> Paths {
+    let Ok(text) = fs::read_to_string(paths.addr_file()) else {
+        return paths.clone();
+    };
+    let socket = PathBuf::from(text.trim());
+    if !socket.is_absolute() || !socket.exists() {
+        return paths.clone();
+    }
+    let lock = socket.with_file_name("daemon.lock");
+    if lock_free(&lock) {
+        return paths.clone();
+    }
+    Paths {
+        socket,
+        lock,
+        ..paths.clone()
+    }
 }
 
 /// Why a daemon did not answer: [`DaemonError::Unavailable`] when nothing

@@ -100,6 +100,7 @@ impl Store {
     }
 
     fn init(mut conn: Connection) -> Result<Self, StoreError> {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // journal_mode returns a row, so it must be read as a query.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;

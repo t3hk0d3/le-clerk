@@ -9,6 +9,10 @@
 //! removed, and only then the lock released, so a successor never finds a
 //! socket that belongs to nobody it could not remove.
 //!
+//! A second lock, [`Paths::store_lock`], is held beside it for the daemon's
+//! whole life: one daemon per store, whatever run directory it uses. The
+//! socket path is recorded in [`Paths::addr_file`] so clients find it.
+//!
 //! A deliberate stop (`daemon_stop`, SIGTERM, SIGINT; not a restart) leaves
 //! a marker ([`Paths::stop_marker`]), written before the listener closes:
 //! while it exists, waiting clients do not start a daemon. The next daemon
@@ -61,6 +65,12 @@ pub enum RunError {
         /// The underlying error.
         source: io::Error,
     },
+    /// Another daemon serves this store (from another run directory).
+    #[error("another clerk daemon already serves this store (lock {})", lock.display())]
+    AlreadyRunning {
+        /// The store lock another daemon holds.
+        lock: PathBuf,
+    },
     /// The socket path is too long for a Unix socket.
     #[error(transparent)]
     SocketPathTooLong(#[from] SocketPathTooLong),
@@ -99,6 +109,13 @@ pub fn run(paths: &Paths, config: Config) -> Result<(), RunError> {
     let Some(lock) = take_lock(&paths.lock)? else {
         return Ok(());
     };
+    // One daemon per store, whatever run directory it uses; held until exit
+    // (the kernel drops it on a crash too).
+    let Some(store_lock) = take_lock(&paths.store_lock())? else {
+        return Err(RunError::AlreadyRunning {
+            lock: paths.store_lock(),
+        });
+    };
     init_logging(&paths.log)?;
     remove_stop_marker(&paths.stop_marker());
     let info = ServerInfo {
@@ -114,6 +131,7 @@ pub fn run(paths: &Paths, config: Config) -> Result<(), RunError> {
 
     remove_stale_socket(&paths.socket)?;
     let listener = bind_private(&paths.socket)?;
+    write_addr(&paths.addr_file(), &paths.socket)?;
     let result = start_and_serve(paths, config, listener, &info);
     match &result {
         Ok(()) => tracing::info!("daemon stopped"),
@@ -124,7 +142,13 @@ pub fn run(paths: &Paths, config: Config) -> Result<(), RunError> {
     {
         tracing::warn!(error = %e, "cannot remove the socket");
     }
+    if let Err(e) = fs::remove_file(paths.addr_file())
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(error = %e, "cannot remove the daemon address");
+    }
     // Released last: a successor may start only once the socket is gone.
+    drop(store_lock);
     drop(lock);
     result
 }
@@ -273,6 +297,13 @@ fn remove_stop_marker(path: &Path) {
     {
         tracing::warn!(error = %e, "cannot remove the stop marker");
     }
+}
+
+/// Record `socket` in `addr` (replacing it atomically).
+fn write_addr(addr: &Path, socket: &Path) -> Result<(), RunError> {
+    let tmp = addr.with_extension("addr.tmp");
+    fs::write(&tmp, socket.as_os_str().as_encoded_bytes()).map_err(io_at(&tmp))?;
+    fs::rename(&tmp, addr).map_err(io_at(addr))
 }
 
 fn parent(path: &Path) -> &Path {

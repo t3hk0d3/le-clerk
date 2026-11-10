@@ -1615,6 +1615,31 @@ mod cli {
         }
     }
 
+    mod daemon_status {
+        use super::*;
+
+        mod on_a_socket_path_over_the_limit {
+            use super::*;
+
+            #[test]
+            fn prints_the_reason_with_running_false_and_exits_0() {
+                let env = Env::new();
+                let long = env.home().join("a".repeat(120));
+                let out = env
+                    .cmd()
+                    .env("CLERK_HOME", &long)
+                    .args(["daemon", "status"])
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.code(), Some(0), "{out:?}");
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(body["running"], false);
+                let reason = body["reason"].as_str().unwrap();
+                assert!(reason.contains("107-byte limit"), "{reason}");
+            }
+        }
+    }
+
     mod error_output {
         use super::*;
 

@@ -271,6 +271,20 @@ impl Paths {
         self.db.with_file_name("stopped")
     }
 
+    /// The lock a daemon holds for its whole life, whatever run directory
+    /// it uses: one daemon per store.
+    #[must_use]
+    pub fn store_lock(&self) -> PathBuf {
+        self.db.with_file_name("clerk.db.lock")
+    }
+
+    /// Where the running daemon records its socket path, so clients with
+    /// another run directory find it.
+    #[must_use]
+    pub fn addr_file(&self) -> PathBuf {
+        self.db.with_file_name("daemon.addr")
+    }
+
     fn under(run: &std::path::Path, state: &std::path::Path, config: &std::path::Path) -> Self {
         Self {
             socket: run.join("clerk.sock"),
