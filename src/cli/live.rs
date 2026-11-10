@@ -17,12 +17,14 @@ use std::time::Duration;
 use crossterm::terminal;
 use leclerk::client::wire::{NoticeKind, NoticeView};
 use leclerk::client::{ApiError, Client};
-use leclerk::model::{Caller, HolderRef};
+use leclerk::model::{Caller, HolderRef, NoticeId};
+use leclerk::store::notices;
 use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
+use super::caller;
 use super::lease;
 use super::output::{EXIT_INTERRUPTED, Exit, Mode};
 use super::render::{self, Style};
@@ -128,21 +130,23 @@ pub enum Phase {
     Held { lease: String },
 }
 
-/// One long-poll for `holder`'s notices about what `phase` names, owning
-/// what it needs so it can outlive a loop iteration (dropping it would lose
-/// the notices it took). The holder's other notices stay pending: an agent
-/// session reads them itself.
-fn poll(client: &Client, holder: &HolderRef, phase: &Phase) -> PollFuture {
-    let filter = match phase {
+/// Acknowledge `handled`, then one long-poll for `caller`'s notices about
+/// what `phase` names, owning what it needs so it can outlive a loop
+/// iteration. The holder's other notices stay pending: an agent session
+/// reads them itself, so for a held lease it is asked only for the lease's
+/// end, the one notice the view acts on.
+fn poll(client: &Client, caller: &Caller, phase: &Phase, handled: Vec<NoticeId>) -> PollFuture {
+    let mut filter = match phase {
         Phase::Queued { request } => lease::filter(&[], &[request]),
         Phase::Offered { request, lease } => lease::filter(&[lease], &[request]),
         Phase::Held { lease } => lease::filter(&[lease], &[]),
     };
-    let (client, holder) = (client.clone(), holder.clone());
+    if matches!(phase, Phase::Held { .. }) && caller::is_agent(caller) {
+        filter.kinds = Some(vec![notices::NoticeKind::LeaseEnded]);
+    }
+    let (client, caller) = (client.clone(), caller.clone());
     Box::pin(async move {
-        client
-            .wait_notices_matching(&holder, Some(&filter), lease::POLL_SECS)
-            .await
+        lease::ack_then_wait(&client, &caller, &filter, lease::POLL_SECS, handled).await
     })
 }
 
@@ -235,7 +239,7 @@ impl View<'_> {
         {
             return Ok(());
         }
-        let mut notices = poll(self.client, &self.caller.holder, &self.phase());
+        let mut notices = poll(self.client, self.caller, &self.phase(), Vec::new());
         let mut failures = 0u32;
         loop {
             tokio::select! {
@@ -279,14 +283,22 @@ impl View<'_> {
                             Vec::new()
                         }
                     };
+                    let mut handled = Vec::new();
                     for n in batch {
-                        if self.on_notice(&n, &mut keys).await? {
-                            return Ok(());
+                        let outcome = self.on_notice(&n, &mut keys).await;
+                        // A failed claim stays pending for whoever reads
+                        // next; a drop that ends the view was handled.
+                        if outcome.is_ok() || n.kind == NoticeKind::QueueDropped {
+                            handled.push(n.id.clone());
+                        }
+                        if !matches!(outcome, Ok(false)) {
+                            lease::acknowledge(self.client, self.caller, &handled).await;
+                            return outcome.map(drop);
                         }
                     }
                     // After the batch: an offer claimed in it moves the
                     // view on to the lease.
-                    notices = poll(self.client, &self.caller.holder, &self.phase());
+                    notices = poll(self.client, self.caller, &self.phase(), handled);
                 }
             }
         }

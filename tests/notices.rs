@@ -439,6 +439,7 @@ mod take_matching {
         NoticeFilter {
             leases: vec![lease.clone()],
             requests: Vec::new(),
+            kinds: None,
         }
     }
 
@@ -451,6 +452,28 @@ mod take_matching {
         let mut n = notice(h, NoticeKind::LeaseEnded, at);
         n.lease_id = Some(lease.clone());
         n
+    }
+
+    mod on_a_filter_with_kinds {
+        use super::*;
+
+        #[test]
+        fn returns_only_notices_of_those_kinds() {
+            let mut f = fixture();
+            let h = holder("h");
+            let ours = LeaseId::new();
+            let ended = about(&h, &ours, T0 + 1);
+            let mut warning = about(&h, &ours, T0);
+            warning.kind = NoticeKind::ExpiryWarning;
+            f.publish(&warning);
+            f.publish(&ended);
+            let filter = NoticeFilter {
+                kinds: Some(vec![NoticeKind::LeaseEnded]),
+                ..filter_for(&ours)
+            };
+            let got = f.with_tx(|tx| notices::returned(tx, &h, Some(&filter), 10, T0).unwrap());
+            assert_eq!(got.iter().map(|n| &n.id).collect::<Vec<_>>(), [&ended.id]);
+        }
     }
 
     mod on_a_filter {

@@ -117,6 +117,12 @@ impl ApiError {
         )
     }
 
+    /// `not_yours`: the caller asked for what is another holder's.
+    #[must_use]
+    pub fn not_yours(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Conflict, "not_yours", message)
+    }
+
     /// `invalid_request`: the body or query does not parse.
     #[must_use]
     pub fn invalid_request(message: impl Into<String>) -> Self {
@@ -299,7 +305,8 @@ enum Job {
     /// rather than queue behind a health check on its way.
     Command(Box<Command>, Option<Host>, DeferOnCheck, Reply<Value>),
     /// Deliver up to [`NOTICE_BATCH`] pending notices of a holder (with a
-    /// filter, only those it matches).
+    /// filter, only those it matches). In-process only: nothing on the wire
+    /// reaches it, as a lost answer would lose the notices.
     TakeNotices(HolderRef, Option<NoticeFilter>, Reply<Vec<Notice>>),
     /// Return up to [`NOTICE_BATCH`] pending notices of a holder without
     /// delivering them (acknowledged delivery; with a filter, only those it
@@ -665,6 +672,10 @@ impl EngineHandle {
     /// `timeout` (capped at [`MAX_WAIT`]) for one to arrive. Returns an
     /// empty list on timeout.
     ///
+    /// In-process only: delivery here is final, so no answer that can be
+    /// lost on its way to a client may come from it. The wire uses
+    /// [`EngineHandle::wait_returned`].
+    ///
     /// # Errors
     /// A storage failure, or `engine_unavailable`.
     pub async fn wait_notices(
@@ -760,6 +771,30 @@ impl EngineHandle {
                 return Ok(None);
             }
         }
+    }
+
+    /// Up to [`NOTICE_BATCH`] pending notices of `holder` (with `filter`,
+    /// only those it matches), oldest first, waiting up to `timeout` (capped
+    /// at [`MAX_WAIT`]) for one to arrive; empty on timeout. They are
+    /// returned **without** being delivered: they stay pending, and come
+    /// back on the next call, until [`EngineHandle::ack_notices`] names them.
+    ///
+    /// # Errors
+    /// As [`EngineHandle::wait_notices`].
+    pub async fn wait_returned(
+        &self,
+        holder: HolderRef,
+        filter: Option<NoticeFilter>,
+        timeout: Duration,
+    ) -> Result<Vec<Notice>, ApiError> {
+        let got = self
+            .wait_until(&holder, timeout.min(MAX_WAIT), || async {
+                let got = self.return_notices(holder.clone(), filter.clone()).await?;
+                Ok((!got.is_empty()).then_some(got))
+            })
+            .await
+            .map_err(|e| self.announced(e))?;
+        Ok(got.unwrap_or_default())
     }
 
     /// Up to [`NOTICE_BATCH`] pending notices of `holder`, oldest first,

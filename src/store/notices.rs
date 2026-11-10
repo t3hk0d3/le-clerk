@@ -179,22 +179,28 @@ pub fn take(
 }
 
 /// Which of a holder's notices a wait is about: those naming one of these
-/// leases or requests. Used by a CLI command that acts for an agent
-/// session, so the session's other notices stay pending for it.
+/// leases or requests and, with `kinds`, of one of those kinds. Used by a
+/// CLI command that acts for an agent session, so the session's other
+/// notices stay pending for it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoticeFilter {
     pub leases: Vec<LeaseId>,
     pub requests: Vec<RequestId>,
+    /// `None`: every kind.
+    #[serde(default)]
+    pub kinds: Option<Vec<NoticeKind>>,
 }
 
 impl NoticeFilter {
-    /// True when `n` names one of the filter's leases or requests.
+    /// True when `n` names one of the filter's leases or requests and is
+    /// of one of its kinds.
     #[must_use]
     pub fn matches(&self, n: &Notice) -> bool {
-        n.lease_id.as_ref().is_some_and(|l| self.leases.contains(l))
+        let named = n.lease_id.as_ref().is_some_and(|l| self.leases.contains(l))
             || n.request_id
                 .as_ref()
-                .is_some_and(|r| self.requests.contains(r))
+                .is_some_and(|r| self.requests.contains(r));
+        named && self.kinds.as_ref().is_none_or(|k| k.contains(&n.kind))
     }
 }
 
@@ -345,12 +351,14 @@ fn select_pending(
                         json_extract(payload, '$.lease_id') IN (SELECT value FROM json_each(?2)) \
                         OR json_extract(payload, '$.request_id') IN (SELECT value FROM json_each(?3)) \
                       ELSE 0 END) \
+                 AND (?4 IS NULL OR kind IN (SELECT value FROM json_each(?4))) \
                  ORDER BY row_id",
             )?;
             let rows = stmt.query(rusqlite::params![
                 holder,
                 serde_json::to_string(&f.leases)?,
                 serde_json::to_string(&f.requests)?,
+                f.kinds.as_ref().map(serde_json::to_string).transpose()?,
             ])?;
             decode_up_to(tx, rows, limit)
         }

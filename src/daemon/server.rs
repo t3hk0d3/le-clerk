@@ -6,10 +6,15 @@
 //!   `200 {"result": ...}` or an error status with
 //!   `{"error": {"code": "...", "message": "..."}}`. The hook methods
 //!   ([`HookCommand::METHODS`]) take the session from their arguments.
-//! - `GET /v1/notices?holder=<url-encoded HolderRef JSON>&wait=<secs, max 60>`
-//!   → `200 {"result": [Notice, ...]}` (the long-poll). Optional
-//!   `leases=<id,id…>` and `requests=<id,id…>` narrow it to notices naming
-//!   one of those; the holder's other notices stay pending.
+//! - `GET /v1/notices?holder=<url-encoded HolderRef JSON>&caller=<url-encoded
+//!   Caller JSON>&wait=<secs, max 60>` → `200 {"result": [Notice, ...]}` (the
+//!   long-poll), or `not_yours` when `holder` is not the caller's. The notices
+//!   stay pending, and come back on the next poll, until acknowledged.
+//!   Optional `leases=<id,id…>` and `requests=<id,id…>` narrow it to notices
+//!   naming one of those, and `kinds=<kind,kind…>` further to those kinds; the
+//!   holder's other notices stay pending.
+//! - `POST /v1/notices/ack` with `{"caller": Caller, "ids": [...]}` →
+//!   `200 {"result": <count marked delivered>}`, for the caller's own holder.
 //!
 //! - `GET /v1/agent/wait?session=<id>&host=<Host JSON>&wait=<secs, max
 //!   60>&first=<bool>&arm=<token>` → `200 {"result": {"status": "notices", "notices":
@@ -87,6 +92,7 @@ pub fn router_with(engine: EngineHandle, info: &ServerInfo) -> Router {
         )
         .route("/v1/rpc/{method}", post(rpc))
         .route("/v1/notices", get(notices))
+        .route("/v1/notices/ack", post(notices_ack))
         .route("/v1/agent/wait", get(agent_wait))
         .route("/v1/agent/ack", post(agent_ack))
         .route("/v1/agent/disarm", post(agent_disarm))
@@ -180,6 +186,8 @@ async fn report(
 struct NoticesQuery {
     /// The holder's JSON encoding.
     holder: String,
+    /// The JSON encoding of who is asking; only its own holder is served.
+    caller: String,
     /// Seconds to wait; capped at 60.
     #[serde(default)]
     wait: u64,
@@ -189,6 +197,10 @@ struct NoticesQuery {
     /// Comma-separated request ids: with `leases`, the filter.
     #[serde(default)]
     requests: Option<String>,
+    /// Comma-separated notice kinds narrowing that filter; absent: every
+    /// kind.
+    #[serde(default)]
+    kinds: Option<String>,
     /// The JSON encoding of the waiting agent session's host.
     #[serde(default)]
     host: Option<String>,
@@ -215,6 +227,7 @@ fn filter_of(query: &NoticesQuery) -> Result<Option<NoticeFilter>, ApiError> {
     Ok(Some(NoticeFilter {
         leases: ids(query.leases.as_deref())?,
         requests: ids(query.requests.as_deref())?,
+        kinds: query.kinds.as_deref().map(|k| ids(Some(k))).transpose()?,
     }))
 }
 
@@ -233,6 +246,18 @@ async fn notices(
                 .into_response();
         }
     };
+    let caller: Caller = match serde_json::from_str(&query.caller) {
+        Ok(c) => c,
+        Err(e) => {
+            return ApiError::invalid_request(format!("caller is not a valid Caller: {e}"))
+                .into_response();
+        }
+    };
+    // Identity is what the client says it is: this guards against mistakes,
+    // not against a client lying.
+    if caller.holder != holder {
+        return ApiError::not_yours("these notices belong to another holder").into_response();
+    }
     let filter = match filter_of(&query) {
         Ok(f) => f,
         Err(e) => return e.into_response(),
@@ -248,8 +273,30 @@ async fn notices(
         return e.into_response();
     }
     let wait = Duration::from_secs(query.wait).min(MAX_WAIT);
-    match engine.wait_notices_matching(holder, filter, wait).await {
+    match engine.wait_returned(holder, filter, wait).await {
         Ok(list) => ok(list),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The body of `POST /v1/notices/ack`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoticesAck {
+    caller: Caller,
+    ids: Vec<NoticeId>,
+}
+
+async fn notices_ack(State(engine): State<EngineHandle>, body: Bytes) -> Response {
+    let ack: NoticesAck = match serde_json::from_slice(&body) {
+        Ok(a) => a,
+        Err(e) => {
+            return ApiError::invalid_request(format!("request body is not valid: {e}"))
+                .into_response();
+        }
+    };
+    match engine.ack_notices(ack.caller.holder, ack.ids).await {
+        Ok(n) => ok(n),
         Err(e) => e.into_response(),
     }
 }

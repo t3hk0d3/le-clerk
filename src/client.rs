@@ -26,8 +26,9 @@ use tokio::net::UnixStream;
 
 use crate::config::{Paths, SocketPathTooLong, check_socket_path};
 use crate::error::ErrorCode;
-use crate::model::{Caller, HolderRef, Host, LeaseId, RequestId};
+use crate::model::{Caller, HolderRef, Host, LeaseId, NoticeId, RequestId};
 use crate::scheduler::liveness;
+use crate::store::enum_text;
 use crate::store::notices::NoticeFilter;
 
 pub mod wire;
@@ -42,6 +43,9 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// The longest one version probe may take: a daemon that bound its socket
 /// but does not answer must not hold up a caller.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Pause before answering a notice poll that brought only notices this
+/// client cannot read.
+const UNREADABLE_PAUSE: Duration = Duration::from_secs(1);
 /// Slack on top of a notice long-poll's own wait.
 const LONG_POLL_SLACK: Duration = Duration::from_secs(5);
 /// The longest an ordinary RPC may take. Generous: a call may run several
@@ -690,46 +694,72 @@ impl Client {
         decode(status, &body)
     }
 
-    /// Deliver `holder`'s pending notices, oldest first, waiting up to
-    /// `secs` seconds (the daemon caps it at 60) for one to arrive. The
-    /// request itself gives up a few seconds after that wait.
+    /// `caller`'s pending notices, oldest first, waiting up to `secs`
+    /// seconds (the daemon caps it at 60) for one to arrive. The request
+    /// itself gives up a few seconds after that wait. They stay pending,
+    /// and come back on the next poll, until [`Client::ack_notices`] names
+    /// them: delivery is at-least-once.
     ///
     /// # Errors
     /// As [`Client::call`].
     pub async fn wait_notices(
         &self,
-        holder: &HolderRef,
+        caller: &Caller,
         secs: u64,
     ) -> Result<Vec<NoticeView>, ApiError> {
-        self.wait_notices_matching(holder, None, secs).await
+        self.wait_notices_matching(caller, None, secs).await
     }
 
-    /// [`Client::wait_notices`], but with `filter` only the notices naming
-    /// one of its leases or requests are delivered (and waited for); the
-    /// holder's other notices stay pending.
+    /// [`Client::wait_notices`], but with `filter` only the notices it
+    /// matches are returned (and waited for).
     ///
     /// # Errors
     /// As [`Client::call`].
     pub async fn wait_notices_matching(
         &self,
-        holder: &HolderRef,
+        caller: &Caller,
         filter: Option<&NoticeFilter>,
         secs: u64,
     ) -> Result<Vec<NoticeView>, ApiError> {
-        self.riding_restarts(|| self.wait_notices_once(holder, filter, secs))
+        self.riding_restarts(|| self.wait_notices_once(caller, filter, secs))
             .await
+    }
+
+    /// Mark `caller`'s notices `ids` delivered. Returns the daemon's count
+    /// of those marked.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub async fn ack_notices(&self, caller: &Caller, ids: &[NoticeId]) -> Result<Value, ApiError> {
+        let body = serde_json::to_vec(&json!({ "caller": caller, "ids": ids }))
+            .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
+        let (status, body) = send(
+            &self.socket(),
+            Method::POST,
+            "/v1/notices/ack",
+            Some(body),
+            CALL_TIMEOUT,
+        )
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+        decode(status, &body)
     }
 
     /// One [`Client::wait_notices_matching`] request.
     async fn wait_notices_once(
         &self,
-        holder: &HolderRef,
+        caller: &Caller,
         filter: Option<&NoticeFilter>,
         secs: u64,
     ) -> Result<Vec<NoticeView>, ApiError> {
-        let holder = serde_json::to_string(holder)
-            .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
-        let mut params = vec![("holder", holder), ("wait", secs.to_string())];
+        let encode = |e: serde_json::Error| ApiError::new("invalid_request", e.to_string());
+        let holder = serde_json::to_string(&caller.holder).map_err(encode)?;
+        let asking = serde_json::to_string(caller).map_err(encode)?;
+        let mut params = vec![
+            ("holder", holder),
+            ("caller", asking),
+            ("wait", secs.to_string()),
+        ];
         if let Some(host) = &self.host {
             params.push(("host", json!(host).to_string()));
         }
@@ -743,6 +773,14 @@ impl Client {
                 "requests",
                 join(f.requests.iter().map(RequestId::as_str).collect()),
             ));
+            if let Some(kinds) = &f.kinds {
+                let names = kinds
+                    .iter()
+                    .map(enum_text)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
+                params.push(("kinds", names.join(",")));
+            }
         }
         let query = serde_urlencoded::to_string(params)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
@@ -757,8 +795,16 @@ impl Client {
         )
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-        wire::parse_notices(decode(status, &body)?)
-            .map_err(|e| ApiError::new("bad_response", e.to_string()))
+        let batch = decode(status, &body)?;
+        let sent = batch.as_array().map_or(0, Vec::len);
+        let notices =
+            wire::parse_notices(batch).map_err(|e| ApiError::new("bad_response", e.to_string()))?;
+        if sent > 0 && notices.is_empty() {
+            // Notices this client cannot read are never acknowledged, so
+            // they come straight back: a waiter must not spin on them.
+            tokio::time::sleep(UNREADABLE_PAUSE).await;
+        }
+        Ok(notices)
     }
 
     /// One step of agent session `session`'s notice wait from `host`, up to

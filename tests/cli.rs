@@ -2569,8 +2569,12 @@ mod cli {
     /// The pending notices of agent session `session`, taken now (agent
     /// sessions cannot run `clerk wait`).
     fn pending_of(env: &Env, session: &str) -> Vec<Value> {
-        let holder = HolderRef::AgentSession {
-            session_id: session.to_owned(),
+        let holder = Caller {
+            holder: HolderRef::AgentSession {
+                session_id: session.to_owned(),
+            },
+            project: None,
+            override_reason: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

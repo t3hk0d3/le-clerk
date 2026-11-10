@@ -1009,6 +1009,7 @@ mod engine {
             NoticeFilter {
                 leases: vec![LeaseId::parse(lease).unwrap()],
                 requests: Vec::new(),
+                kinds: None,
             }
         }
 
@@ -1989,9 +1990,10 @@ mod server {
     mod notices {
         use super::*;
 
-        fn url(holder: &HolderRef, wait: u64) -> String {
-            let json = serde_json::to_string(holder).unwrap();
-            let encoded: String = json
+        /// `value`'s JSON encoding, percent-encoded for a query string.
+        fn encoded(value: &impl serde::Serialize) -> String {
+            serde_json::to_string(value)
+                .unwrap()
                 .bytes()
                 .map(|b| match b {
                     b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
@@ -1999,8 +2001,23 @@ mod server {
                     }
                     _ => format!("%{b:02X}"),
                 })
-                .collect();
-            format!("/v1/notices?holder={encoded}&wait={wait}")
+                .collect()
+        }
+
+        /// The long-poll of `holder`'s notices, asked by `caller`.
+        fn url_as(caller: &Caller, holder: &HolderRef, wait: u64) -> String {
+            let (caller, holder) = (encoded(caller), encoded(holder));
+            format!("/v1/notices?holder={holder}&caller={caller}&wait={wait}")
+        }
+
+        /// The long-poll of `holder`'s notices, asked by `holder` itself.
+        fn url(holder: &HolderRef, wait: u64) -> String {
+            let caller = Caller {
+                holder: holder.clone(),
+                project: None,
+                override_reason: None,
+            };
+            url_as(&caller, holder, wait)
         }
 
         mod on_pending_notices {
@@ -2040,13 +2057,120 @@ mod server {
             }
         }
 
+        mod on_pending_notices_not_acknowledged {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_them_again() {
+                let (h, _clock) = spawn();
+                seed_board(&h, &["u1"]).await;
+                let grant = acquire(&h, &user("b"), 60_000).await;
+                ok(
+                    &h,
+                    "release",
+                    &user("b"),
+                    json!({"lease_id": grant["lease_id"]}),
+                )
+                .await;
+                let get = || {
+                    Request::get(url(&holder("b"), 0))
+                        .body(Body::empty())
+                        .unwrap()
+                };
+                let (_, first) = send(&h, get()).await;
+                let (_, second) = send(&h, get()).await;
+                assert_eq!(first["result"].as_array().map(Vec::len), Some(1));
+                assert_eq!(second, first);
+            }
+        }
+
+        mod on_an_acknowledgement {
+            use super::*;
+
+            /// `POST /v1/notices/ack` as `caller`, naming `ids`.
+            fn ack(caller: &Caller, ids: &Value) -> Request<Body> {
+                Request::post("/v1/notices/ack")
+                    .body(Body::from(
+                        json!({"caller": caller, "ids": ids}).to_string(),
+                    ))
+                    .unwrap()
+            }
+
+            /// `b` has one notice, already returned: its id.
+            async fn returned(h: &EngineHandle) -> Value {
+                seed_board(h, &["u1"]).await;
+                let grant = acquire(h, &user("b"), 60_000).await;
+                ok(
+                    h,
+                    "release",
+                    &user("b"),
+                    json!({"lease_id": grant["lease_id"]}),
+                )
+                .await;
+                let req = Request::get(url(&holder("b"), 0))
+                    .body(Body::empty())
+                    .unwrap();
+                let (_, body) = send(h, req).await;
+                json!([body["result"][0]["id"]])
+            }
+
+            #[tokio::test]
+            async fn marks_the_callers_notices_delivered() {
+                let (h, _clock) = spawn();
+                let ids = returned(&h).await;
+                let (status, body) = send(&h, ack(&user("b"), &ids)).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body, json!({"result": 1}));
+            }
+
+            #[tokio::test]
+            async fn leaves_another_holders_notices_pending() {
+                let (h, _clock) = spawn();
+                let ids = returned(&h).await;
+                let (_, body) = send(&h, ack(&user("a"), &ids)).await;
+                assert_eq!(body, json!({"result": 0}));
+            }
+        }
+
+        mod on_a_holder_other_than_the_callers {
+            use super::*;
+
+            #[tokio::test]
+            async fn refuses_with_not_yours() {
+                let (h, _clock) = spawn();
+                let req = Request::get(url_as(&user("a"), &holder("b"), 0))
+                    .body(Body::empty())
+                    .unwrap();
+                let (status, body) = send(&h, req).await;
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert_eq!(error_code(&body), "not_yours");
+            }
+        }
+
         mod on_bad_holder {
             use super::*;
 
             #[tokio::test]
             async fn returns_422_invalid_request() {
                 let (h, _clock) = spawn();
-                let req = Request::get("/v1/notices?holder=nope&wait=0")
+                let caller = encoded(&user("a"));
+                let req = Request::get(format!("/v1/notices?holder=nope&caller={caller}&wait=0"))
+                    .body(Body::empty())
+                    .unwrap();
+                let (status, body) = send(&h, req).await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+                assert_eq!(error_code(&body), "invalid_request");
+            }
+        }
+
+        mod on_no_caller {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_422_invalid_request() {
+                let (h, _clock) = spawn();
+                let who = encoded(&holder("a"));
+                let req = Request::get(format!("/v1/notices?holder={who}&wait=0"))
                     .body(Body::empty())
                     .unwrap();
                 let (status, body) = send(&h, req).await;

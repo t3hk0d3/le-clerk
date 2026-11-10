@@ -27,8 +27,8 @@ use clap::{Args, ValueEnum};
 use leclerk::client::wire::{NoticeKind, NoticeView};
 use leclerk::client::{ApiError, Client};
 use leclerk::clock::{Clock, SystemClock};
-use leclerk::model::{Caller, HolderRef, LeaseId, RequestId, UnitSettings};
-use leclerk::store::notices::NoticeFilter;
+use leclerk::model::{Caller, HolderRef, LeaseId, NoticeId, RequestId, UnitSettings};
+use leclerk::store::notices::{self, NoticeFilter};
 use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::Instant;
@@ -43,6 +43,16 @@ use super::{Ctx, UsageError};
 
 /// Seconds one notice long-poll waits.
 pub const POLL_SECS: u64 = 30;
+/// Seconds one long-poll for an offer waits; also how soon a wait notices
+/// that another consumer of its notice stream settled its request.
+const OFFER_POLL_SECS: u64 = 5;
+/// The notices about its lease `clerk run` acts on in an agent session: the
+/// session's other notices are for its `clerk wait`.
+const RUN_ACTS_ON: [notices::NoticeKind; 3] = [
+    notices::NoticeKind::Overridden,
+    notices::NoticeKind::CleanupWindowStarted,
+    notices::NoticeKind::LeaseEnded,
+];
 /// Pause after a failed notice poll, so a sick daemon is not hammered.
 pub const POLL_RETRY: Duration = Duration::from_secs(1);
 /// Longest default purpose of `clerk run`, in characters.
@@ -413,17 +423,38 @@ pub async fn wait(ctx: &Ctx, args: WaitArgs) -> anyhow::Result<()> {
         let batch = next_batch(&client, &caller).await?;
         if args.once {
             let value = serde_json::to_value(&batch)?;
-            return ctx.out.emit(&View::new(value, move |_| {
-                if batch.is_empty() {
+            let shown = batch.clone();
+            ctx.out.emit(&View::new(value, move |_| {
+                if shown.is_empty() {
                     "No notices arrived.".to_owned()
                 } else {
-                    batch.iter().map(notice_text).collect::<Vec<_>>().join("\n")
+                    shown.iter().map(notice_text).collect::<Vec<_>>().join("\n")
                 }
-            }));
+            }))?;
+            acknowledge_printed(&client, &caller, &batch).await;
+            return Ok(());
         }
-        for n in batch {
+        for n in batch.clone() {
             let value = serde_json::to_value(&n)?;
             ctx.out.emit(&View::new(value, move |_| notice_text(&n)))?;
+        }
+        acknowledge_printed(&client, &caller, &batch).await;
+    }
+}
+
+/// Acknowledge the notices of `batch`, each as the holder it was for: the
+/// user's `clerk wait` reads the notices of several holders.
+async fn acknowledge_printed(client: &Client, caller: &Caller, batch: &[NoticeView]) {
+    for n in batch {
+        match serde_json::from_value(n.holder.clone()) {
+            Ok(holder) => {
+                let owner = Caller {
+                    holder,
+                    ..caller.clone()
+                };
+                acknowledge(client, &owner, std::slice::from_ref(&n.id)).await;
+            }
+            Err(e) => tracing::debug!(error = %e, "a notice of an unknown holder stays pending"),
         }
     }
 }
@@ -518,12 +549,81 @@ pub fn dropped(n: &NoticeView) -> ApiError {
     }
 }
 
+/// Mark `ids` of `caller`'s notices delivered. Best effort: a notice that
+/// stays pending only comes back, and every waiter handles a repeat.
+pub async fn acknowledge(client: &Client, caller: &Caller, ids: &[NoticeId]) {
+    if ids.is_empty() {
+        return;
+    }
+    if let Err(e) = client.ack_notices(caller, ids).await {
+        tracing::debug!(error = %e, "notices not acknowledged; they will come back");
+    }
+}
+
+/// Acknowledge `handled`, then long-poll for the next notices `filter`
+/// matches. One future, so a waiter's `select!` stays live while the daemon
+/// answers the acknowledgement.
+///
+/// # Errors
+/// As [`Client::wait_notices_matching`].
+pub async fn ack_then_wait(
+    client: &Client,
+    caller: &Caller,
+    filter: &NoticeFilter,
+    secs: u64,
+    handled: Vec<NoticeId>,
+) -> Result<Vec<NoticeView>, ApiError> {
+    acknowledge(client, caller, &handled).await;
+    client
+        .wait_notices_matching(caller, Some(filter), secs)
+        .await
+}
+
+/// Where `request` stands, whoever moved it there.
+enum RequestState {
+    Waiting,
+    Offered(String),
+    Held(Value),
+    Gone,
+}
+
+/// Where `request` stands now. `Waiting` when that cannot be told: the
+/// notice poll reports a daemon in trouble.
+async fn request_state(client: &Client, caller: &Caller, request: &str) -> RequestState {
+    let mine = match client.call("list_my_leases", caller, json!({})).await {
+        Ok(mine) => mine,
+        Err(e) => {
+            tracing::debug!(error = %e, "cannot read the request's state");
+            return RequestState::Waiting;
+        }
+    };
+    let (Some(leases), Some(requests)) = (mine["leases"].as_array(), mine["requests"].as_array())
+    else {
+        return RequestState::Waiting;
+    };
+    if let Some(lease) = leases.iter().find(|l| l["request_id"] == request) {
+        return match lease["state"].as_str() {
+            Some("offered") => RequestState::Offered(text(&lease["lease_id"])),
+            Some("held" | "paused") => RequestState::Held(lease.clone()),
+            _ => RequestState::Gone,
+        };
+    }
+    if requests.iter().any(|r| r["request_id"] == request) {
+        RequestState::Waiting
+    } else {
+        RequestState::Gone
+    }
+}
+
 /// Wait for `request`'s offer and claim it; returns the held lease. Only
-/// notices about the request are taken (the holder's others stay pending);
-/// those that are not the offer are shown on stderr. SIGINT, SIGTERM or
-/// SIGHUP cancels the request, and so does a failed wait, so a detached
-/// holder never leaves a request queued behind it. A stopped daemon takes
-/// no cancel: see [`request_after_stop`] for what becomes of the request.
+/// notices about the request are read (the holder's others stay pending);
+/// those that are not the offer are shown on stderr, and each is
+/// acknowledged once handled. Another consumer of an agent session's
+/// notices (its `clerk wait`) may read the offer or the drop first, so every
+/// poll also looks at the request itself. SIGINT, SIGTERM or SIGHUP cancels
+/// the request, and so does a failed wait, so a detached holder never leaves
+/// a request queued behind it. A stopped daemon takes no cancel: see
+/// [`request_after_stop`] for what becomes of the request.
 async fn await_offer(
     ctx: &Ctx,
     client: &Client,
@@ -534,9 +634,10 @@ async fn await_offer(
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let only_ours = filter(&[], &[request]);
+    let mut handled = Vec::new();
     loop {
         let waited = tokio::select! {
-            batch = client.wait_notices_matching(&caller.holder, Some(&only_ours), POLL_SECS) => batch,
+            batch = ack_then_wait(client, caller, &only_ours, OFFER_POLL_SECS, std::mem::take(&mut handled)) => batch,
             _ = interrupt.recv() => {
                 cancel(client, caller, request).await?;
                 return Err(Exit(EXIT_INTERRUPTED).into());
@@ -578,11 +679,32 @@ async fn await_offer(
                 _ => note(|| notice_text(n)),
             }
         }
+        handled = batch.iter().map(|n| n.id.clone()).collect();
         if let Some(e) = gone {
+            acknowledge(client, caller, &handled).await;
             return Err(e.into());
         }
         if let Some(lease) = offer {
-            return Ok(claim(client, caller, &lease).await?);
+            let view = claim(client, caller, &lease).await?;
+            acknowledge(client, caller, &handled).await;
+            return Ok(view);
+        }
+        let state = request_state(client, caller, request).await;
+        if !matches!(state, RequestState::Waiting) {
+            acknowledge(client, caller, &handled).await;
+        }
+        match state {
+            RequestState::Waiting => {}
+            RequestState::Held(view) => return Ok(view),
+            RequestState::Offered(lease) => return Ok(claim(client, caller, &lease).await?),
+            RequestState::Gone => {
+                return Err(ApiError {
+                    code: "queue_dropped".to_owned(),
+                    message: format!("Request {request} is no longer queued and holds no lease."),
+                    details: None,
+                }
+                .into());
+            }
         }
     }
 }
@@ -631,6 +753,7 @@ pub fn filter(leases: &[&str], requests: &[&str]) -> NoticeFilter {
             .iter()
             .filter_map(|r| RequestId::parse(r).ok())
             .collect(),
+        kinds: None,
     }
 }
 
@@ -682,9 +805,15 @@ async fn supervise(
     };
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
-    let only_ours = filter(&[&lease_id], &[]);
-    let wait = || client.wait_notices_matching(&caller.holder, Some(&only_ours), POLL_SECS);
-    let mut notices = Box::pin(wait());
+    let mut only_ours = filter(&[&lease_id], &[]);
+    if caller::is_agent(caller) {
+        only_ours.kinds = Some(RUN_ACTS_ON.to_vec());
+    }
+    let wait = |handled| ack_then_wait(client, caller, &only_ours, POLL_SECS, handled);
+    let mut notices = Box::pin(wait(Vec::new()));
+    // The last batch handled: the poll in flight acknowledges it first, but
+    // the command may end before that poll gets to.
+    let mut unacknowledged = Vec::new();
     let mut stop_at: Option<Instant> = None;
     let mut stopped = false;
     // Off once the daemon was stopped: polling on would only reconnect.
@@ -707,7 +836,8 @@ async fn supervise(
                                 stop_at = Some(stop_at.map_or(at, |s| s.min(at)));
                             }
                         }
-                        notices = Box::pin(wait());
+                        unacknowledged = batch.iter().map(|n| n.id.clone()).collect();
+                        notices = Box::pin(wait(unacknowledged.clone()));
                     }
                     Err(e) if e.code == "daemon_stopping" => {
                         note(|| {
@@ -720,7 +850,7 @@ async fn supervise(
                     Err(e) => {
                         tracing::warn!(error = %e, "cannot read notices; retrying");
                         tokio::time::sleep(POLL_RETRY).await;
-                        notices = Box::pin(wait());
+                        notices = Box::pin(wait(Vec::new()));
                     }
                 }
             }
@@ -739,6 +869,7 @@ async fn supervise(
         }
     };
     let code = exit_code(status);
+    acknowledge(client, caller, &unacknowledged).await;
     give_back(client, caller, &lease_id, code).await;
     Ok(code)
 }
@@ -818,18 +949,24 @@ fn exit_code(status: ExitStatus) -> u8 {
 /// by the user's CLI has its own holder). Waits up to [`POLL_SECS`].
 async fn next_batch(client: &Client, caller: &Caller) -> anyhow::Result<Vec<NoticeView>> {
     if caller::is_agent(caller) {
-        return Ok(client.wait_notices(&caller.holder, POLL_SECS).await?);
+        return Ok(client.wait_notices(caller, POLL_SECS).await?);
     }
     let deadline = Instant::now() + Duration::from_secs(POLL_SECS);
     loop {
         let holders = user_holders(client, caller).await?;
+        let owner = |holder: &HolderRef| Caller {
+            holder: holder.clone(),
+            ..caller.clone()
+        };
         if let [only] = holders.as_slice() {
             let left = deadline.saturating_duration_since(Instant::now());
-            return Ok(client.wait_notices(only, left.as_secs().max(1)).await?);
+            return Ok(client
+                .wait_notices(&owner(only), left.as_secs().max(1))
+                .await?);
         }
         let mut batch = Vec::new();
         for holder in &holders {
-            batch.extend(client.wait_notices(holder, 0).await?);
+            batch.extend(client.wait_notices(&owner(holder), 0).await?);
         }
         if !batch.is_empty() || Instant::now() >= deadline {
             return Ok(batch);

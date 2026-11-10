@@ -291,7 +291,17 @@ async fn notice_of(client: &Client, who: &HolderRef, kind: NoticeKind) -> Notice
     let deadline = Instant::now() + PATIENCE;
     loop {
         assert!(Instant::now() < deadline, "no {kind:?} notice for {who:?}");
-        let got = client.wait_notices(who, 5).await.expect("wait_notices");
+        let got = client
+            .wait_notices(
+                &Caller {
+                    holder: who.clone(),
+                    project: None,
+                    override_reason: None,
+                },
+                5,
+            )
+            .await
+            .expect("wait_notices");
         if let Some(n) = got.into_iter().find(|n| n.kind == kind) {
             return n;
         }
@@ -858,7 +868,9 @@ mod daemon {
                 let patience = Instant::now() + PATIENCE;
                 while started.len() < 2 {
                     assert!(Instant::now() < patience, "got only {started:?}");
-                    let got = client.wait_notices(&holder("a"), 5).await.unwrap();
+                    let got = client.wait_notices(&user("a"), 5).await.unwrap();
+                    let ids: Vec<_> = got.iter().map(|n| n.id.clone()).collect();
+                    client.ack_notices(&user("a"), &ids).await.unwrap();
                     started.extend(
                         got.into_iter()
                             .filter(|n| n.kind == NoticeKind::CleanupWindowStarted),
@@ -1133,7 +1145,7 @@ mod daemon {
                     let h = Harness::new();
                     fake_daemon(&h.paths, "daemon_stopping");
                     let poller = Client::connect(&h.paths).await.unwrap();
-                    let outcome = poller.wait_notices(&holder("idle"), 1).await;
+                    let outcome = poller.wait_notices(&user("idle"), 1).await;
                     assert_eq!(outcome.unwrap_err().code, "daemon_stopping");
                     // The daemon is gone and left no marker: only the
                     // announcement is left to go by.
@@ -1173,7 +1185,7 @@ mod daemon {
                     let client = Client::connect(&h.paths).await.unwrap();
                     let _ = tokio::time::timeout(
                         Duration::from_secs(1),
-                        client.wait_notices(&holder("idle"), 1),
+                        client.wait_notices(&user("idle"), 1),
                     )
                     .await;
                     let served = polls.load(Ordering::SeqCst);
@@ -1226,11 +1238,78 @@ mod daemon {
                     json!({"lease_id": grant["lease_id"]}),
                 )
                 .await;
-                let got = client.wait_notices(&holder("a"), 5).await.unwrap();
+                let got = client.wait_notices(&user("a"), 5).await.unwrap();
                 assert!(
                     got.iter()
                         .any(|n| n.kind == NoticeKind::CleanupWindowStarted)
                 );
+            }
+
+            mod on_notices_acknowledged {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn does_not_return_them_again() {
+                    let h = Harness::new();
+                    let client = h.start().await;
+                    seed_board(&client).await;
+                    let grant = acquire(&client, &user("a"), 60_000).await;
+                    ok(
+                        &client,
+                        "release",
+                        &user("a"),
+                        json!({"lease_id": grant["lease_id"]}),
+                    )
+                    .await;
+                    let got = client.wait_notices(&user("a"), 5).await.unwrap();
+                    let ids: Vec<_> = got.iter().map(|n| n.id.clone()).collect();
+                    client.ack_notices(&user("a"), &ids).await.unwrap();
+                    let again = client.wait_notices(&user("a"), 0).await.unwrap();
+                    assert_eq!(again, Vec::<NoticeView>::new());
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn leaves_them_pending_when_another_holder_acknowledges() {
+                    let h = Harness::new();
+                    let client = h.start().await;
+                    seed_board(&client).await;
+                    let grant = acquire(&client, &user("a"), 60_000).await;
+                    ok(
+                        &client,
+                        "release",
+                        &user("a"),
+                        json!({"lease_id": grant["lease_id"]}),
+                    )
+                    .await;
+                    let got = client.wait_notices(&user("a"), 5).await.unwrap();
+                    let ids: Vec<_> = got.iter().map(|n| n.id.clone()).collect();
+                    client.ack_notices(&user("b"), &ids).await.unwrap();
+                    let again = client.wait_notices(&user("a"), 0).await.unwrap();
+                    assert_eq!(again, got);
+                }
+            }
+
+            mod on_a_response_the_client_never_read {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn returns_the_notices_again_on_the_next_poll() {
+                    let h = Harness::new();
+                    let client = h.start().await;
+                    seed_board(&client).await;
+                    let grant = acquire(&client, &user("a"), 60_000).await;
+                    ok(
+                        &client,
+                        "release",
+                        &user("a"),
+                        json!({"lease_id": grant["lease_id"]}),
+                    )
+                    .await;
+                    let thrown_away = client.wait_notices(&user("a"), 5).await.unwrap();
+                    assert_ne!(thrown_away, Vec::<NoticeView>::new());
+                    let again = client.wait_notices(&user("a"), 0).await.unwrap();
+                    assert_eq!(again, thrown_away);
+                }
             }
 
             mod on_filter {
@@ -1252,13 +1331,14 @@ mod daemon {
                     let elsewhere = NoticeFilter {
                         leases: vec![LeaseId::new()],
                         requests: vec![RequestId::new()],
+                        kinds: None,
                     };
                     let filtered = client
-                        .wait_notices_matching(&holder("a"), Some(&elsewhere), 1)
+                        .wait_notices_matching(&user("a"), Some(&elsewhere), 1)
                         .await
                         .unwrap();
                     assert_eq!(filtered, Vec::<NoticeView>::new());
-                    let rest = client.wait_notices(&holder("a"), 5).await.unwrap();
+                    let rest = client.wait_notices(&user("a"), 5).await.unwrap();
                     assert!(
                         rest.iter()
                             .any(|n| n.kind == NoticeKind::CleanupWindowStarted),
@@ -1277,9 +1357,10 @@ mod daemon {
                     let ours = NoticeFilter {
                         leases: vec![LeaseId::parse(id).unwrap()],
                         requests: Vec::new(),
+                        kinds: None,
                     };
                     let got = client
-                        .wait_notices_matching(&holder("a"), Some(&ours), 5)
+                        .wait_notices_matching(&user("a"), Some(&ours), 5)
                         .await
                         .unwrap();
                     assert!(

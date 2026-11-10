@@ -222,6 +222,24 @@ mod client_notice_parsing {
         use super::*;
 
         #[test]
+        fn pauses_when_nothing_in_the_batch_can_be_read() {
+            let daemon = NewerDaemon::new(json!({}), vec![json!([{"kind": "offered"}])]);
+            let paths = daemon.paths.clone();
+            let took = daemon.runtime.block_on(async move {
+                let client = Client::connect(&paths).await.unwrap();
+                let who = Caller {
+                    holder: HolderRef::User { tag: "me".into() },
+                    project: None,
+                    override_reason: None,
+                };
+                let started = std::time::Instant::now();
+                client.wait_notices(&who, 0).await.unwrap();
+                started.elapsed()
+            });
+            assert!(took >= Duration::from_millis(500), "took {took:?}");
+        }
+
+        #[test]
         fn keeps_the_rest_of_the_batch() {
             let daemon = NewerDaemon::new(
                 json!({}),
@@ -233,7 +251,11 @@ mod client_notice_parsing {
             let paths = daemon.paths.clone();
             let got = daemon.runtime.block_on(async move {
                 let client = Client::connect(&paths).await.unwrap();
-                let who = HolderRef::User { tag: "me".into() };
+                let who = Caller {
+                    holder: HolderRef::User { tag: "me".into() },
+                    project: None,
+                    override_reason: None,
+                };
                 client.wait_notices(&who, 0).await.unwrap()
             });
             assert_eq!(
