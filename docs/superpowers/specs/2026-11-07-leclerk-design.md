@@ -2,7 +2,7 @@
 
 *"Un moment, s'il vous plaît… your esp32 is being prepared."*
 
-Status: draft for review · Date: 2026-11-07 · Binary: `clerk`
+Status: draft for review · Date: 2026-11-07 (agent interface revised 2026-11-10: CLI only, no MCP) · Binary: `clerk`
 
 ## 1. Intent
 
@@ -44,7 +44,7 @@ messages and docs may keep that tone, provided they stay clear.
 - More than one machine: resources and agents are local to one host and one OS
   user.
 - Agent harnesses other than Claude Code. The design should not block them,
-  and choosing MCP Tasks helps here, but nothing is built or tested for them.
+  and a plain CLI keeps that open, but nothing is built or tested for them.
 - Enforcement: blocking an agent from touching a unit it doesn't hold. Le Clerk
   is advisory, like most of the prior art. Enforcement hooks are a later phase.
 - Restoring units after use, such as reflashing firmware. The next holder
@@ -148,7 +148,7 @@ agent session started in. A session's project is fixed when it connects
 - **The clash is always reported** (user decision):
   - creating either resource returns a warning naming the shadowed or
     shadowing resource;
-  - `resource_list`, `resource_get` and `clerk status` mark a project resource
+  - `clerk resources`, `clerk resource show` and `clerk status` mark a project resource
     that hides a user/system one.
 
 ### 4.3 Types and duplicate detection
@@ -294,8 +294,8 @@ Agents working with a resource need context: what it is, how to use it, what
 - **Where agents see them:**
   - on grant (offered or held) and in the agent's own lease status: both
     descriptions and the rendered usage;
-  - `resource_list` and listings: descriptions only, to keep them short;
-  - `resource_get`: everything, with usage as the raw template so it can be
+  - `clerk resources` and listings: descriptions only, to keep them short;
+  - `clerk resource show`: everything, with usage as the raw template so it can be
     edited.
 - **Who writes them:** agents on create and update (the skill asks them to fill
   both in when they register something, §8.3); the user through the CLI
@@ -319,7 +319,7 @@ knowing resource IDs (user decision).
   - duplicates collapse to one, and tags are stored sorted;
   - anything else is refused (`invalid_tag`, `too_many_tags`). Uppercase is
     refused, not lowercased, so agents learn the format.
-- **Search** (user decision: a filter, not a lease): `resource_list` takes
+- **Search** (user decision: a filter, not a lease): `clerk resources` takes
   tags and returns the visible resources that carry **all** of them (my call:
   more tags narrow the search). The agent then picks a resource and leases it
   as usual. The clerk never leases "any resource with tag X".
@@ -331,7 +331,7 @@ knowing resource IDs (user decision).
   adds and removes individual tags (my call: both, applied atomically, so the
   CLI's `--add-tag` cannot lose a concurrent change). Tag changes are
   inventory changes and are audited (§8.5).
-- **Where they appear:** `resource_list`, `resource_get`, `clerk resources`,
+- **Where they appear:** `clerk resources`, `clerk resource show`,
   `clerk status`, the grant and the agent's lease status. Exports carry them.
 - Duplicate detection ignores tags (§4.3).
 
@@ -375,12 +375,12 @@ end time) or **queued** (position, estimated wait from declared durations).
   passes.
 - **Claiming an asynchronous grant** (my call).
   - A grant made while the agent is waiting starts as **offered**. The agent
-    must claim it, with `lease_claim` or any lease call carrying the lease ID,
+    must claim it, with `clerk claim` or any lease call carrying the lease ID,
     within a claim window (default 5 min).
   - An unclaimed offer goes to the next waiter. The requester's queue entry is
     dropped, with a notice.
   - The lease clock starts at claim time.
-  - A grant returned directly from `lease_acquire` is claimed at once.
+  - A grant returned directly from `clerk acquire` is claimed at once.
   - This stops a board from sitting idle while its new owner hasn't noticed.
 - A paused holder whose unit is lent out (§5.5) is **ahead of the whole queue**
   for that unit.
@@ -491,7 +491,7 @@ Notices tell an agent that something happened:
 - cleanup window ending;
 - unit handed over to you without confirmed cleanup.
 
-**Constraint: only documented Claude Code and MCP mechanisms.** Two kinds were
+**Constraint: only documented Claude Code mechanisms.** Two kinds were
 spiked and rejected, and must not be used:
 - writing JSON lines into Claude Code's per-session inbox socket from outside;
 - forging the `<cross-session-message>` envelope.
@@ -499,46 +499,62 @@ spiked and rejected, and must not be used:
 They worked, but they are undocumented. Agents also treated those messages with
 suspicion. See Appendix A.
 
+**No MCP (user decision, 2026-11-10).** Agents reach the clerk only through
+the `clerk` CLI from their Bash tool, taught by one skill and backed by hooks
+(§8.3, §9). Phase 3 built an MCP server; it is removed. Appendix C has the
+spike that showed the CLI is enough.
+
 The notices themselves are an event stream on the daemon. Getting them to
 agents works in layers:
 
-1. **Primary: MCP Tasks.**
-   - The tools that can take a long time, `lease_acquire` when the request is
-     queued and `lease_wait`, declare task support.
-   - A client that supports tasks gets a task handle at once and the result
-     when it completes. In Claude Code, an idle session starts on a completed
-     task's result unprompted.
-   - This is the protocol-level mechanism, which also makes porting to other
-     agents easier. The user explicitly favoured it for that reason.
-2. **Fallback: a blocking `lease_wait`.**
-   - For clients without tasks, `lease_wait` simply blocks until there is a
-     notice.
-   - Claude Code moves an MCP call still running after 2 minutes to a
-     background task and delivers the result later, waking an idle session.
-     This was verified in the spike.
-   - While it waits, the server sends progress notifications. That keeps the
-     call alive past the idle limit, about 30 minutes for stdio servers. This is
-     documented but not yet verified, see §11.
-3. **Re-arming.**
-   - `lease_wait` returns one batch of notices and ends. Its result tells the
-     agent to call it again while it holds or waits for anything.
+1. **Primary: a background `clerk wait`.**
+   - The agent keeps one `clerk wait` running with the Bash tool's
+     `run_in_background` while it holds or waits for anything.
+   - `clerk wait` blocks until there are notices for the agent, claims any
+     offer among them (waiting proves the agent is present), prints them and
+     exits.
+   - Claude Code starts a turn in an idle session when a background command
+     completes (verified, Appendix C). The completion notice carries only the
+     path of the command's output file, so the skill and every notice tell the
+     agent to read it.
+   - A local interactive session has no time limit on background commands
+     (documented). Unattended sessions (`-p`, Agent SDK) do: 30 min by
+     default, up to 2 h with the `timeout` passed with `run_in_background`. My
+     call: `clerk wait` has no limit of its own; the skill asks for the 2 h
+     `timeout`, and a wait killed by a limit ends like any other wait, so the
+     agent re-arms it.
+   - `clerk wait` watches the Claude Code process (`CLAUDE_PID`) and exits
+     when it is gone; Claude Code does not kill background commands when it
+     is killed itself (Appendix C).
+   - One armed wait per agent (my call): a second `clerk wait` while one runs
+     exits at once, saying one is already armed, so notices are never split
+     between two outputs.
+2. **Re-arming.**
+   - A wait returns one batch of notices and ends. Its output tells the agent
+     to start it again while it holds or waits for anything.
    - A **Stop hook** checks with the daemon at the end of each turn. If the
-     session holds a lease or a queued request but has no open `lease_wait`, the
+     agent holds a lease or a queued request but has no armed `clerk wait`, the
      hook adds a reminder to the context.
-4. **Mid-turn backup.** A **PreToolUse hook** attaches pending notices to the
+3. **Mid-turn backup.** A **PreToolUse hook** attaches pending notices to the
    context on the next tool call. These are documented `additionalContext`
    hooks.
+4. **New conversations in the same process.** After `/clear` or compaction the
+   conversation has no memory of its leases, yet a wait started before still
+   wakes it (Appendix C). A **SessionStart hook** for `clear`, `compact` and
+   `resume` adds a short brief: what the agent holds or waits for, whether a
+   wait is armed, and to use the clerk skill.
 5. **Optional extra wake-up: `asyncRewake`.** A hook that runs in the
    background and exits with code 2 when a notice arrives. Hook timeouts are
    enforced, as the spike confirmed, so it must be bounded and re-armed on each
    Stop. The builder decides whether the MVP needs it once layers 1–3 work.
 
-Hooks 3–5 are Claude Code-specific and live in the integration package (§9).
-The daemon and MCP surface stay client-neutral.
+The hooks are Claude Code-specific and live in the integration package (§9).
+The daemon and the CLI stay client-neutral: another harness needs only a way to
+run a command in the background and be woken when it ends.
 
 ## 7. Architecture
 
-### 7.1 One binary, three roles
+### 7.1 One binary, two roles
 
 The binary is `clerk`. Every invocation first checks whether the daemon is
 running and starts it if not. The roles:
@@ -546,26 +562,18 @@ running and starts it if not. The roles:
   - a resident process that owns all state;
   - runs the scheduler and the timers (expiry, warnings, cleanup windows);
   - runs health checks;
-  - serves an MCP endpoint over **Streamable HTTP**, which streams with SSE, as
-    the user specified.
-  - My notes: plain "HTTP+SSE" is a deprecated MCP transport, so Streamable
-    HTTP is the right reading. Clients reach it on a **Unix socket** in the
-    user's runtime directory, with permissions limited to the user, rather than
-    a TCP port. That avoids clashing ports, and it is itself the kind of
-    resource this tool manages.
-- **stdio proxy** (`clerk mcp`): what Claude Code launches as its MCP server.
-  - It forwards MCP traffic between stdio and the daemon, unchanged in meaning.
-  - It adds the session's identity (§7.3).
-  - Its connection is the session's liveness signal.
-- **CLI** (`clerk <command>`): for the user and for scripts (§8.4). It talks to
-  the daemon through the same socket.
-  - My call: through an admin API alongside MCP, rather than by speaking MCP.
-    Left to the builder.
+  - watches holders' processes for liveness (§7.3);
+  - serves the CLI on a **Unix socket** in the user's runtime directory, with
+    permissions limited to the user, rather than a TCP port. That avoids
+    clashing ports, and it is itself the kind of resource this tool manages.
+- **CLI** (`clerk <command>`): for the user, scripts and agents (§8.1, §8.4).
+  It talks to the daemon through that socket. Agents call it from their Bash
+  tool; hooks call `clerk hook <event>`.
 
 Trust model: the socket is reachable only by the user (its directory is
 `0700`), and inside that boundary there is no further authentication: any
 process running as the same user can call the daemon's RPCs and hooks with
-any session id or Claude PID, so the clerk guards agents against each
+any Claude PID or session id, so the clerk guards agents against each
 other's mistakes, not against a hostile process of the same user.
 
 ### 7.2 Daemon lifecycle
@@ -593,31 +601,45 @@ other's mistakes, not against a hostile process of the same user.
 
 ### 7.3 Agent identity and liveness
 
-- **Identity:** the Claude Code session. The stdio proxy reads
-  `CLAUDE_CODE_SESSION_ID`, which Claude Code sets for stdio MCP server
-  processes, and the session's starting working directory, which determines
-  the project (§4.2).
-- Subagents share their parent session's MCP connection, and therefore its
-  leases. That is deliberate, as in Simlock.
+- **Identity: the Claude Code process** (my call, 2026-11-10). Claude Code sets
+  `CLAUDE_PID` to its own process ID for Bash tool commands and hook commands
+  (documented, Claude Code 2.1.214 or later). The holder is that process,
+  identified by PID and start time so a reused PID is never mistaken for it.
+  The project comes from the command's working directory (§4.2).
+  - The clerk also records which conversation (`CLAUDE_CODE_SESSION_ID`, set
+    for Bash and hooks and updated on `/clear`) each call came from, for the
+    audit log, for `clerk status`, and to find the holder again on resume.
+- **What follows from it:**
+  - Subagents run their Bash in the same process, so they share their parent's
+    leases. That is deliberate, as in Simlock.
+  - **`/clear` and compaction keep leases** (my call; the user has not said
+    otherwise): the process lives on, so its leases do too. The SessionStart
+    brief (§6, layer 4) tells the new conversation what it holds.
+  - `/resume` inside a running Claude Code keeps leases with the process for
+    the same reason.
+- **Agent detection.** A caller is an agent when `CLAUDE_PID` is set. With
+  `CLAUDE_CODE_SESSION_ID` set but no `CLAUDE_PID` (Claude Code older than
+  2.1.214) the CLI refuses to take leases for the agent, naming the version
+  it needs (my call): such a lease could not be tied to anything alive.
+  `clerk hook` with neither variable exits 0 at once, without contacting the
+  daemon, so the plugin is harmless in other tools.
 - **Liveness:**
-  - The session is alive while its proxy is connected.
-  - When the proxy disconnects, a short grace period (my call: 60 s) allows for
-    reconnection.
-  - After that, the session is dead (§5.7).
-  - A `SessionEnd` hook may additionally tell the daemon immediately.
-- **Resumed sessions:**
-  - Known risk: on `--continue` / `--resume`, the proxy may receive the
-    original start-up session ID.
-  - Mitigation: identity is (session ID, proxy connection). A new connection
-    with the same session ID takes over that session's leases and queue
-    entries.
-  - Verify early, see §11.
-- **Fallback if `CLAUDE_CODE_SESSION_ID` is missing** (my call): identity is
-  the proxy connection itself. The session still works, but a resumed session
-  loses its leases.
-- **Other kinds of holder (user decision): the CLI.** The user, scripts and
-  smoke tests can hold and wait for leases through the CLI (§8.4). My calls on
-  how:
+  - The agent is alive while its Claude Code process runs. The daemon watches
+    the process, as it does for `clerk run`.
+  - When the process is gone, a short grace period (my call: 60 s) allows a
+    `--continue` or `--resume` to take the leases over.
+  - After that, the agent is dead (§5.7).
+  - A `SessionEnd` hook may additionally tell the daemon at once, except with
+    reason `clear`, where the process lives on.
+- **Resumed sessions** (`--continue`, `--resume`, a new process): the
+  SessionStart hook with source `resume` reports the new process and the
+  conversation it resumed. If an earlier process recorded that conversation
+  and is gone, or within its grace, its leases and queued requests move to the
+  new process in one transaction, audited as `holder_resumed`. A process that
+  is still alive keeps its leases; source `fork` never takes leases over.
+- **Other kinds of holder (user decision): the CLI without an agent.** The
+  user, scripts and smoke tests can hold and wait for leases through the CLI
+  (§8.4). My calls on how:
   - **`clerk run <resource|unit> [lease options] -- <command>`:**
     - Waits in the queue in the foreground, then runs the command with the
       unit's settings in environment variables.
@@ -637,25 +659,19 @@ other's mistakes, not against a hostile process of the same user.
         held in the background and returns the shell. The lease then lives
         until `clerk release <lease>` or expiry.
       - `clerk attach <lease>` re-attaches the live view (my call).
-    - **Non-interactive (agents' Bash, scripts):**
+    - **Non-interactive (scripts, agents' Bash):**
       - never needs a TTY;
       - prints a structured result (grant, or queued with position) and exits;
-      - the lease, or the queued request, stays held detached.
-      - `--wait` blocks until granted, for scripts. Agents should prefer the MCP
-        tools for waiting, because a long foreground Bash call gets moved to
-        the background.
+      - the lease, or the queued request, stays held detached; for an agent,
+        by the agent (§8.1).
+      - `--wait` blocks until granted, for scripts. Agents use a background
+        `clerk wait` instead (§6).
   - **`clerk release <lease>`** releases from any shell.
-  - **Agents can use the CLI directly.** When `CLAUDE_CODE_SESSION_ID` is set
-    in the environment (Claude Code sets it for Bash commands), a lease made
-    through the CLI belongs to **that agent session**. It behaves exactly like
-    an MCP lease: session liveness, notices through `lease_wait`, and
-    interruptible if requested.
-  - **A lease from a CLI with no agent session** is owned by the user or
-    script.
+  - **A lease from a CLI with no agent** is owned by the user or script.
     - Kept until released or expired.
     - Notices appear in the attached view, `clerk status` and `clerk wait`.
-  - **CLI holders without an agent session are never interruptible** in the
-    MVP. Overrides still apply:
+  - **CLI holders without an agent are never interruptible** in the MVP.
+    Overrides still apply:
     - for `clerk run`, the command gets SIGTERM when its cleanup window ends;
     - for `clerk acquire`, the lease simply moves on and the unit is marked
       dirty.
@@ -667,53 +683,61 @@ other's mistakes, not against a hostile process of the same user.
 
 ### 7.4 Stack (my call; user said "Go or Rust")
 
-- **Rust, with the official MCP Rust SDK (`rmcp`), and SQLite.**
-- Reason: the official Go SDK does not implement MCP Tasks yet (go-sdk issue
-  #626 is still open, and its v1.7.0 audit fails the Tasks scenarios). `rmcp`
-  supports tasks, and tasks are central to this design.
+- **Rust and SQLite.** Rust was chosen when MCP Tasks were central (the Go
+  SDK lacked them); with MCP gone (§6) the reason is moot, but the code exists
+  and the stack is not reopened.
 - Platform: Linux first. macOS should work but is not a target for the MVP.
 
 ## 8. Interfaces
 
-### 8.1 MCP tools (indicative; the builder may rename or merge)
+### 8.1 Agent commands (indicative; the builder may rename or merge)
+
+Agents use the same CLI as the user (§8.4), from their Bash tool. Run by an
+agent, a command acts for the agent (§7.3), never prompts, and prints JSON.
 
 **Inventory:**
-- `type_list`: built-in types and their settings shape.
-- `resource_create`, `resource_update`, `resource_delete`, `resource_list`,
-  `resource_get`. `resource_list` shows only visible scopes, with unit counts,
-  how many are free, descriptions and tags, and filters by tags (§4.8).
-  Create and update take a description, a usage template (§4.7) and tags.
-- `unit_add`, `unit_update`, `unit_remove`, `unit_retire`. Adding or updating a
-  unit returns duplicate results (§4.4).
-- No separate promotion tool (my call): a `similar_in_other_project` warning
-  already files the promotion request for the user (§4.4).
-- `resource_create` defaults to the session's project scope; user scope only
-  when asked (my call, matching the CLI).
-- Never exposed to agents (enforced by the daemon): `view: all`, admin
-  operations, the audit log, the promotion list and approval, holder lookups.
+- `clerk types`: built-in types and their settings shape.
+- `clerk resource create|update|delete|list|show`, `clerk resources --tag`.
+  Listings show only scopes the agent can see, with unit counts, how many are
+  free, descriptions and tags. Create and update take a description, a usage
+  template (§4.7) and tags, by flags or `-f` YAML.
+- `clerk unit add|update|remove|retire`. Adding or updating a unit returns
+  duplicate results (§4.4).
+- No separate promotion command for agents (my call): a
+  `similar_in_other_project` warning already files the promotion request for
+  the user (§4.4).
+- `resource create` defaults to the agent's project scope; user scope only
+  when asked (my call, as for people).
+- Refused to agents (enforced by the daemon): `--view all`, the audit log, the
+  promotion list and approval, holder lookups. `clerk admin …` needs
+  `--override` (§8.4).
 
 **Leasing:**
-- `lease_acquire` (§5.1). Returns a grant at once, or a task / queued result.
-  A grant carries the descriptions, the rendered usage (§4.7) and the
-  resource's tags.
-- `lease_status`: this session's leases, queue positions, pending notices.
-- `lease_extend`.
-- `lease_release`: starts cleanup.
-- `lease_confirm`: "clean" or "yielded".
-- `lease_set_interruptible`.
-- `lease_yield_refuse`.
-- `lease_reclaim`: a paused holder takes its unit back after the borrower
-  overruns.
-- `lease_cancel`: cancel a queued request.
-- `lease_claim`: claim an offered unit (my call; `lease_wait` and a completed
-  `lease_acquire` task claim offers themselves, since the waiting call proves
-  the agent is present).
-- `lease_wait`: blocks, or runs as a task, until notices exist, then returns
-  them.
+- `clerk acquire <resource|unit> --for --purpose [--interruptible]
+  [--priority]` (§5.1): prints a grant at once, or the queued request with
+  its position. A grant carries the descriptions, the rendered usage (§4.7)
+  and the resource's tags. A grant printed by `acquire` is claimed at once.
+- `clerk status --mine`: the agent's leases, queue positions, pending notices
+  and whether a wait is armed.
+- `clerk extend <lease> --for`.
+- `clerk release <lease>`: gives the unit back with cleanup confirmed;
+  `--cleanup` starts the cleanup window instead, ended by
+  `clerk confirm <lease> clean`.
+- `clerk confirm <lease> clean|yielded`.
+- `clerk interruptible <lease> on|off`.
+- `clerk yield <lease> --refuse`: turn a yield request down.
+- `clerk reclaim <lease>`: a paused holder takes its unit back after the
+  borrower overruns.
+- `clerk cancel <request>`: cancel a queued request.
+- `clerk claim <lease>`: claim an offered unit (`clerk wait` claims offers
+  itself).
+- `clerk wait`: blocks until notices exist, then prints them and exits (§6).
 
 **Results** are short and structured, and always state the next step the clerk
-expects ("call `lease_confirm` when clean"). Agents shouldn't need the skill
-loaded to do the right thing.
+expects: every JSON result has `summary` (what happened, in words, including
+what to tell the user) and `next` (the command the clerk expects, e.g.
+"`clerk confirm lse_… clean` when the board is clean"); errors end with it.
+Agents shouldn't need the skill loaded to do the right thing.
 
 ### 8.2 Notice content
 
@@ -723,30 +747,40 @@ Every notice states:
 - the deadline, if any;
 - the expected action.
 
-Notices come from the clerk's own tools and hooks, never as cross-session
+Notices come from the clerk's own commands and hooks, never as cross-session
 messages.
 
-### 8.3 Skills
+### 8.3 Skill
 
-Two Claude Code skills ship with the integration package (user decision).
+**One skill, `clerk`** (user decision, 2026-11-10), so the clerk costs one
+skill description in every agent's context. Its body is short and points to
+reference files in the skill directory, read only when needed (my call on the
+split):
+- `SKILL.md`: when to use the clerk, the never-message-other-agents rule, the
+  lease loop (find, acquire, keep `clerk wait` armed in the background, read
+  the wait's output file when it completes, follow `next`, release) and where
+  the rest is.
+- `leasing.md`: the etiquette below in full.
+- `registering.md`: registering resources, below.
 
 **Leasing (agent etiquette)** teaches agents:
 - when to lease, and to declare honest durations;
 - to mark long, pausable work as interruptible;
-- to keep `lease_wait` armed;
+- to keep one `clerk wait` running in the background, with the 2 h `timeout`,
+  and to read its output when it completes;
 - to confirm cleanup;
 - to record resource and unit IDs in project docs or memory after creating
   them;
 - to read the descriptions and usage on grant;
-- to use `override` only when the user said so;
+- to use `--override` only when the user said so;
 - never to coordinate resources by messaging other agents.
 
 **Registering resources** covers both moments: the user asks an agent to
 register things ("register the boards on my hub"), and an agent needs something
 that isn't registered yet. It is generic across types; serial boards are one
 example among services and generic pools. Discovery is the agent's prerogative:
-the clerk has no scan tool (user decision). The steps:
-1. Search first (`resource_list` by tags) and reuse what exists.
+the clerk has no scan command (user decision). The steps:
+1. Search first (`clerk resources --tag`) and reuse what exists.
 2. Pick the type: `device` (reached by a path), `service` (host and port,
    connect or listen), `generic` (anything else with an identity key).
 3. Group interchangeable things into one resource, one unit each.
@@ -760,7 +794,7 @@ the clerk has no scan tool (user decision). The steps:
    the thing is shared.
 7. Record the IDs in project docs or memory.
 
-### 8.4 CLI (for the user)
+### 8.4 CLI (for the user, scripts and agents)
 
 At minimum:
 - `clerk run`, `clerk acquire`, `clerk attach`, `clerk release`, `clerk wait`:
@@ -770,8 +804,7 @@ At minimum:
   - interactive output and prompts when stdin/stdout is a TTY;
   - plain, structured output (e.g. JSON) with no prompts otherwise, so agents
     can call any command directly.
-- **Inventory (user decision):** the CLI can do everything the MCP inventory
-  tools can (§8.1):
+- **Inventory (user decision):** the CLI does all inventory work (§8.1):
   - `clerk resource create|update|delete|list|show`, with a `--scope` option
     for user or project;
   - `clerk unit add|update|remove|retire`;
@@ -781,7 +814,7 @@ At minimum:
     (§4.8);
   - **YAML input** (user decision): `resource create|update` and
     `unit add|update` take `-f <path>`, or `-f -` for stdin, holding the same
-    fields as the MCP tools, e.g. a multi-line `usage` as a YAML block. The
+    fields as the flags, e.g. a multi-line `usage` as a YAML block. The
     ID stays on the command line. My calls:
     - stdin is read only with `-f -`, never implicitly, so an agent's Bash
       call cannot hang on an input stream that never closes;
@@ -824,7 +857,7 @@ At minimum:
   - **Safety** (my call):
     - Interactive use asks for confirmation. Non-interactive use needs
       `--yes`.
-    - Run from an agent session (`CLAUDE_CODE_SESSION_ID` set), every
+    - Run by an agent (§7.3), every
       `admin` command also needs `--override "<reason>"`, the same rule
       as overrides (§5.6). Agents can therefore help with clean-up when you ask
       them to, and the log shows who did what.
@@ -841,18 +874,21 @@ promotion. It is kept in SQLite and shown by `clerk log`.
 
 My call: shipped as a **Claude Code plugin**, with an install command as an
 alternative (e.g. `clerk install claude-code`). It contains:
-- the MCP server registration: stdio, `clerk mcp`;
-- the hooks from §6 (Stop reminder, PreToolUse notice injection, optional
-  asyncRewake) and an optional SessionEnd notification;
-- the two skills (§8.3).
+- the hooks from §6 (SessionStart brief and resume takeover, Stop reminder,
+  PreToolUse notice injection, optional asyncRewake) and a SessionEnd
+  notification;
+- the `clerk` skill (§8.3).
 
-Hooks call `clerk` CLI subcommands meant for hooks. They must fail open: if the
-daemon is unreachable, the agent's work is never blocked. The scope the plugin
-is installed in (user or project) is the user's choice at install time.
+There is no MCP server registration. The `clerk` binary must be on the PATH of
+Claude Code's Bash tool and hooks.
+
+Hooks call `clerk hook <event>`. They must fail open: if the daemon is
+unreachable, the agent's work is never blocked. The scope the plugin is
+installed in (user or project) is the user's choice at install time.
 
 ## 10. Success criteria
 
-- An agent gets a matching free unit in **one tool call**. With several
+- An agent gets a matching free unit in **one command**. With several
   identical boards, all of them get used before anyone queues.
 - No physical unit is ever held by two agents at once, including after
   duplicate registration across projects. Tests demonstrate this.
@@ -864,38 +900,40 @@ is installed in (user or project) is the user's choice at install time.
 
 ## 11. Verify first (risks to settle at the start of implementation)
 
-1. **Which Tasks version `rmcp` implements:** the older experimental one
-   (SEP-1686) or the `io.modelcontextprotocol/tasks` extension (SEP-2663, MCP
-   2026-07-28) that Claude Code 2.1.319 speaks. Also whether Claude Code needs
-   feature-flag fetching for tasks; its docs and changelog disagree.
-2. Whether a `lease_wait` call with progress notifications survives longer than
-   the stdio idle limit (about 30 min) in Claude Code. The spike's attempt to
-   shorten the limit had no effect, so this is still unverified.
-3. **Behaviour of `CLAUDE_CODE_SESSION_ID`** after `--continue` / `--resume`,
-   and whether subagents see the same value.
-4. **Streamable HTTP over a Unix socket** with `rmcp` on both the server side
-   and the client (proxy) side.
-5. How Claude Code shows a completed MCP task when the session is mid-turn, as
-   opposed to idle. Idle was verified for auto-backgrounded calls.
+Phase 3's items (MCP Tasks, `lease_wait` past the idle limit, the proxy's
+session ID, Streamable HTTP over a Unix socket, mid-turn task results) are
+settled or moot; Appendix B has them. For the CLI-only interface (§6, §7.3):
+
+1. **A background `clerk wait` longer than 30 min** in an interactive session
+   still wakes the agent when it ends (docs: no limit locally).
+2. **A background command ending mid-turn:** how Claude Code shows it, and
+   whether the agent sees it before its turn ends.
+3. **A background command killed by its time limit** in an unattended session
+   (`-p`): whether its end wakes the agent like a normal completion.
+4. **`--continue` and `--resume` while a wait runs:** the old process's wait
+   exits with it; the new process's SessionStart (`resume`) hook sees the
+   resumed conversation's ID and a new `CLAUDE_PID`.
+5. **`SessionEnd` on `/clear`:** its `reason` is `clear` and the process lives
+   on.
+6. **`CLAUDE_PID` in the desktop app and the VS Code extension**, for Bash and
+   hooks.
 
 **If an item fails, these are the decided fallbacks** (my calls; none of them
 stops the MVP):
-- **Tasks mismatch (1):**
-  - The MVP must be fully usable on the blocking `lease_wait` fallback alone.
-    Tasks are an improvement on top of it.
-  - If `rmcp`'s Tasks version doesn't match what Claude Code speaks, implement
-    the extension's wire format directly on top of `rmcp` rather than forking
-    it.
-  - The stack is not reopened.
-- **Unix socket (4):** loopback TCP on a random port. The port and an access
-  token go in a file only the user can read, in the runtime directory.
-- **Session ID (3):** see the §7.3 fallback.
+- **Long waits (1, 3):** `clerk wait --timeout <d>` ends the wait with no
+  notices after `d`, telling the agent to start it again; the skill sets it
+  below the limit.
+- **Mid-turn (2):** the PreToolUse hook (§6, layer 3) is the mid-turn path.
+- **Resume (4):** the resumed conversation's leases are lost after the grace;
+  the SessionStart brief says so.
+- **No `CLAUDE_PID` (6):** that surface is unsupported for agents in the MVP;
+  the CLI refuses agent leases there, as for old Claude Code (§7.3).
 
 **Testing approach** (my call):
 - Automated tests at daemon and scheduler level cover every behaviour in §4–§5
   and §7. They follow the plan's BDD skeleton.
 - Delivery to agents (§6, §10) is checked with a scripted end-to-end harness
-  that drives a real Claude Code session in tmux, like the spike. It runs on
+  that drives a real Claude Code session in tmux, like the spikes. It runs on
   demand, not in CI.
 
 ## 12. Decided by the user vs. left to the builder
@@ -904,7 +942,9 @@ stops the MVP):
 - local only;
 - Claude Code only for the MVP;
 - documented mechanisms only;
-- MCP Tasks as the main mechanism;
+- no MCP: agents use the CLI, one skill and the plugin's hooks (2026-11-10;
+  phase 3's MCP Tasks design is superseded);
+- one `clerk` skill, to keep agents' context small (2026-11-10);
 - the Type → Resource → Unit hierarchy;
 - agent-chosen IDs recorded in docs and memory;
 - user/system and project scopes, with project resources invisible elsewhere;
@@ -915,8 +955,8 @@ stops the MVP):
 - a description per resource and unit, and usage instructions per resource
   with unit placeholders, handed over on grant;
 - tags per resource, used by agents to search, never to lease "any match";
-- two skills, leasing and registering resources; no scan tool, discovery is
-  the agent's job;
+- leasing and registering covered by that skill; no scan command, discovery
+  is the agent's job;
 - hard expiry even when nobody is waiting, marking the unit dirty and warning
   its next owner;
 - CLI holders for the user, scripts and smoke tests;
@@ -925,8 +965,7 @@ stops the MVP):
 - expiry warnings and extension;
 - interruptible leases where the holder controls yielding;
 - user-directed override;
-- a single `clerk` binary that auto-starts the daemon, with a stdio proxy to
-  the daemon's SSE endpoint;
+- a single `clerk` binary that auto-starts the daemon;
 - Go or Rust (Rust chosen, §7.4);
 - the name.
 
@@ -945,7 +984,9 @@ stops the MVP):
   another project" for holders a waiter can't see;
 - an "offered" state with a claim window for grants made while the agent waits;
 - the forms of CLI holder: `run` and `acquire`, non-interruptible;
-- the session-ID fallback;
+- the Claude Code process as the agent holder, leases kept on `/clear`, and
+  refusing agent leases without `CLAUDE_PID`;
+- one armed `clerk wait` per agent, with no time limit of its own;
 - the description and usage limits, the placeholder syntax and keys, and
   write-time placeholder checks;
 - the tag format and limits, all-tags matching, exact matching, and
@@ -955,12 +996,11 @@ stops the MVP):
 - fallbacks if verify-first items fail;
 - the testing approach;
 - a Unix socket instead of TCP;
-- a CLI admin API;
 - shipping as a plugin;
 - Rust.
 
 **Left to the builder:**
-- exact tool names and data shapes;
+- exact command names and data shapes;
 - the scoring of duplicate signals per type;
 - the SQLite schema;
 - the daemon start-up lock mechanism;
@@ -1277,3 +1317,28 @@ plugin files were unchanged (checksums).
     alias the new id to the live proxy session of the same Claude PID; then
     the CLI after `/clear` and a later `--continue` both resolve to it.
 
+## Appendix C: CLI-only spike (2026-11-10, Claude Code 2.1.321)
+
+Question: can CLI + skills replace the MCP server? A stand-in for `clerk
+wait` (blocks until a flag file exists, then prints a notice) in isolated
+Claude Code sessions (no plugin, `--strict-mcp-config`, no user settings,
+private tmux server, model haiku). Scripts and screens:
+`docs/superpowers/spikes/2026-11-10-cli-only/`.
+
+1. **Background Bash wakes an idle session: yes.** Started with
+   `run_in_background`, turn ended; 2.5 min later the waiter exited and Claude
+   Code started a turn on its own ("Background command … completed (exit code
+   0)"). The notification carries only the output file's path; the agent read
+   it and followed the notice.
+2. **A background waiter survives `/clear`, and its exit wakes the new
+   conversation: yes**, but that conversation had no context and did not act.
+   Hence the SessionStart brief (§6, layer 4).
+3. **Bash sees `CLAUDE_PID`**, the Claude Code process, the same before and
+   after `/clear`; `CLAUDE_CODE_SESSION_ID` changes on `/clear`. Both are
+   documented for Bash and hooks (env-vars docs; `CLAUDE_PID` since 2.1.214).
+4. **`kill -9` of Claude Code leaves the background waiter running.** Hence
+   `clerk wait` watches `CLAUDE_PID`, and liveness comes from the process.
+5. Docs (tools reference, "Time limit for background commands"): no limit for
+   local interactive sessions (terminal, desktop app, VS Code); unattended
+   sessions get 30 min by default, or the `timeout` passed with
+   `run_in_background` up to 2 h (10 min with `-p` and a text prompt).

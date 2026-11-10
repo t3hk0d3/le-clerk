@@ -1,0 +1,18 @@
+start 09:24:57 pid=2412144 ppid=2412143 sid=fddc65cf-61aa-4c92-bd49-699d786d2a10 claude_pid=2411619 flag=/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/sp/flag-a
+  2412144 /bin/sh /home/tehkode/dev/leclerk/docs/superpowers/spikes/2026-11-10-cli-only/wa
+  2412143 /usr/bin/zsh -c source /home/tehkode/.claude/shell-snapshots/snapshot-zsh-179429
+  2411619 claude --setting-sources project --strict-mcp-config --allowedTools=Bash --model
+  2411611 tmux -L sp new-session -d -s sp -n shell -c /tmp/claude-1000/-home-tehkode-dev/3
+exit 09:27:54 pid=2412144 flag=/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/sp/flag-a
+start 09:28:30 pid=2417236 ppid=2417235 sid=fddc65cf-61aa-4c92-bd49-699d786d2a10 claude_pid=2411619 flag=/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/sp/flag-b
+  2417236 /bin/sh /home/tehkode/dev/leclerk/docs/superpowers/spikes/2026-11-10-cli-only/wa
+  2417235 /usr/bin/zsh -c source /home/tehkode/.claude/shell-snapshots/snapshot-zsh-179429
+  2411619 claude --setting-sources project --strict-mcp-config --allowedTools=Bash --model
+  2411611 tmux -L sp new-session -d -s sp -n shell -c /tmp/claude-1000/-home-tehkode-dev/3
+exit 09:29:21 pid=2417236 flag=/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/sp/flag-b
+start 09:30:02 pid=2418883 ppid=2418882 sid=7e9d00fb-0e14-427d-9ac2-c5db697d307b claude_pid=2411619 flag=/tmp/claude-1000/-home-tehkode-dev/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/sp/flag-c
+  2418883 /bin/sh /home/tehkode/dev/leclerk/docs/superpowers/spikes/2026-11-10-cli-only/wa
+  2418882 /usr/bin/zsh -c source /home/tehkode/.claude/shell-snapshots/snapshot-zsh-179429
+  2411619 claude --setting-sources project --strict-mcp-config --allowedTools=Bash --model
+  2411611 tmux -L sp new-session -d -s sp -n shell -c /tmp/claude-1000/-home-tehkode-dev/3
+signal 09:30:38 pid=2418883

@@ -1,4 +1,6 @@
-# Le Clerk: Phase 3 (MCP, hooks, plugin and skills) Implementation Plan
+# Le Clerk: Phase 3 (agent interface: MCP, then CLI-only) Implementation Plan
+
+> **2026-11-10 revision:** MCP is dropped. Part 2 (Tasks 8–13, at the end) replaces Tasks 2–4's MCP code with the CLI, one skill and hooks; its Global Constraints override Part 1's where they differ.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -126,6 +128,12 @@ Conventional Commits). Builds use
   - `clerk hook session-start|stop|pre-tool-use|session-end` read one JSON
     document from stdin (Claude Code's documented hook input; this is the
     only stdin read besides `-f -` and TTY prompts).
+  - **Agent detection (Task 8):** `clerk hook` works out which agent ran it
+    from the environment: Claude Code when `CLAUDE_CODE_SESSION_ID` or
+    `CLAUDE_PID` is set (non-empty). Claude Code is the only agent so far;
+    with no agent detected the hook exits 0 with no output and never
+    contacts the daemon. The hook names stay agent-neutral, so another
+    agent's hooks can reuse `clerk hook <name>` later.
   - Never start the daemon (probe only). Budget: 2 s total for session-start,
     stop and pre-tool-use; 1.5 s total for session-end (Claude Code's limit),
     so its RPC must finish within 1 s. On any error, timeout or missing
@@ -136,7 +144,18 @@ Conventional Commits). Builds use
     falls back to `session_id`.
   - SessionStart with `source: "resume"`: alias the proxy's start-up session
     id to the resumed id, so `--continue` takes over the resumed session's
-    leases inside the grace. Other sources: nothing.
+    leases inside the grace.
+  - **Link (Task 8):** SessionStart with any other source (`clear`, and also
+    `startup`, `compact`, `fork`, where it is usually a no-op), and every
+    `session_brief` (Stop, PreToolUse) after its pending resume, links the
+    hook's `session_id` N to the live proxy session U of the same Claude PID
+    when N is not already U (after aliases), N has no open liveness stream,
+    N holds nothing (no live lease, queued request or pending notice) and N
+    is not a pending resume of that PID. Linking persists the alias N → U
+    (as a resume alias does) and audits `session_linked { from: N, to: U }`;
+    nothing moves. Then the CLI run from Bash after `/clear` acts as U, and a
+    later `--continue` naming N takes over U's leases through the chain.
+    Leases held at `/clear` stay with the session (user decision: keep).
   - Stop: when the session holds a live lease or a queued request, has no open
     `lease_wait`, and `stop_hook_active` is false, output a block decision
     whose reason tells the agent to call `lease_wait`. Otherwise output
@@ -317,6 +336,22 @@ scheduler::session
         - ends the session's leases and requests without grace
     alias(from start-up id, to resumed id) (SessionStart resume)
         - leases and requests of the resumed id are now held by the live proxy session; its grace is cancelled
+    link(claude_pid, session_id) (SessionStart other than resume; session_brief) (Task 8)
+        On a new id (after /clear) with a live proxy session of that Claude PID
+            - returns Linked; the id resolves to the proxy session from now on, across a daemon restart
+            - audits session_linked {from, to}; no lease, request or notice moves
+        On the id already standing for the proxy session (start-up, compact, already linked)
+            - returns None; writes nothing
+        On no live proxy session of that Claude PID, or no Claude PID
+            - returns None; writes nothing
+        On the id holding a live lease, queued request or pending notice
+            - returns None; writes nothing (a resume's job)
+        On the id being a pending resume of that Claude PID
+            - returns None; the pending resume stands
+        On the id having an open liveness stream of its own
+            - returns None; writes nothing
+    after /clear, a crash and --continue (Task 8)
+        - the SessionStart resume naming the post-/clear id takes over the leases held at /clear
     resolve(claude_pid, session_id)
         On a live proxy session with that Claude PID
             - returns it
@@ -335,6 +370,8 @@ engine
         - reads the live session's notices
 
 cli (agent sessions, CLAUDE_CODE_SESSION_ID set)
+    leases --mine / release after /clear (Task 8)
+        - acts on the leases the session's MCP tools took before /clear
     acquire --wait / attach
         On an offer the session already claimed (e.g. through lease_wait)
             - exits 0 and prints the held lease
@@ -360,6 +397,8 @@ mcp::ProjectCache
 
 cli::hook
     any hook
+        On no agent detected (neither CLAUDE_CODE_SESSION_ID nor CLAUDE_PID set) (Task 8)
+            - exits 0 with no output; never contacts the daemon
         On no daemon / daemon unresponsive / malformed input / slow daemon
             - exits 0 with no output within its budget (2 s; session-end 1.5 s); never starts a daemon
         - resolves the session by CLAUDE_PID first, then session_id
@@ -368,8 +407,13 @@ cli::hook
             - aliases the proxy's start-up id to the resumed id
         On source resume with the daemon not answering yet (the proxy starting it)
             - retries the connection within its budget, never starting a daemon, then aliases
+        On source clear with the proxy connected (Task 8)
+            - outputs nothing; links the new id to the proxy session
         On any other source
-            - outputs nothing; changes nothing
+            - outputs nothing; changes nothing beyond a link
+    stop / pre-tool-use (Task 8)
+        On a new id the session-start hook did not link (it gave up)
+            - links it, then answers for the proxy session
     stop
         On a live lease or queued request, no open lease_wait, stop_hook_active false
             - outputs a block decision whose reason names lease_wait
@@ -731,6 +775,386 @@ cli JSON output
   listed for the user, not faked.
 - [ ] **Step 3:** Commit: `docs: Claude Code install and verification checklist`
 
+## Part 2 (2026-11-10): CLI-only agent interface, no MCP
+
+The user dropped MCP after the CLI-only spike (spec §6, Appendix C): agents use
+the `clerk` CLI from Bash, one `clerk` skill and the plugin's hooks. Tasks 2–4's
+MCP code is removed (Task 9) and the old Task 8 (`/clear` link) is superseded:
+with the Claude Code process as the holder, `/clear` needs no link. Tasks 0–7
+stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, §8.3,
+§9, §11, Appendix C.
+
+**Styleguide:** `STYLEGUIDE.md`, unchanged, for every task below.
+
+### Part 2 Global Constraints
+
+- **No MCP anywhere:** no `src/mcp`, no `clerk mcp`, no `rmcp`, `schemars` or
+  MCP-only crates, no `/mcp` route, no `.mcp.json`. Protocol bumps to 4.
+- **Agent detection:** a CLI or hook caller is an agent when `CLAUDE_PID` is
+  set and non-empty. The agent holder is `HolderRef::ClaudeCode { pid,
+  start_time }`, with `start_time` read from `/proc/<pid>/stat` (as for
+  `CliProcess`). The call also carries `conversation`
+  (`CLAUDE_CODE_SESSION_ID`, if set).
+  - `CLAUDE_CODE_SESSION_ID` set but no `CLAUDE_PID`, or a `CLAUDE_PID` whose
+    start time cannot be read: commands that would hold or queue for the
+    agent fail with code `agent_unidentified`, naming Claude Code 2.1.214 as
+    the minimum; read-only commands still work, as the user.
+  - `clerk hook` with neither variable set: exit 0, no output, no daemon
+    contact.
+- **Legacy holders:** stored `AgentSession` rows still deserialize (audit,
+  old leases); no new ones are made. After a daemon start they get the
+  restart grace (`reconnect_grace`, 60 s) and then end as `holder_gone`.
+  The `session_aliases` table is dropped by a migration.
+- **Conversations:** the daemon records every (Claude process, conversation)
+  pair it sees from CLI calls and hooks (`agent_conversations`: pid,
+  start_time, conversation, first_seen, last_seen).
+- **Liveness:** a `ClaudeCode` holder is alive while its process (pid and
+  start time) runs. When it is gone, `reconnect_grace` starts; at its end the
+  holder's leases end with cause `holder_gone` and its requests drop (§5.7).
+  The existing process watch for `CliProcess` covers it.
+- **Resume takeover:** `session_start { source: "resume", conversation }`
+  from process P′: if another `ClaudeCode` holder P recorded that
+  conversation and P is not running, every live lease, queued request and
+  pending notice of P moves to P′ in one transaction, audited
+  `holder_resumed { from, to, conversation }`. P running, or source `fork`:
+  nothing moves.
+- **`clerk wait` for agents:**
+  - returns one batch: blocks until the agent has pending notices, claims any
+    `offered` lease in the batch (the result carries the grant brief), prints
+    the batch and exits 0;
+  - notices are marked delivered only after the batch is written and flushed
+    (the CLI acks with the existing ack mechanism); a wait killed before that
+    leaves them pending;
+  - exits 0 with an empty batch when the Claude Code process is gone (checked
+    at least every 2 s);
+  - one armed wait per agent: while one is open, another exits 0 at once with
+    `summary` "a clerk wait is already armed for this agent" and `next` none;
+  - **armed** means a wait long-poll from the holder is open (the CLI
+    re-polls with gaps under 2 s); the daemon tracks it in memory;
+  - no time limit of its own; `--timeout <duration>` ends it with an empty
+    batch (the §11 fallback).
+- **Agent results:** run by an agent, every command prints JSON (no TTY
+  view, no prompts) with `summary` and `next`; errors carry `code`,
+  `message`, `details` and end their message with the next step. The
+  next-step texts move from `src/mcp/tools.rs` into `src/cli/next.rs` and name
+  CLI commands. Every wait result's `next` tells the agent to start
+  `clerk wait` again in the background while it holds or waits for anything.
+- **Agent commands** (names fixed for this plan): `clerk types`,
+  `clerk status --mine`, `clerk confirm <lease> clean|yielded`,
+  `clerk interruptible <lease> on|off`, `clerk yield <lease> --refuse`,
+  `clerk reclaim <lease>`, `clerk claim <lease>`, `clerk release <lease>
+  [--cleanup]`, plus the existing inventory, `acquire`, `extend`, `cancel`,
+  `wait`. `acquire` by an agent never blocks (`--wait` refused for agents,
+  pointing to `clerk wait`); queued exit code stays 6.
+- **Hooks** (budgets unchanged: 2 s; SessionEnd 1.5 s; fail open):
+  - session-start: records the conversation; `resume` runs the takeover;
+    for `clear`, `compact` and `resume`, when the agent holds or waits for
+    anything, prints a brief as `additionalContext`: its leases and requests
+    (IDs, resource, unit, ends), whether a wait is armed, "use the clerk
+    skill", and, when no wait is armed, the exact `clerk wait` command to run
+    in the background. Nothing for `startup` or `fork`, or when it holds
+    nothing.
+  - stop: reminder (block decision) when the agent holds or queues anything,
+    no wait is armed and `stop_hook_active` is false; the reason names the
+    background `clerk wait` command.
+  - pre-tool-use: unchanged (pending notices not yet shown by a hook).
+  - session-end: ends the holder's liveness now (no grace), except with
+    `reason` `clear` or `resume`, or while the Claude Code process still runs.
+- **Plugin:** `integrations/claude-code/` holds `.claude-plugin/plugin.json`,
+  `hooks/hooks.json` and `skills/clerk/{SKILL.md,leasing.md,registering.md}`;
+  the `leasing` and `registering-resources` skills and `.mcp.json` are
+  deleted. `SKILL.md` stays under 120 lines; its description covers leasing,
+  notices and registering in one paragraph.
+
+### Part 2 Review Focus
+
+1. **A killed Claude Code keeps its boards:** `kill -9` of the agent's process
+   (its background `clerk wait` keeps running, Appendix C). The wait must
+   exit and the leases end after the grace. → Tasks 10, 11.
+2. **`--continue` loses its boards:** the new process must take over the old
+   one's leases inside the grace, and never a still-running process's. →
+   Tasks 10, 12.
+3. **Notices lost between two waits:** a wait killed mid-print, two waits
+   racing, a wait woken by an offer it fails to claim. Nothing is lost or
+   delivered twice. → Task 11.
+4. **PID reuse:** a new process with the old `CLAUDE_PID` but another start
+   time never inherits leases or counts as alive. → Task 10.
+5. **A hook or wait blocks a non-agent shell:** the plugin installed while
+   running `clerk` outside Claude Code; `clerk wait` run by a person. People
+   keep today's behaviour. → Tasks 11, 12.
+
+### Part 2 BDD skeleton
+
+```
+cli::caller
+    current
+        On CLAUDE_PID set with a readable start time
+            - holder is ClaudeCode { pid, start_time }; conversation from CLAUDE_CODE_SESSION_ID
+        On CLAUDE_CODE_SESSION_ID without CLAUDE_PID
+            - holding/queueing commands fail with agent_unidentified naming 2.1.214
+            - read-only commands run as the user
+        On CLAUDE_PID whose process is gone
+            - holding/queueing commands fail with agent_unidentified
+        On neither variable
+            - unchanged (CliProcess / User per kind)
+
+scheduler::liveness (ClaudeCode holders)
+    sweep
+        On the process running with the same start time
+            - holder stays alive
+        On the process gone
+            - grace starts; leases stay held during it
+        On the grace ending
+            - leases end holder_gone, units go through §5.4, requests drop
+        On a reused pid with another start time
+            - counts as gone
+    daemon start
+        On stored AgentSession holders
+            - end holder_gone after reconnect_grace from boot
+        On ClaudeCode holders whose process is gone
+            - grace from boot, then end
+
+engine::session_start (hook RPC)
+    On any source
+        - records (holder, conversation) in agent_conversations
+    On resume with an earlier gone holder that recorded the conversation
+        - moves its leases, requests and pending notices to the new holder in one transaction
+        - audits holder_resumed { from, to, conversation }
+        - the earlier holder's grace no longer ends anything
+    On resume while the earlier holder still runs
+        - moves nothing
+    On fork
+        - moves nothing
+    On resume with no earlier holder
+        - moves nothing; returns the brief
+
+cli wait (agent)
+    On pending notices
+        - prints one JSON batch with summary and next, exits 0
+        - marks them delivered after the flush
+    On an offered lease in the batch
+        - claims it; the batch carries the grant brief
+        On the claim failing (offer expired)
+            - the batch says so; next says to run clerk wait again
+    On no notices yet
+        - blocks; the agent counts as armed meanwhile
+    On the Claude Code process exiting
+        - exits 0 with an empty batch within 2 s
+    On another wait already armed for the agent
+        - exits 0 at once; summary says one is armed; nothing consumed
+    On being killed before the flush
+        - its notices are returned by the next wait
+    On --timeout elapsing
+        - exits 0 with an empty batch whose next says to start it again
+cli wait (person)
+    - unchanged
+
+cli agent commands (run with CLAUDE_PID)
+    any command
+        - prints JSON with summary and next; never prompts
+        On an error
+            - JSON error with code, message, details; message ends with the next step
+    acquire
+        On a free unit
+            - prints the grant (descriptions, rendered usage, tags), claimed; next names confirm/release
+        On queued
+            - exits 6 with position; next names the background clerk wait
+        On --wait
+            - refused; points to clerk wait
+    status --mine
+        - lists the agent's leases, requests, pending notices and armed: true|false
+        - never lists another holder's
+    confirm / interruptible / yield --refuse / reclaim / claim / release [--cleanup] / types
+        - map to the engine command for the agent; results carry summary and next
+    admin / log / promotions / --view all
+        - refused as for agents today
+
+cli::hook
+    any event
+        On neither CLAUDE_PID nor CLAUDE_CODE_SESSION_ID
+            - exits 0, no output, no daemon contact
+    session-start
+        On clear | compact | resume while holding or queued
+            - prints the brief; with no armed wait it includes the background clerk wait command
+        On startup | fork, or holding nothing
+            - prints nothing
+        On resume after a crash
+            - the takeover happened before the brief; the brief lists the taken-over leases
+    stop
+        On holding, no armed wait, stop_hook_active false
+            - block decision naming the background clerk wait
+        On a wait armed, or stop_hook_active true, or holding nothing
+            - no output
+    session-end
+        On reason clear | resume, or the process still running
+            - nothing changes
+        On other reasons with the process gone
+            - leases end at once (no grace)
+
+plugin
+    files
+        - plugin.json and hooks.json valid; hooks run clerk hook <event> with timeouts ≤ 5 s
+        - no .mcp.json; no leasing or registering-resources skill
+    skills/clerk
+        - SKILL.md frontmatter name clerk, one description; under 120 lines
+        - links leasing.md and registering.md; mentions only commands in Part 2 Global Constraints
+        - tells the agent to run clerk wait with run_in_background and the 2 h timeout, and to read its output file on completion
+```
+
+### Task 8: Verify first for the CLI-only interface (spec §11)
+
+**Files:**
+- Modify: spec Appendix C (results), `docs/superpowers/spikes/2026-11-10-cli-only/`
+  (scripts for the new checks, evidence)
+
+**Interfaces:**
+- Consumes: the spike helpers (`env.sh`, `tm.sh`, `run-claude.sh`,
+  `waiter.sh`), isolated as before: a folder Claude Code already trusts,
+  `--setting-sources project --strict-mcp-config`, a private tmux server; never
+  the user's real config or clerk state.
+- Produces: a result per spec §11 item 1–6 in Appendix C, and, for each that
+  fails, the fallback applied to the later tasks (ledger ruling).
+
+- [ ] **Step 1:** §11.1: a background waiter released after 35 min wakes the
+  idle agent (started 2026-11-10 10:36).
+- [ ] **Step 2:** §11.2: release the waiter while the agent is mid-turn (a
+  prompt that runs `sleep 60` in the foreground); record what the agent sees
+  and when.
+- [ ] **Step 3:** §11.3: `claude -p` with `BASH_DEFAULT_TIMEOUT_MS` unset and a
+  waiter started with `timeout: 60000`; record whether the kill wakes it.
+- [ ] **Step 4:** §11.4–11.5: `/clear` then `SessionEnd` input (a hook that
+  logs its stdin); `kill -9` then `claude --continue`: the SessionStart hook
+  input (`source`, `session_id`) and `CLAUDE_PID`.
+- [ ] **Step 5:** §11.6: list for the user (desktop app, VS Code); not faked.
+- [ ] **Step 6:** Commit: `docs: CLI-only verify-first results`
+
+### Task 9: Remove MCP
+
+**Files:**
+- Delete: `src/mcp/`, `src/cli/mcp.rs`, `tests/mcp.rs`, `tests/proxy.rs`,
+  `integrations/claude-code/.mcp.json`
+- Modify: `src/lib.rs`, `src/cli/mod.rs` (no `Mcp` command),
+  `src/daemon/server.rs` (no `/mcp`, no `/v1/session/live`), `Cargo.toml`
+  (drop `rmcp`, `schemars` and any crate only MCP used), `src/engine/wire.rs`
+  (PROTOCOL 4), `src/cli/lease.rs` (drop the "use lease_wait" refusal)
+- Test: the full suite; `tests/cli.rs` gains `clerk mcp` → usage error
+
+**Interfaces:**
+- Consumes: nothing new.
+- Produces: a daemon and CLI with no MCP. `src/scheduler/session.rs` stays
+  until Task 10 replaces it. CLI agents temporarily keep `AgentSession`
+  identity (no liveness source: they end after the grace) until Task 10.
+
+- [ ] **Step 1:** Delete and unwire; build.
+- [ ] **Step 2:** `cargo tree | grep -i mcp` prints nothing.
+- [ ] **Step 3:** Run fmt, clippy and the full suite; expected PASS (tests of
+  removed code removed with it, nothing else changed).
+- [ ] **Step 4:** Commit: `refactor!: remove the MCP server and clerk mcp`
+
+### Task 10: The Claude Code process as the agent holder
+
+**Files:**
+- Modify: `src/model/types.rs` (`HolderRef::ClaudeCode`; `AgentSession`
+  legacy), `src/cli/caller.rs` (detection, `agent_unidentified`),
+  `src/scheduler/liveness.rs` (watch `ClaudeCode` like `CliProcess`),
+  `src/scheduler/session.rs` (replaced: `agent.rs` with conversations and
+  resume takeover), `src/store/` (migration: `agent_conversations`, drop
+  `session_aliases`), `src/engine/command.rs` (`session_start` takeover;
+  every agent call records its conversation), `src/model/types.rs` `Caller`
+  (`conversation: Option<String>`)
+- Test: `tests/liveness.rs`, `tests/agent.rs` (new, replaces
+  `tests/session.rs`), `tests/engine.rs`, unit tests in `caller.rs`
+
+**Interfaces:**
+- Consumes: `liveness::start_time_of(pid)` (add if only `self_start_time`
+  exists), the holder-gone path.
+- Produces: `HolderRef::ClaudeCode { pid: u32, start_time: u64 }`;
+  `Caller.conversation`; `scheduler::agent::Agents::takeover(&mut self, tx:
+  &Tx, sched: &Scheduler, to: &HolderRef, conversation: &str) ->
+  Result<Option<HolderRef>, SchedulerError>` (the holder taken over, if any);
+  error code `agent_unidentified`.
+
+- [ ] **Step 1:** Write the failing tests for `cli::caller`,
+  `scheduler::liveness (ClaudeCode holders)` and `engine::session_start`,
+  including Review Focus 1, 2 and 4.
+- [ ] **Step 2:** Run them; expected FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run fmt, clippy and the full suite; expected PASS.
+- [ ] **Step 5:** Commit: `feat: the Claude Code process holds agent leases`
+
+### Task 11: Agent commands and `clerk wait`
+
+**Files:**
+- Create: `src/cli/next.rs` (summary and next-step texts for every agent
+  result and error)
+- Modify: `src/cli/{mod,lease,views,inventory,output}.rs`, the daemon's wait
+  RPC (armed-wait tracking, one per holder)
+- Test: `tests/cli.rs`, `tests/notices.rs`
+
+**Interfaces:**
+- Consumes: Task 10's holder; the engine's existing confirm, set
+  interruptible, refuse yield, reclaim, claim, cancel and ack commands.
+- Produces: the commands in Part 2 Global Constraints; RPC `wait_notices`
+  gains `armed` tracking and an `already_armed` answer; `status --mine`
+  reports `armed`.
+
+- [ ] **Step 1:** Write the failing tests for `cli wait (agent)`,
+  `cli wait (person)` and `cli agent commands`, including Review Focus 3 and
+  5 (a person's `clerk wait` unchanged).
+- [ ] **Step 2:** Run them; expected FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run fmt, clippy and the full suite; expected PASS.
+- [ ] **Step 5:** Commit: `feat(cli): agent commands and a one-batch clerk wait`
+
+### Task 12: Hooks for the CLI-only interface
+
+**Files:**
+- Modify: `src/cli/hook.rs`, `src/engine/command.rs` (`session_brief` with
+  `armed`; `session_start` brief), `integrations/claude-code/hooks/hooks.json`
+  (description text)
+- Test: `tests/hook.rs`
+
+**Interfaces:**
+- Consumes: Tasks 10–11 (`takeover`, armed tracking, conversations).
+- Produces: the hook behaviour in Part 2 Global Constraints. Tests set
+  `CLAUDE_PID` to a live child process they own.
+
+- [ ] **Step 1:** Write the failing tests for `cli::hook`, including Review
+  Focus 5 (no agent variables: no daemon started, no output).
+- [ ] **Step 2:** Run them; expected FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run fmt, clippy and the full suite; expected PASS.
+- [ ] **Step 5:** Commit: `feat(hooks): briefs after /clear and resume, wait reminders`
+
+### Task 13: The `clerk` skill, docs and end-to-end check
+
+**Files:**
+- Create: `integrations/claude-code/skills/clerk/{SKILL.md,leasing.md,registering.md}`
+- Delete: `integrations/claude-code/skills/{leasing,registering-resources}/`
+- Modify: `tests/plugin.rs`, `docs/claude-code.md`, spec Appendix C,
+  `README` if it mentions MCP
+- Test: `tests/plugin.rs`
+
+**Interfaces:**
+- Consumes: the commands, wait and hooks of Tasks 11–12; the content of the
+  two old skills (rewritten for CLI commands, not copied).
+- Produces: the plugin per Part 2 Global Constraints; `docs/claude-code.md`
+  install steps without MCP and a checklist: two agents on one pool (the
+  second woken by its background wait), an idle agent woken by an expiry
+  warning, `/clear` keeps leases and shows the brief, `kill -9` frees the
+  board after the grace, `--continue` keeps it, the Stop reminder fires once,
+  "register the boards on my hub" follows `registering.md`.
+
+- [ ] **Step 1:** Write the failing `tests/plugin.rs` for the BDD subtree
+  `plugin`.
+- [ ] **Step 2:** Run it; expected FAIL.
+- [ ] **Step 3:** Write the skill files and docs.
+- [ ] **Step 4:** Run fmt, clippy and the full suite; expected PASS.
+- [ ] **Step 5:** Run the checklist with isolated real `claude` sessions
+  (spike helpers, plugin loaded with `--plugin-dir`, a private `CLERK_HOME`);
+  record results in Appendix C; list what needs the user.
+- [ ] **Step 6:** Commit: `feat(plugin): one clerk skill for the CLI-only interface`
+
 ---
 
 ## Self-review notes
@@ -743,3 +1167,4 @@ cli JSON output
 - **Deferred:** `asyncRewake`; `clerk install claude-code`; phase 2 deferred
   minors (SIGKILL escalation in `clerk run`, `clerk wait` and lent leases,
   unit update read-modify-write, splitting `src/cli/lease.rs`).
+- **Part 2 coverage (2026-11-10):** §6 layers 1–4 (Tasks 11, 12), §7.1 (Task 9), §7.3 holder, liveness, resume, detection (Tasks 10, 12), §8.1 (Task 11), §8.3 one skill (Task 13), §9 (Tasks 9, 13), §11 (Task 8). Deferred: `asyncRewake`, `clerk install claude-code`.

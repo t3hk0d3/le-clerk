@@ -1,0 +1,24 @@
+
+ ▐▛███▛█   Claude Code v2.1.321
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   /…/3ee8a19f-2334-4c55-8c65-c9833449d6cc/scratchpad/subject
+
+▎ Debug mode enabled · logging to /tmp/claude-1000/-home-tehkode-dev/3ee8a19f-23
+▎ 34-4c55-8c65-c9833449d6cc/scratchpad/sp/a-debug.log
+
+❯ /clear                                                                        
+
+
+
+
+                                                                                
+                                                                                
+
+
+
+                                                                              
+                                                                              
+────────────────────────────────────────────────────────────────────────────────
+❯                                                             
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · ← 1 agent · ↓ to manage                   
