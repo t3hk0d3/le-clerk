@@ -22,7 +22,6 @@ pub fn render(command: &str, value: &Value, now_ms: i64) -> String {
             .collect::<Vec<_>>()
             .join("\n\n"),
         Value::Object(m) => {
-            let (heading, used) = heading(m);
             let (summary, next) = match (m.get("summary"), m.get("next")) {
                 (Some(Value::Array(s)), Some(Value::String(n))) => (
                     s.iter()
@@ -33,18 +32,7 @@ pub fn render(command: &str, value: &Value, now_ms: i64) -> String {
                 ),
                 _ => super::next::note(command, value),
             };
-            let mut skip: Vec<&str> = vec!["summary", "next"];
-            skip.extend(used);
-            if heading.is_some() {
-                // Fields that only restate the heading or a default.
-                skip.extend(restated(m));
-            }
-            let mut out = String::new();
-            if let Some(h) = heading {
-                out.push_str(&h);
-                out.push('\n');
-            }
-            out.push_str(&body(value, now_ms, &skip));
+            let mut out = block(value, now_ms);
             let summary: Vec<String> = summary.into_iter().filter(|l| !l.is_empty()).collect();
             if !summary.is_empty() {
                 out.push_str("\n\n");
@@ -56,6 +44,62 @@ pub fn render(command: &str, value: &Value, now_ms: i64) -> String {
         }
         other => scalar("", other, now_ms),
     }
+}
+
+/// One object as a block: its heading (for a hand-tuned layout) and its
+/// fields, without summary or next step.
+#[must_use]
+pub fn block(value: &Value, now_ms: i64) -> String {
+    let Value::Object(m) = value else {
+        return scalar("", value, now_ms);
+    };
+    let (heading, used) = heading(m);
+    let mut skip: Vec<&str> = vec!["summary", "next"];
+    skip.extend(used);
+    if heading.is_some() {
+        // Fields that only restate the heading or a default.
+        skip.extend(restated(m));
+    }
+    let mut out = String::new();
+    if let Some(h) = heading {
+        out.push_str(&h);
+        out.push('\n');
+    }
+    out.push_str(&body(value, now_ms, &skip));
+    out
+}
+
+/// A `clerk wait` result (a batch: `notices`, `claimed`; or a `--follow`
+/// line: `notice`, `claimed`), with its `summary` and `next`: the notice
+/// blocks, the claimed leases, the summary, then `Next:`.
+#[must_use]
+pub fn wait(value: &Value, now_ms: i64) -> String {
+    let as_list = |k: &str| match value.get(k) {
+        Some(Value::Array(a)) => a.clone(),
+        Some(v) if !v.is_null() => vec![v.clone()],
+        _ => Vec::new(),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for n in as_list("notices").into_iter().chain(as_list("notice")) {
+        parts.push(block(&n, now_ms));
+    }
+    for l in as_list("claimed") {
+        parts.push(block(&l, now_ms));
+    }
+    let summary: Vec<&str> = value["summary"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !summary.is_empty() {
+        parts.push(summary.join("\n"));
+    }
+    if let Some(next) = value["next"].as_str() {
+        parts.push(format!("Next: {next}"));
+    }
+    parts.join("\n\n")
 }
 
 /// An error, for an agent: heading, message (ending with the next step).

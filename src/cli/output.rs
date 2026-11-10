@@ -270,6 +270,12 @@ impl Output {
         }
     }
 
+    /// Whether results print as Markdown (an agent, stdout not a terminal).
+    #[must_use]
+    pub fn is_markdown(self) -> bool {
+        self.markdown && self.agent.is_some() && matches!(self.mode, Mode::Json)
+    }
+
     /// This agent output printing Markdown when it would print JSON.
     #[must_use]
     pub fn markdown(self) -> Self {

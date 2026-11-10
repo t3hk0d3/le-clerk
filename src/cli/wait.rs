@@ -45,6 +45,7 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
         anyhow::bail!("not an agent session");
     };
     let client = ctx.client().await?;
+    let md = ctx.out.is_markdown();
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let deadline = args.timeout.map(|t| Instant::now() + t);
@@ -54,33 +55,38 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
     loop {
         if !process_alive(host.pid, host.start_time) {
             return finish(
+                md,
                 args,
                 &ended("Claude Code process running this session has exited"),
             );
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            return finish(args, &empty(&["No notices arrived before --timeout."]));
+            return finish(md, args, &empty(&["No notices arrived before --timeout."]));
         }
         let step = tokio::select! {
             got = client.agent_wait(session_id, host, STEP.as_secs(), first, &arm) => got?,
-            _ = term.recv() => return finish(args, &stopped()),
-            _ = int.recv() => return finish(args, &stopped()),
+            _ = term.recv() => return finish(md, args, &stopped()),
+            _ = int.recv() => return finish(md, args, &stopped()),
         };
         first = false;
         match step["status"].as_str() {
             Some("timeout") => {}
             Some("armed") => {
-                return print(&json!({
-                    "notices": [],
-                    "claimed": [],
-                    "armed": true,
-                    "summary": ["A clerk wait is already armed for this session; this one \
-                                 took nothing."],
-                    "next": "Nothing: the armed wait reports the notices.",
-                }));
+                return print(
+                    md,
+                    &json!({
+                        "notices": [],
+                        "claimed": [],
+                        "armed": true,
+                        "summary": ["A clerk wait is already armed for this session; this one \
+                                     took nothing."],
+                        "next": "Nothing: the armed wait reports the notices.",
+                    }),
+                );
             }
             Some("ended") => {
                 return finish(
+                    md,
                     args,
                     &ended("this Claude Code process runs another session now"),
                 );
@@ -91,7 +97,7 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
                     for notice in notices {
                         let claimed = claim_if_offered(&client, caller, &notice).await;
                         let line = follow_line(&notice, claimed);
-                        print(&line)?;
+                        print(md, &line)?;
                         ack(&client, session_id, &[&notice]).await?;
                     }
                 } else {
@@ -108,12 +114,15 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
                         }
                         summary.push(action_of(notice));
                     }
-                    print(&json!({
-                        "notices": notices,
-                        "claimed": claimed,
-                        "summary": summary,
-                        "next": format!("Act on each notice as it says. {ARM_AGAIN}"),
-                    }))?;
+                    print(
+                        md,
+                        &json!({
+                            "notices": notices,
+                            "claimed": claimed,
+                            "summary": summary,
+                            "next": format!("Act on each notice as it says. {ARM_AGAIN}"),
+                        }),
+                    )?;
                     let all: Vec<&Value> = notices.iter().collect();
                     ack(&client, session_id, &all).await?;
                     return Ok(());
@@ -195,17 +204,23 @@ fn stopped() -> Value {
 
 /// End the wait with `value`: printed for a one-batch wait; a `--follow`
 /// wait just ends (Monitor reports the end itself).
-fn finish(args: &WaitArgs, value: &Value) -> anyhow::Result<()> {
+fn finish(md: bool, args: &WaitArgs, value: &Value) -> anyhow::Result<()> {
     if args.follow {
         return Ok(());
     }
-    print(value)
+    print(md, value)
 }
 
-/// Print `value` as one JSON line and flush.
-fn print(value: &Value) -> anyhow::Result<()> {
+/// Print `value` (a wait result) and flush: one JSON line, or Markdown
+/// followed by a blank line.
+fn print(markdown: bool, value: &Value) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{value}")?;
+    if markdown {
+        let now = leclerk::clock::Clock::now_ms(&leclerk::clock::SystemClock);
+        writeln!(stdout, "{}\n", super::md::wait(value, now))?;
+    } else {
+        writeln!(stdout, "{value}")?;
+    }
     stdout.flush()?;
     Ok(())
 }

@@ -3708,6 +3708,94 @@ mod cli {
             }
         }
 
+        mod on_an_agent_session_in_markdown {
+            use super::*;
+
+            fn text_of(cmd: &mut Command) -> String {
+                String::from_utf8(cmd.output().unwrap().stdout).unwrap()
+            }
+
+            #[test]
+            fn one_batch_is_notice_blocks_the_claimed_lease_and_next_last() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let theirs = agent_queued(&env, &dir);
+                free(&env, "x", &theirs);
+                let text = text_of(env.agent_md("sess-1", &dir).arg("wait"));
+                assert!(text.contains("## Notice: offered\n"), "{text}");
+                assert!(text.contains("## Lease lse_"), "{text}");
+                assert!(
+                    text.trim_end()
+                        .lines()
+                        .last()
+                        .unwrap()
+                        .starts_with("Next: "),
+                    "{text}"
+                );
+                assert!(text.contains("clerk wait"), "{text}");
+                assert!(!text.contains('{'), "{text}");
+            }
+
+            #[test]
+            fn a_timeout_is_one_sentence_and_next() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let text = text_of(
+                    env.agent_md("sess-1", &dir)
+                        .args(["wait", "--timeout", "1s"]),
+                );
+                let lines: Vec<&str> = text.trim().lines().filter(|l| !l.is_empty()).collect();
+                assert_eq!(lines.len(), 2, "{text}");
+                assert!(lines[1].starts_with("Next: "), "{text}");
+            }
+
+            #[test]
+            fn follow_prints_one_block_per_notice_each_with_next() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let theirs = agent_queued(&env, &dir);
+                let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"))
+                    .args(["wait", "--follow"])
+                    .env("CLERK_HOME", env.home())
+                    .env(SESSION_VAR, "sess-1")
+                    .env(CLAUDE_PID, std::process::id().to_string())
+                    .current_dir(&dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let out = lines(&mut child);
+                free(&env, "x", &theirs);
+                let mut seen = Vec::new();
+                while let Ok(line) = out.recv_timeout(Duration::from_secs(3)) {
+                    seen.push(line);
+                    if seen.last().is_some_and(|l| l.starts_with("Next: ")) {
+                        break;
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let text = seen.join("\n");
+                assert!(text.starts_with("## Notice: offered"), "{text}");
+                assert!(text.contains("## Lease lse_"), "{text}");
+                assert!(text.ends_with(&seen.last().unwrap().clone()), "{text}");
+                assert!(seen.last().unwrap().starts_with("Next: "), "{text}");
+            }
+
+            #[test]
+            fn an_error_in_follow_reaches_stdout() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let text = text_of(
+                    env.cmd()
+                        .args(["wait", "--follow"])
+                        .env(SESSION_VAR, "sess-1")
+                        .current_dir(&dir),
+                );
+                assert!(text.starts_with("## Error: agent_unidentified"), "{text}");
+            }
+        }
+
         mod on_user {
             use super::*;
 
