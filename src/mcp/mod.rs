@@ -19,10 +19,12 @@
 
 pub mod tools;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -44,7 +46,7 @@ use ulid::Ulid;
 
 use crate::engine::EngineHandle;
 use crate::model::{Caller, HolderRef, ProjectKey};
-use crate::scope::ProjectResolver;
+use crate::scope::{ProjectResolver, ScopeError};
 
 /// The agent session id (required).
 pub const SESSION_HEADER: &str = "x-clerk-session";
@@ -100,12 +102,23 @@ pub enum IdentityError {
     )]
     MissingSession,
     /// A header is present but malformed.
-    #[error("the {header} header is malformed: {reason}")]
+    #[error("the {} header is malformed: {reason}", display_name(.header))]
     BadHeader {
         /// The header name.
         header: &'static str,
         /// What is wrong with it.
         reason: &'static str,
+    },
+    /// `X-Clerk-Project` names a directory that does not resolve to a
+    /// project (it is gone, or cannot be read).
+    #[error(
+        "the X-Clerk-Project directory {} does not resolve to a project; start Claude Code in \
+         an existing directory",
+        .dir.display()
+    )]
+    UnresolvedProject {
+        /// The directory the header names.
+        dir: PathBuf,
     },
 }
 
@@ -115,7 +128,8 @@ pub enum IdentityError {
 struct Claimed {
     session_id: String,
     connection: Option<Ulid>,
-    project_dir: Option<PathBuf>,
+    /// The raw `X-Clerk-Project` value and the directory it names.
+    project: Option<(String, PathBuf)>,
     claude_pid: Option<u32>,
 }
 
@@ -147,39 +161,58 @@ impl Claimed {
             .transpose()?;
         let claude_pid = text(CLAUDE_PID_HEADER)?
             .map(|p| {
-                p.parse().map_err(|_| IdentityError::BadHeader {
+                parse_pid(p).ok_or(IdentityError::BadHeader {
                     header: CLAUDE_PID_HEADER,
                     reason: "not a process id",
                 })
             })
             .transpose()?;
-        let project_dir = text(PROJECT_HEADER)?.map(project_dir).transpose()?;
+        let project = text(PROJECT_HEADER)?
+            .map(|raw| Ok::<_, IdentityError>((raw.to_owned(), project_dir(raw)?)))
+            .transpose()?;
         Ok(Self {
             session_id,
             connection,
-            project_dir,
+            project,
             claude_pid,
         })
     }
 
     /// Resolve the project directory and the session id.
-    async fn resolve(self, engine: &EngineHandle) -> McpIdentity {
-        let project = match self.project_dir {
-            Some(dir) => tokio::task::spawn_blocking(move || resolve_project(&dir))
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "project resolution did not finish");
-                    None
-                }),
+    async fn resolve(self, id: &Identifier) -> Result<McpIdentity, IdentityError> {
+        let project = match self.project {
+            Some((raw, dir)) => Some(id.projects.project(&raw, dir).await?),
             None => None,
         };
-        McpIdentity {
-            session_id: resolve_session(engine, self.session_id).await,
+        Ok(McpIdentity {
+            session_id: resolve_session(&id.engine, self.session_id).await,
             connection: self.connection,
             project,
             claude_pid: self.claude_pid,
-        }
+        })
     }
+}
+
+/// A header name as people write it: `x-clerk-project` → `X-Clerk-Project`.
+fn display_name(header: &str) -> String {
+    header
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_ascii_uppercase().to_string() + chars.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// A process id: ASCII digits only (no sign, no spaces), fitting a `u32`.
+fn parse_pid(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// The directory an `X-Clerk-Project` value names; it must be absolute.
@@ -197,14 +230,79 @@ fn project_dir(value: &str) -> Result<PathBuf, IdentityError> {
     }
 }
 
-/// The project of `dir`, or none when it does not resolve (as for the CLI).
-fn resolve_project(dir: &std::path::Path) -> Option<ProjectKey> {
-    match ProjectResolver::resolve(dir) {
-        Ok(project) => Some(project),
-        Err(e) => {
-            tracing::debug!(error = %e, "no project for the MCP client's directory");
-            None
+/// How long a resolved project is reused before it is resolved again.
+const PROJECT_TTL: Duration = Duration::from_secs(300);
+/// The most `X-Clerk-Project` values remembered at once.
+const PROJECT_CACHE_MAX: usize = 256;
+
+/// Resolves a directory to its project.
+type Resolve = fn(&Path) -> Result<ProjectKey, ScopeError>;
+
+/// Resolved projects by raw `X-Clerk-Project` value, so a session's project
+/// is stable between requests and `git` is not spawned for every message.
+///
+/// An entry is reused for [`PROJECT_TTL`]. After that the value is resolved
+/// again; if that fails, the last known project still stands.
+struct ProjectCache {
+    resolve: Resolve,
+    ttl: Duration,
+    entries: Mutex<HashMap<String, (Instant, ProjectKey)>>,
+}
+
+impl ProjectCache {
+    fn new(resolve: Resolve, ttl: Duration) -> Self {
+        Self {
+            resolve,
+            ttl,
+            entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn entries(&self) -> MutexGuard<'_, HashMap<String, (Instant, ProjectKey)>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The project of header value `raw`, naming `dir`.
+    async fn project(&self, raw: &str, dir: PathBuf) -> Result<ProjectKey, IdentityError> {
+        let known = self.entries().get(raw).cloned();
+        if let Some((at, key)) = &known
+            && at.elapsed() < self.ttl
+        {
+            return Ok(key.clone());
+        }
+        let resolve = self.resolve;
+        let target = dir.clone();
+        let resolved = tokio::task::spawn_blocking(move || resolve(&target)).await;
+        match resolved {
+            Ok(Ok(key)) => {
+                self.remember(raw, key.clone());
+                Ok(key)
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "the MCP client's directory does not resolve");
+                known
+                    .map(|(_, key)| key)
+                    .ok_or(IdentityError::UnresolvedProject { dir })
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "project resolution did not finish");
+                known
+                    .map(|(_, key)| key)
+                    .ok_or(IdentityError::UnresolvedProject { dir })
+            }
+        }
+    }
+
+    fn remember(&self, raw: &str, key: ProjectKey) {
+        let mut entries = self.entries();
+        if entries.len() >= PROJECT_CACHE_MAX && !entries.contains_key(raw) {
+            let ttl = self.ttl;
+            entries.retain(|_, (at, _)| at.elapsed() < ttl);
+            if entries.len() >= PROJECT_CACHE_MAX {
+                entries.clear();
+            }
+        }
+        entries.insert(raw.to_owned(), (Instant::now(), key));
     }
 }
 
@@ -219,7 +317,8 @@ async fn resolve_session(_engine: &EngineHandle, session_id: String) -> String {
     session_id
 }
 
-/// Decode `%XX` escapes; `None` on a malformed escape.
+/// Decode `%XX` escapes (two ASCII hex digits); `None` on a malformed
+/// escape.
 fn percent_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -227,6 +326,9 @@ fn percent_decode(s: &str) -> Option<Vec<u8>> {
     while i < bytes.len() {
         if bytes[i] == b'%' {
             let hex = bytes.get(i + 1..i + 3)?;
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
             let hex = std::str::from_utf8(hex).ok()?;
             out.push(u8::from_str_radix(hex, 16).ok()?);
             i += 3;
@@ -236,6 +338,13 @@ fn percent_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// What the identity middleware needs.
+#[derive(Clone)]
+struct Identifier {
+    engine: EngineHandle,
+    projects: Arc<ProjectCache>,
 }
 
 /// The `/mcp` route for `engine`, to merge into the daemon's router.
@@ -248,20 +357,23 @@ pub fn router(engine: EngineHandle) -> Router {
         Arc::new(NeverSessionManager::default()),
         StreamableHttpServerConfig::default().with_legacy_session_mode(false),
     );
+    let identifier = Identifier {
+        engine,
+        projects: Arc::new(ProjectCache::new(ProjectResolver::resolve, PROJECT_TTL)),
+    };
     Router::new()
         .route_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(engine, identify))
+        .layer(middleware::from_fn_with_state(identifier, identify))
 }
 
 /// Build the request's [`McpIdentity`] into its extensions, or refuse it.
-async fn identify(
-    State(engine): State<EngineHandle>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    match Claimed::parse(request.headers()) {
-        Ok(claimed) => {
-            let identity = claimed.resolve(&engine).await;
+async fn identify(State(id): State<Identifier>, mut request: Request, next: Next) -> Response {
+    let identity = match Claimed::parse(request.headers()) {
+        Ok(claimed) => claimed.resolve(&id).await,
+        Err(e) => Err(e),
+    };
+    match identity {
+        Ok(identity) => {
             request.extensions_mut().insert(identity);
             next.run(request).await
         }
@@ -365,6 +477,132 @@ mod tests {
     }
 
     #[test]
+    fn percent_decode_refuses_a_signed_escape() {
+        assert_eq!(percent_decode("/a%+f"), None);
+    }
+
+    #[test]
+    fn percent_decode_refuses_a_non_hex_escape() {
+        assert_eq!(percent_decode("/a%g0"), None);
+    }
+
+    #[test]
+    fn display_name_capitalises_each_part() {
+        assert_eq!(display_name(PROJECT_HEADER), "X-Clerk-Project");
+    }
+
+    #[test]
+    fn parse_pid_takes_digits() {
+        assert_eq!(parse_pid("42"), Some(42));
+    }
+
+    #[test]
+    fn parse_pid_refuses_a_sign() {
+        assert_eq!(parse_pid("+42"), None);
+    }
+
+    #[test]
+    fn parse_pid_refuses_empty() {
+        assert_eq!(parse_pid(""), None);
+    }
+
+    #[test]
+    fn parse_refuses_a_signed_pid() {
+        let err = Claimed::parse(&headers(&[
+            (SESSION_HEADER, "s"),
+            (CLAUDE_PID_HEADER, "+42"),
+        ]));
+        assert!(
+            matches!(err, Err(IdentityError::BadHeader { header, .. }) if header == CLAUDE_PID_HEADER)
+        );
+    }
+
+    mod project_cache {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        use super::*;
+
+        fn key(n: u32) -> ProjectKey {
+            ProjectKey(PathBuf::from(format!("/p/{n}")))
+        }
+
+        static FLAKY_FAILS: AtomicBool = AtomicBool::new(false);
+
+        /// Resolves to `/p/1` until told to fail.
+        fn flaky(dir: &Path) -> Result<ProjectKey, ScopeError> {
+            if FLAKY_FAILS.load(Ordering::SeqCst) {
+                Err(ScopeError::NoSuchDirectory(dir.to_owned()))
+            } else {
+                Ok(key(1))
+            }
+        }
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        /// A new project every call.
+        // Must match `Resolve`, which can fail.
+        #[allow(clippy::unnecessary_wraps)]
+        fn counting(_dir: &Path) -> Result<ProjectKey, ScopeError> {
+            Ok(key(COUNTER.fetch_add(1, Ordering::SeqCst)))
+        }
+
+        fn failing(dir: &Path) -> Result<ProjectKey, ScopeError> {
+            Err(ScopeError::NoSuchDirectory(dir.to_owned()))
+        }
+
+        #[tokio::test]
+        async fn keeps_a_resolved_project_when_resolution_later_fails() {
+            let cache = ProjectCache::new(flaky, PROJECT_TTL);
+            let first = cache.project("/d", PathBuf::from("/d")).await.unwrap();
+            FLAKY_FAILS.store(true, Ordering::SeqCst);
+            let again = cache.project("/d", PathBuf::from("/d")).await.unwrap();
+            assert_eq!(again, first);
+        }
+
+        #[tokio::test]
+        async fn keeps_the_last_project_when_an_expired_entry_fails_to_resolve() {
+            static FAIL: AtomicBool = AtomicBool::new(false);
+            fn once(dir: &Path) -> Result<ProjectKey, ScopeError> {
+                if FAIL.swap(true, Ordering::SeqCst) {
+                    Err(ScopeError::NoSuchDirectory(dir.to_owned()))
+                } else {
+                    Ok(key(7))
+                }
+            }
+            let cache = ProjectCache::new(once, Duration::ZERO);
+            cache.project("/d", PathBuf::from("/d")).await.unwrap();
+            assert_eq!(cache.project("/d", PathBuf::from("/d")).await, Ok(key(7)));
+        }
+
+        #[tokio::test]
+        async fn reuses_an_entry_within_the_ttl() {
+            let cache = ProjectCache::new(counting, PROJECT_TTL);
+            let first = cache.project("/d", PathBuf::from("/d")).await.unwrap();
+            let again = cache.project("/d", PathBuf::from("/d")).await.unwrap();
+            assert_eq!(again, first);
+        }
+
+        #[tokio::test]
+        async fn resolves_again_after_the_ttl() {
+            let cache = ProjectCache::new(counting, Duration::ZERO);
+            let first = cache.project("/e", PathBuf::from("/e")).await.unwrap();
+            let again = cache.project("/e", PathBuf::from("/e")).await.unwrap();
+            assert_ne!(again, first);
+        }
+
+        #[tokio::test]
+        async fn refuses_a_directory_that_never_resolved() {
+            let cache = ProjectCache::new(failing, PROJECT_TTL);
+            assert_eq!(
+                cache.project("/gone", PathBuf::from("/gone")).await,
+                Err(IdentityError::UnresolvedProject {
+                    dir: PathBuf::from("/gone")
+                })
+            );
+        }
+    }
+
+    #[test]
     fn parse_requires_a_session() {
         assert_eq!(
             Claimed::parse(&headers(&[(PROJECT_HEADER, "/tmp")])),
@@ -411,7 +649,10 @@ mod tests {
             Claimed {
                 session_id: "s1".into(),
                 connection: Some(ulid),
-                project_dir: Some(PathBuf::from("/home/me/my repo")),
+                project: Some((
+                    "/home/me/my%20repo".into(),
+                    PathBuf::from("/home/me/my repo")
+                )),
                 claude_pid: Some(42),
             }
         );

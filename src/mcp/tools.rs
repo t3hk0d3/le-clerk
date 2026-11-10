@@ -733,17 +733,67 @@ mod tests {
         assert_eq!(unique.len(), names.len());
     }
 
+    /// Every object schema in `schema` (with properties) that allows extra
+    /// properties, by JSON pointer.
+    fn open_objects(schema: &Value, at: &str, found: &mut Vec<String>) {
+        match schema {
+            Value::Object(m) => {
+                if m.contains_key("properties")
+                    && m.get("additionalProperties") != Some(&json!(false))
+                {
+                    found.push(at.to_owned());
+                }
+                for (k, v) in m {
+                    open_objects(v, &format!("{at}/{k}"), found);
+                }
+            }
+            Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    open_objects(v, &format!("{at}/{i}"), found);
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[test]
-    fn every_schema_is_an_object_refusing_extra_properties() {
+    fn every_schema_is_an_object() {
         for tool in catalog() {
             assert_eq!(tool.input_schema["type"], json!("object"), "{}", tool.name);
-            assert_eq!(
-                tool.input_schema["additionalProperties"],
-                json!(false),
-                "{}",
-                tool.name
-            );
         }
+    }
+
+    #[test]
+    fn every_object_schema_refuses_extra_properties_at_any_depth() {
+        let mut found = Vec::new();
+        for tool in catalog() {
+            let schema = Value::Object((*tool.input_schema).clone());
+            open_objects(&schema, &tool.name, &mut found);
+        }
+        assert_eq!(found, Vec::<String>::new());
+    }
+
+    #[test]
+    fn unit_settings_schema_variants_refuse_extra_properties() {
+        let tool = catalog()
+            .into_iter()
+            .find(|t| t.name == "unit_add")
+            .unwrap();
+        let schema = Value::Object((*tool.input_schema).clone());
+        let text = schema.to_string();
+        assert!(text.contains("identity_key"), "{text}");
+        let mut found = Vec::new();
+        open_objects(&schema, "unit_add", &mut found);
+        assert_eq!(found, Vec::<String>::new());
+    }
+
+    #[test]
+    fn unit_settings_refuse_an_unknown_key() {
+        let r = parse::<UnitAddArgs>(
+            "unit_add",
+            json!({"resource": "r", "id": "u", "settings": {"type": "generic", "identity_key": "k", "holder": "x"}}),
+        );
+        assert!(r.is_err());
     }
 
     #[test]

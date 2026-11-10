@@ -70,9 +70,10 @@ pub enum ServiceMode {
     Listen,
 }
 
-/// Per-unit settings handed to the holder.
+/// Per-unit settings handed to the holder. Unknown keys are refused (the
+/// `type` tag excepted), so a misspelt field is an error, not a silent drop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UnitSettings {
     /// A device node.
     Device {

@@ -231,6 +231,13 @@ impl Raw {
         }
     }
 
+    /// Send `value` as header `name` instead of what the identity says.
+    fn with_header(mut self, name: &'static str, value: &str) -> Self {
+        self.headers.retain(|(k, _)| *k != name);
+        self.headers.push((name, value.to_owned()));
+        self
+    }
+
     /// The same identity, speaking 2025-11-25 (no per-request `_meta`).
     fn legacy(mut self) -> Self {
         self.version = "2025-11-25";
@@ -319,6 +326,28 @@ impl Raw {
         assert_eq!(result["isError"], json!(true), "{result}");
         result["structuredContent"]["error"].clone()
     }
+}
+
+/// Assert `reply` is an HTTP 400 JSON-RPC `-32600` refusal whose message
+/// contains `needle`.
+fn assert_refused(reply: &Reply, needle: &str) {
+    assert_eq!(reply.status, 400, "{}", reply.message);
+    assert!(reply.message.get("result").is_none(), "{}", reply.message);
+    let error = &reply.message["error"];
+    assert_eq!(error["code"], json!(-32600), "{error}");
+    assert!(
+        error["message"].as_str().unwrap().contains(needle),
+        "{error}"
+    );
+}
+
+/// `initialize` params of a 2025-11-25 client.
+fn initialize_params() -> Value {
+    json!({
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": {"name": "mcp-test", "version": "0"},
+    })
 }
 
 /// The text block of a tool result.
@@ -416,6 +445,100 @@ mod server {
                     .await;
                 assert_eq!(d.all_resources().await, Vec::<Value>::new());
             }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refuses_server_discover() {
+                let d = Daemon::start();
+                let reply = d.anonymous("a").request("server/discover", json!({})).await;
+                assert_refused(&reply, "X-Clerk-Session");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refuses_tools_list() {
+                let d = Daemon::start();
+                let reply = d.anonymous("a").request("tools/list", json!({})).await;
+                assert_refused(&reply, "X-Clerk-Session");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refuses_initialize() {
+                let d = Daemon::start();
+                let reply = d
+                    .anonymous("a")
+                    .legacy()
+                    .request("initialize", initialize_params())
+                    .await;
+                assert_refused(&reply, "X-Clerk-Session");
+            }
+        }
+
+        mod on_a_relative_x_clerk_project {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refuses_the_request_with_an_mcp_error() {
+                let d = Daemon::start();
+                let reply = d
+                    .session("s1", "a")
+                    .with_header("x-clerk-project", "relative/dir")
+                    .request("tools/list", json!({}))
+                    .await;
+                assert_refused(&reply, "X-Clerk-Project");
+            }
+        }
+
+        mod on_an_x_clerk_project_that_does_not_resolve {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refuses_the_request_naming_the_path() {
+                let d = Daemon::start();
+                let gone = d.dir.path().join("gone");
+                let reply = d
+                    .session("s1", "a")
+                    .with_header("x-clerk-project", &percent_encode(&gone))
+                    .request(
+                        "tools/call",
+                        json!({"name": "resource_create", "arguments": {"id": "x", "type": "generic"}}),
+                    )
+                    .await;
+                assert_refused(&reply, gone.to_str().unwrap());
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn changes_nothing() {
+                let d = Daemon::start();
+                let gone = d.dir.path().join("gone");
+                d.session("s1", "a")
+                    .with_header("x-clerk-project", &percent_encode(&gone))
+                    .request(
+                        "tools/call",
+                        json!({"name": "resource_create", "arguments": {"id": "x", "type": "generic"}}),
+                    )
+                    .await;
+                assert_eq!(d.all_resources().await, Vec::<Value>::new());
+            }
+        }
+
+        mod on_a_project_directory_that_goes_away_after_first_use {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn keeps_resolving_to_the_same_project() {
+                let d = Daemon::start();
+                let dir = d.dir.path().join("c");
+                std::fs::create_dir(&dir).unwrap();
+                let s = Raw::new(&d, Some("s1"), Some(&dir));
+                let created = s
+                    .ok("resource_create", json!({"id": "board", "type": "generic"}))
+                    .await;
+                std::fs::remove_dir(&dir).unwrap();
+                let listed = s.ok("resource_list", json!({})).await;
+                assert_eq!(
+                    listed["resources"][0]["scope"],
+                    created["resource"]["scope"]
+                );
+            }
         }
     }
 
@@ -468,16 +591,7 @@ mod server {
         async fn later_requests_still_take_identity_from_their_own_headers() {
             let d = Daemon::start();
             let first = d.session("s1", "a").legacy();
-            let reply = first
-                .request(
-                    "initialize",
-                    json!({
-                        "protocolVersion": "2025-11-25",
-                        "capabilities": {},
-                        "clientInfo": {"name": "mcp-test", "version": "0"},
-                    }),
-                )
-                .await;
+            let reply = first.request("initialize", initialize_params()).await;
             assert!(reply.message.get("result").is_some(), "{}", reply.message);
             d.session("s2", "b")
                 .legacy()
@@ -683,6 +797,48 @@ mod tools {
                 let text = text_of(&add_similar(&d).await);
                 assert!(text.contains("Tell the user"), "{text}");
                 assert!(text.contains("clerk approve"), "{text}");
+            }
+        }
+    }
+
+    mod unit_add {
+        use super::*;
+
+        mod on_an_unknown_key_inside_settings {
+            use super::*;
+
+            async fn add_with_extra(s: &Raw) -> Value {
+                s.ok("resource_create", json!({"id": "svc", "type": "service"}))
+                    .await;
+                s.call(
+                    "unit_add",
+                    json!({"resource": "svc", "id": "u1", "settings": {
+                        "type": "service", "mode": "connect", "host": "localhost", "port": 8080,
+                        "sevice_id": "typo"}}),
+                )
+                .await
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn returns_a_tool_error() {
+                let d = Daemon::start();
+                let result = add_with_extra(&d.session("s1", "a")).await;
+                assert_eq!(result["isError"], json!(true), "{result}");
+                let error = &result["structuredContent"]["error"];
+                assert_eq!(error["code"], json!("invalid_request"), "{error}");
+                assert!(
+                    error["message"].as_str().unwrap().contains("sevice_id"),
+                    "{error}"
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn adds_no_unit() {
+                let d = Daemon::start();
+                let s = d.session("s1", "a");
+                add_with_extra(&s).await;
+                let got = s.ok("resource_get", json!({"id": "svc"})).await;
+                assert_eq!(got["resource"]["units"], json!([]));
             }
         }
     }
