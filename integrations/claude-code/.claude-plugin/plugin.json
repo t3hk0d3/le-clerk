@@ -5,5 +5,14 @@
   "author": {
     "name": "Igor Yamolov"
   },
-  "keywords": ["lease", "resources", "devices", "ports", "coordination"]
+  "keywords": [
+    "lease",
+    "resources",
+    "devices",
+    "ports",
+    "coordination"
+  ],
+  "homepage": "https://github.com/t3hk0d3/le-clerk",
+  "repository": "https://github.com/t3hk0d3/le-clerk",
+  "license": "AGPL-3.0-only"
 }

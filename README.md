@@ -58,9 +58,12 @@ The first `clerk` command starts the daemon. After upgrading `clerk`, run
 The repository is also a Claude Code plugin marketplace:
 
 ```sh
-claude plugin marketplace add /path/to/le-clerk
+claude plugin marketplace add t3hk0d3/le-clerk
 claude plugin install leclerk@leclerk --scope user
 ```
+
+(For development, add your checkout instead: `claude plugin marketplace add
+/path/to/le-clerk`; Claude Code then reads the plugin in place.)
 
 Restart Claude Code. The plugin adds the `clerk` skill and four hooks. Optional:
 add `"Bash(clerk:*)"` and `"Monitor"` to `permissions.allow` to skip

@@ -43,13 +43,14 @@ Checked with Claude Code 2.1.321.
    `version_mismatch`, saying to run `clerk daemon restart`. Restarting keeps
    leases and queues; agents whose Claude Code still runs keep theirs.
 
-3. **Add the marketplace** (the repository checkout), from a shell:
+3. **Add the marketplace** (this GitHub repository), from a shell:
 
    ```sh
-   claude plugin marketplace add /path/to/leclerk
+   claude plugin marketplace add t3hk0d3/le-clerk
    ```
 
-   or inside a session: `/plugin marketplace add /path/to/leclerk`.
+   or inside a session: `/plugin marketplace add t3hk0d3/le-clerk`. To work
+   on the plugin, add your checkout instead (`/path/to/le-clerk`).
 
 4. **Install the plugin**, at the scope you want:
 
@@ -61,7 +62,8 @@ Checked with Claude Code 2.1.321.
    `--scope project` writes `"enabledPlugins": {"leclerk@leclerk": true}` to
    the project's `.claude/settings.json`; collaborators also need the
    marketplace added. Inside a session, `/plugin install leclerk@leclerk`
-   asks for the scope. A plugin from a local marketplace is read in place from
+   asks for the scope. `claude plugin marketplace update leclerk` fetches a
+   newer version from GitHub. A plugin from a local marketplace is read in place from
    the checkout (`claude plugin list` shows `Read from: …/integrations/claude-code`),
    so skill and hook edits apply on the next session start.
 

@@ -2,7 +2,8 @@
   "name": "leclerk",
   "description": "Le Clerk: a local resource-lease broker for AI coding agents.",
   "owner": {
-    "name": "Igor Yamolov"
+    "name": "Igor Yamolov",
+    "url": "https://github.com/t3hk0d3"
   },
   "plugins": [
     {
