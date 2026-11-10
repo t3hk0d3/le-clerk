@@ -20,8 +20,8 @@
 //! - stop: a block decision telling the agent to call `lease_wait`, when
 //!   the session holds a live lease or a queued request, has no open wait,
 //!   and `stop_hook_active` is false.
-//! - pre-tool-use: the session's pending notices that no hook has shown
-//!   yet, as `additionalContext` (at most [`MAX_CONTEXT`] characters; the
+//! - pre-tool-use (not inside a subagent, whose input has `agent_id`): the
+//!   session's pending notices that no hook has shown yet, as `additionalContext` (at most [`MAX_CONTEXT`] characters; the
 //!   rest are counted and shown by a later hook), then marked shown. They
 //!   stay pending for `lease_wait`.
 //! - session-end: the session's leases and requests end now, unless
@@ -100,6 +100,9 @@ struct HookInput {
     /// `Stop`.
     #[serde(default)]
     stop_hook_active: bool,
+    /// Set inside a subagent.
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 /// Run the hook; always exit 0. Only the hook's documented output reaches
@@ -249,6 +252,11 @@ impl Hook {
 
     /// Show the notices no hook has shown yet, and mark them shown.
     async fn pre_tool_use(&self) -> anyhow::Result<Option<Value>> {
+        // A subagent's tool call: the notices are for the main agent, which
+        // holds the leases and runs lease_wait.
+        if self.input.agent_id.is_some() {
+            return Ok(None);
+        }
         let session = self.client().await?;
         let brief = session
             .call("session_brief", json!({}), self.left())
@@ -347,6 +355,11 @@ fn plural(n: u64, what: &str) -> String {
 /// without notices. At most [`MAX_CONTEXT`] characters: notices that do
 /// not fit are counted, not shown (a later hook shows them).
 fn notice_context(notices: &[Value]) -> Option<(String, Vec<String>)> {
+    // A notice without an id cannot be marked shown: it is left out.
+    let notices: Vec<(&str, &Value)> = notices
+        .iter()
+        .filter_map(|n| n["id"].as_str().map(|id| (id, n)))
+        .collect();
     if notices.is_empty() {
         return None;
     }
@@ -357,10 +370,7 @@ fn notice_context(notices: &[Value]) -> Option<(String, Vec<String>)> {
     );
     let mut ids = Vec::new();
     let mut used = context.chars().count();
-    for notice in notices {
-        let Some(id) = notice["id"].as_str() else {
-            continue;
-        };
+    for (id, notice) in &notices {
         let line: String = notice_line(notice).chars().take(MAX_NOTICE_LINE).collect();
         let len = line.chars().count() + 1;
         if used + len + SUMMARY_ROOM > MAX_CONTEXT {
@@ -369,7 +379,7 @@ fn notice_context(notices: &[Value]) -> Option<(String, Vec<String>)> {
         context.push_str(&line);
         context.push('\n');
         used += len;
-        ids.push(id.to_owned());
+        ids.push((*id).to_owned());
     }
     let rest = notices.len() - ids.len();
     if rest > 0 {
@@ -438,6 +448,17 @@ mod tests {
         assert!(context.chars().count() <= MAX_CONTEXT);
         assert!(ids.len() < 50 && !ids.is_empty());
         assert!(context.contains(&format!("{} more notices", 50 - ids.len())));
+    }
+
+    #[test]
+    fn context_leaves_out_notices_without_an_id() {
+        let mut no_id = notice("N0", "Lost.");
+        no_id.as_object_mut().unwrap().remove("id");
+        assert!(notice_context(std::slice::from_ref(&no_id)).is_none());
+        let (context, ids) = notice_context(&[no_id, notice("N1", "Claim it.")]).unwrap();
+        assert_eq!(ids, vec!["N1".to_owned()]);
+        assert!(context.contains("1 pending notice "), "{context}");
+        assert!(!context.contains("more notice"), "{context}");
     }
 
     #[test]

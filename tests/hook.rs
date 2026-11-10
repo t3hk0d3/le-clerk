@@ -9,6 +9,7 @@ mod common;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::routing::{get, post};
+use leclerk::config::Paths;
 use leclerk::model::{Caller, HolderRef};
 use leclerk::store::{Store, StoreError};
 use serde_json::{Value, json};
@@ -119,6 +121,18 @@ fn typical(event: &str, session: &str) -> String {
     input(event, session, &extra)
 }
 
+/// The clerk paths of `home`.
+fn paths_in(home: &Path) -> Paths {
+    let home = home.to_path_buf();
+    Paths::from_lookup(move |k| (k == "CLERK_HOME").then(|| home.clone().into_os_string())).unwrap()
+}
+
+/// No daemon was started in `home`: its lock file was never created.
+fn assert_no_daemon(home: &Path) {
+    let paths = paths_in(home);
+    assert!(!paths.lock.exists(), "{} exists", paths.lock.display());
+}
+
 fn assert_silent_within(out: &Output, took: Duration, budget: Duration, what: &str) {
     assert!(out.status.success(), "{what}: {out:?}");
     assert!(out.stdout.is_empty(), "{what}: stdout {out:?}");
@@ -146,7 +160,7 @@ impl Wedged {
         let home = TempDir::new().unwrap();
         let run = home.path().join("run");
         fs::create_dir_all(&run).unwrap();
-        let listener = UnixListener::bind(run.join("clerk.sock")).unwrap();
+        let listener = UnixListener::bind(paths_in(home.path()).socket).unwrap();
         Self {
             home,
             _listener: listener,
@@ -171,7 +185,7 @@ impl Slow {
             .enable_all()
             .build()
             .unwrap();
-        let socket = run.join("clerk.sock");
+        let socket = paths_in(home.path()).socket;
         runtime.block_on(async {
             let listener = tokio::net::UnixListener::bind(socket).unwrap();
             let app = Router::new()
@@ -200,9 +214,13 @@ impl Slow {
 // ---------------------------------------------------------------------------
 
 /// A running `clerk mcp` whose parent (its Claude PID) is this test
-/// process. Dropping it kills it.
+/// process, or with [`Proxy::spawn_under_shell`] a shell standing for
+/// another Claude Code process. Dropping it kills it.
 struct Proxy {
     child: Child,
+    /// The child is a shell leading its own process group (the proxy is
+    /// in it).
+    group: bool,
     stdin: Option<ChildStdin>,
     lines: mpsc::Receiver<Value>,
     seen: Vec<Value>,
@@ -211,11 +229,27 @@ struct Proxy {
 
 impl Proxy {
     fn spawn(env: &Env, session: &str) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_clerk"));
+        cmd.arg("mcp");
+        Self::spawn_with(env, session, cmd, false)
+    }
+
+    /// A proxy whose parent is a shell: its Claude PID is not this
+    /// process's.
+    fn spawn_under_shell(env: &Env, session: &str) -> Self {
+        let mut cmd = Command::new("sh");
+        // `; :` keeps the shell from exec-ing the proxy.
+        cmd.args(["-c", "\"$CLERK\" mcp; :"])
+            .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
+            .process_group(0);
+        Self::spawn_with(env, session, cmd, true)
+    }
+
+    fn spawn_with(env: &Env, session: &str, mut cmd: Command, group: bool) -> Self {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         let stderr = File::create(env.home().join(format!("proxy-{n}.err"))).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_clerk"))
-            .arg("mcp")
+        let mut child = cmd
             .env("CLERK_HOME", env.home())
             .env(SESSION_VAR, session)
             .current_dir(env.dir("p"))
@@ -240,6 +274,7 @@ impl Proxy {
         });
         Self {
             child,
+            group,
             stdin,
             lines,
             seen: Vec::new(),
@@ -296,6 +331,11 @@ impl Proxy {
     }
 
     fn kill(&mut self) {
+        if self.group {
+            let pgid = libc::pid_t::try_from(self.child.id()).unwrap();
+            // SAFETY: kill(2) on our own child's process group.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -482,8 +522,8 @@ mod cli {
                         let (out, took) = run_hook(home.path(), event, &typical(event, "s1"), me());
                         assert_silent_within(&out, took, budget, event);
                     }
-                    assert!(!home.path().join("run").join("clerk.sock").exists());
-                    assert!(!home.path().join("run").join("clerk.lock").exists());
+                    assert!(!paths_in(home.path()).socket.exists());
+                    assert_no_daemon(home.path());
                 }
 
                 #[test]
@@ -494,7 +534,7 @@ mod cli {
                             run_hook(wedged.home.path(), event, &typical(event, "s1"), me());
                         assert_silent_within(&out, took, budget, event);
                     }
-                    assert!(!wedged.home.path().join("run").join("clerk.lock").exists());
+                    assert_no_daemon(wedged.home.path());
                 }
 
                 #[test]
@@ -505,7 +545,7 @@ mod cli {
                             run_hook(slow.home.path(), event, &typical(event, "s1"), me());
                         assert_silent_within(&out, took, budget, event);
                     }
-                    assert!(!slow.home.path().join("run").join("clerk.lock").exists());
+                    assert_no_daemon(slow.home.path());
                 }
 
                 #[test]
@@ -537,7 +577,8 @@ mod cli {
                     let fresh = TempDir::new().unwrap();
                     let (out, took) = run_hook(fresh.path(), "stop", "not json", me());
                     assert_silent_within(&out, took, BUDGET, "fresh home");
-                    assert!(!fresh.path().join("run").join("clerk.sock").exists());
+                    assert!(!paths_in(fresh.path()).socket.exists());
+                    assert_no_daemon(fresh.path());
                 }
             }
 
@@ -623,6 +664,29 @@ mod cli {
                 }
             }
 
+            mod on_source_resume_right_after_the_old_process_died {
+                use super::*;
+
+                #[test]
+                fn aliases_once_the_old_proxys_end_is_noticed() {
+                    let env = Env::new();
+                    // The old Claude Code process: another PID.
+                    let mut old = Proxy::spawn_under_shell(&env, "s1");
+                    let lease = board_held_by(&mut old);
+                    let mut new = Proxy::spawn(&env, "s2");
+                    new.tool("resource_list", &json!({}));
+                    wait_connected(&env, "s2");
+                    // No wait for the old stream to be noticed closed.
+                    old.kill();
+                    let doc = input("session-start", "s1", &json!({"source": "resume"}));
+                    let (out, took) = run_hook(env.home(), "session-start", &doc, me());
+                    assert_silent_within(&out, took, BUDGET, "session-start");
+                    assert_eq!(leases_of(&env, "s2"), vec![lease]);
+                    let refused = env.ok(&["log", "--action", "session_alias_refused"]);
+                    assert_eq!(refused, json!([]));
+                }
+            }
+
             mod on_any_other_source {
                 use super::*;
 
@@ -685,8 +749,11 @@ mod cli {
                     let mut p = Proxy::spawn(&env, "s1");
                     board_held_by(&mut p);
                     let wait = p.send_tool("lease_wait", &json!({}));
-                    // Give the wait time to reach the daemon and block there.
-                    thread::sleep(Duration::from_millis(500));
+                    let until = Instant::now() + PATIENCE;
+                    while brief(&env, "s1", me())["open_waits"].as_u64() < Some(1) {
+                        assert!(Instant::now() < until, "the lease_wait never opened");
+                        thread::sleep(Duration::from_millis(20));
+                    }
                     let (out, took) = run_hook(env.home(), "stop", &typical("stop", "s1"), me());
                     assert_silent_within(&out, took, BUDGET, "stop");
                     assert!(p.seen.iter().all(|m| m["id"] != json!(wait)));
@@ -761,6 +828,34 @@ mod cli {
                 }
             }
 
+            mod on_a_subagents_tool_call {
+                use super::*;
+
+                #[test]
+                fn outputs_nothing_and_marks_nothing() {
+                    let env = Env::new();
+                    let mut p = Proxy::spawn(&env, "s1");
+                    let notice = offered_to(&env, &mut p, "s1");
+                    let doc = input(
+                        "pre-tool-use",
+                        "s1",
+                        &json!({"tool_name": "Bash", "tool_input": {"command": "ls"},
+                                "tool_use_id": "toolu_1", "agent_id": "a1",
+                                "agent_type": "general-purpose"}),
+                    );
+                    let (out, took) = run_hook(env.home(), "pre-tool-use", &doc, me());
+                    assert_silent_within(&out, took, BUDGET, "subagent pre-tool-use");
+                    // The main agent's next tool call still shows it.
+                    let doc = typical("pre-tool-use", "s1");
+                    let (out, _) = run_hook(env.home(), "pre-tool-use", &doc, me());
+                    let context = stdout_json(&out)["hookSpecificOutput"]["additionalContext"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    assert!(context.contains(&notice), "{context}");
+                }
+            }
+
             mod on_none {
                 use super::*;
 
@@ -793,6 +888,25 @@ mod cli {
                         assert_silent_within(&out, took, END_BUDGET, reason);
                     }
                     assert_eq!(leases_of(&env, "s1"), vec![lease]);
+                }
+            }
+
+            mod on_reason_clear_or_resume_with_the_proxy_gone {
+                use super::*;
+
+                #[test]
+                fn ends_the_sessions_liveness_now() {
+                    for reason in ["clear", "resume"] {
+                        let env = Env::new();
+                        let mut p = Proxy::spawn(&env, "s1");
+                        board_held_by(&mut p);
+                        p.kill();
+                        wait_disconnected(&env, "s1");
+                        let doc = input("session-end", "s1", &json!({"reason": reason}));
+                        let (out, took) = run_hook(env.home(), "session-end", &doc, me());
+                        assert_silent_within(&out, took, END_BUDGET, reason);
+                        assert_eq!(leases_of(&env, "s1"), Vec::<String>::new(), "{reason}");
+                    }
                 }
             }
 

@@ -66,7 +66,9 @@ pub enum Resume {
     /// The resumed session holds nothing (no live lease, queued request
     /// or pending notice): there is nothing to take over.
     NothingHeld,
-    /// No proxy of that Claude Code process is connected yet. The resume
+    /// No proxy of that Claude Code process is connected yet, or the
+    /// resumed session still is (its old proxy's end not yet noticed). The
+    /// resume
     /// is remembered (see [`Sessions::resume_pending`]) and may be asked
     /// again.
     Pending,
@@ -278,7 +280,9 @@ impl Sessions {
     /// `now_ms`: the process's live proxy session takes `session_id` over
     /// ([`Sessions::alias`]). When no proxy of the process is connected yet
     /// (the hook can run before the proxy's liveness stream opens), nothing
-    /// moves and the resume is remembered for [`Sessions::resume_pending`]
+    /// moves and the resume is remembered for [`Sessions::resume_pending`];
+    /// likewise while the resumed session itself is still connected (its
+    /// old process just died, its stream not yet noticed closed). Remembered
     /// until the reconnect grace from now is over. Without a Claude PID the
     /// proxy cannot be found: `Pending`, remembering nothing. A resumed
     /// session that holds nothing is left alone (`NothingHeld`).
@@ -302,7 +306,11 @@ impl Sessions {
         let Some(pid) = claude_pid else {
             return Ok(Resume::Pending);
         };
-        let Some(proxy) = self.proxy_of(pid, session_id) else {
+        let proxy = self.proxy_of(pid, session_id);
+        // The resumed session still counts as connected right after its
+        // Claude Code process died (until its stream is noticed closed):
+        // wait for that like for a proxy not yet connected.
+        let Some(proxy) = proxy.filter(|p| !self.resumed_elsewhere(p, session_id)) else {
             self.pending.retain(|_, p| p.until > now_ms);
             self.pending.insert(
                 pid,
@@ -319,9 +327,10 @@ impl Sessions {
 
     /// A later hook of Claude Code process `claude_pid` for session
     /// `session_id` at `now_ms`: when a [`Sessions::start_resume`] of that
-    /// process and session is still pending and its proxy is connected now,
-    /// the alias is made (once, whatever its outcome). `None` when nothing
-    /// was pending or the proxy is still not connected.
+    /// process and session is still pending, its proxy is connected now
+    /// and the resumed session no longer is, the alias is made (once,
+    /// whatever its outcome). `None` when nothing was pending or it still
+    /// has to wait.
     ///
     /// # Errors
     /// [`SchedulerError::Store`] on storage failure.
@@ -349,8 +358,17 @@ impl Sessions {
         let Some(proxy) = self.proxy_of(pid, session_id) else {
             return Ok(None);
         };
+        if self.resumed_elsewhere(&proxy, session_id) {
+            return Ok(None);
+        }
         self.pending.remove(&pid);
         Ok(Some(self.alias(tx, sched, &proxy, session_id)?))
+    }
+
+    /// Whether resumed session `session_id` is another session than
+    /// `proxy` and still has an open liveness stream.
+    fn resumed_elsewhere(&self, proxy: &str, session_id: &str) -> bool {
+        self.follow(session_id) != proxy && self.is_alive(session_id)
     }
 
     /// Forget a pending resume of Claude Code process `claude_pid` (its
