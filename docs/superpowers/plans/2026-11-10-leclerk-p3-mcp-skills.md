@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Agents use the clerk through MCP. The daemon serves the MCP tools
+**Goal:** First polish the CLI's human output (Task 0). Then agents use the clerk through MCP. The daemon serves the MCP tools
 of spec §8.1 over Streamable HTTP on its Unix socket, `clerk mcp` bridges
 Claude Code's stdio to it with the session's identity, session liveness ends
 dead sessions' leases, hooks re-arm and surface notices, and a Claude Code
@@ -287,6 +287,76 @@ docs/claude-code.md     install and manual verification checklist
 ```
 
 ---
+
+### Task 0: CLI human output and smoke-test fixes
+
+Before MCP: the fixes from the 2026-11-10 CLI smoke test, and the human output
+format agreed with the user in `docs/cli-output.md` (the reference; its rules
+and mock-ups are the contract for this task).
+
+**Files:**
+- Create: `src/cli/render.rs` (shared styling, glyphs, holder/project/time
+  formatting, tables via `comfy-table`)
+- Modify: `Cargo.toml` (add `comfy-table`), `src/cli/{output,views,inventory,lease,live,admin,mod}.rs`
+- Modify (daemon, only if needed): the queued `acquire` result gains a
+  `blocked_by` field describing what blocks the request (unhealthy units with
+  their check message, held units with the earliest-ending holder and purpose,
+  or a linked unit busy); `not_found` errors gain details naming the missing
+  thing (`{"kind": "resource", "id": "nope"}`)
+- Test: `tests/cli.rs`, `tests/cli_tty.rs`, unit tests in `src/cli/render.rs`
+
+**Interfaces:**
+- `render::Style { color: bool, unicode: bool }` from `Style::detect(json: bool, ascii_flag: bool)`:
+  colour only on a TTY without `NO_COLOR`; Unicode unless `--ascii` or a
+  non-UTF-8 locale (`LC_ALL`/`LC_CTYPE`/`LANG`).
+- `render::holder(&Value) -> String`, `render::project(&ProjectKey) -> String`
+  (repo folder, `~` for home), `render::when(ms) -> String`,
+  `render::tags(&[String], &Style) -> String`, `render::table(...)`.
+- Global flag `--ascii`; `clerk log --wide`.
+
+**BDD skeleton:**
+```
+cli human output (stdout is a TTY)
+    any list or detail view
+        - never shortens resource, unit, lease, request or promotion IDs, or settings
+        - wraps free text instead of truncating it
+        - shows projects as the repo folder with ~ for home, never .../.git
+        - shows holders as cli / pid N / agent <8 chars> / agent in another project
+        - omits empty fields
+    style
+        On a TTY without NO_COLOR
+            - tags are bold cyan, resource IDs bold, ⚠ lines yellow; nothing else coloured
+        On NO_COLOR set
+            - no escape sequences
+        On --ascii or a non-UTF-8 locale
+            - no non-ASCII characters
+    resources / leases / queue / log / promotions
+        - match the mock-ups in docs/cli-output.md (tables, columns, occupancy bar)
+    status
+        - matches the mock-up (header with bar, unit tree, queue line)
+    resource show / grant / queued
+        - match the mock-ups; usage indented under its label
+    queued acquire
+        On every free unit unhealthy
+            - names the units and their check message and says they are re-checked
+        On units held
+            - names the holder and purpose of the one ending first
+    errors
+        On not_found
+            - names the missing kind and id
+        On a clap usage error in JSON mode
+            - message carries no "try '--help'" tail
+cli JSON output
+    - unchanged except additive fields (blocked_by, not_found details)
+```
+
+- [ ] **Step 1:** Write the failing tests (TTY views under `script`; style and
+  ASCII checks on raw bytes; the queued-reason and not_found cases).
+- [ ] **Step 2:** Run them; expected FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run fmt, clippy and the full suite; expected PASS. Re-run
+  the smoke scenarios by hand and compare against `docs/cli-output.md`.
+- [ ] **Step 5:** Commit: `feat(cli): human output format, tags styling, smoke-test fixes`
 
 ### Task 1: Verify first (spec §11) and pin dependencies
 
