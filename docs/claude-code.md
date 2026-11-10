@@ -37,11 +37,12 @@ Checked with Claude Code 2.1.321.
    You don't need to start the daemon: the first `clerk` command starts it.
    Hooks never start it.
 
-   **After installing or upgrading `clerk`, run `clerk daemon restart`.** A
-   daemon left running from an older build is refused by every client (each
-   checks the daemon's version and protocol): `clerk` commands exit 5 with
-   `version_mismatch`, saying to run `clerk daemon restart`. Restarting keeps
-   leases and queues; agents whose Claude Code still runs keep theirs.
+   **After installing or upgrading `clerk`, run `clerk daemon restart`** so
+   the daemon runs the new build. A daemon of another version keeps serving
+   clients as long as it speaks the same protocol; only a protocol change
+   makes clients refuse it (`protocol_mismatch`, exit 5, saying to run
+   `clerk daemon restart`). Restarting keeps leases and queues; agents whose
+   Claude Code still runs keep theirs.
 
 3. **Add the marketplace** (this GitHub repository), from a shell:
 

@@ -572,41 +572,26 @@ mod daemon {
             }
         }
 
-        mod on_version_mismatch {
+        /// Another version speaking the same protocol: compatible.
+        mod on_another_version_with_the_same_protocol {
             use super::*;
 
-            async fn other_version_daemon(h: &Harness) {
+            async fn other_version_daemon(h: &Harness) -> Client {
                 let launcher = h.launcher_with(&[("CLERK_TEST_DAEMON_VERSION", "0.0.0-other")]);
-                let err = Client::ensure_running_with(&h.paths, &launcher)
+                Client::ensure_running_with(&h.paths, &launcher)
                     .await
-                    .err()
-                    .unwrap();
-                assert!(
-                    matches!(err, DaemonError::VersionMismatch { .. }),
-                    "{err:?}"
-                );
+                    .unwrap()
             }
 
             #[tokio::test(flavor = "multi_thread")]
-            async fn returns_version_mismatch_with_both_versions() {
+            async fn clients_keep_working_with_it() {
                 let h = Harness::new();
                 other_version_daemon(&h).await;
-                let err = Client::ensure_running_with(&h.paths, &h.launcher())
+                let client = Client::ensure_running_with(&h.paths, &h.launcher())
                     .await
-                    .err()
                     .unwrap();
-                match err {
-                    DaemonError::VersionMismatch { client, daemon } => {
-                        assert_eq!(client, leclerk::VERSION);
-                        assert_eq!(daemon, "0.0.0-other");
-                    }
-                    other @ (DaemonError::Unavailable
-                    | DaemonError::Unresponsive { .. }
-                    | DaemonError::ProtocolMismatch { .. }
-                    | DaemonError::SocketPathTooLong(_)) => {
-                        panic!("expected a version mismatch, got {other:?}")
-                    }
-                }
+                assert_eq!(client.daemon().version, "0.0.0-other");
+                ok(&client, "status", &user("a"), json!({})).await;
             }
 
             #[tokio::test(flavor = "multi_thread")]
@@ -620,14 +605,10 @@ mod daemon {
             }
 
             #[tokio::test(flavor = "multi_thread")]
-            async fn connect_reports_it_too() {
+            async fn connect_accepts_it_too() {
                 let h = Harness::new();
                 other_version_daemon(&h).await;
-                let err = Client::connect(&h.paths).await.err().unwrap();
-                assert!(
-                    matches!(err, DaemonError::VersionMismatch { .. }),
-                    "{err:?}"
-                );
+                Client::connect(&h.paths).await.unwrap();
             }
         }
     }

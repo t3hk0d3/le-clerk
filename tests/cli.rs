@@ -1582,7 +1582,21 @@ mod cli {
             }
         }
 
-        mod on_version_mismatch {
+        mod on_another_version_with_the_same_protocol {
+            use super::*;
+
+            #[test]
+            fn works() {
+                let env = Env::new();
+                env.cmd()
+                    .env("CLERK_TEST_DAEMON_VERSION", "0.0.0-other")
+                    .arg("status")
+                    .assert()
+                    .success();
+            }
+        }
+
+        mod on_protocol_mismatch {
             use super::*;
 
             #[test]
@@ -1590,11 +1604,11 @@ mod cli {
                 let env = Env::new();
                 let error = error_of(
                     env.cmd()
-                        .env("CLERK_TEST_DAEMON_VERSION", "0.0.0-other")
+                        .env("CLERK_TEST_DAEMON_PROTOCOL", "1")
                         .arg("status"),
                     5,
                 );
-                assert_eq!(error["code"], "version_mismatch");
+                assert_eq!(error["code"], "protocol_mismatch");
                 let message = error["message"].as_str().unwrap();
                 assert!(message.contains("clerk daemon restart"), "{message}");
             }

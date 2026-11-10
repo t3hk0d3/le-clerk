@@ -56,17 +56,6 @@ pub enum DaemonError {
          then retry"
     )]
     Unavailable,
-    /// The daemon runs a different version than this client.
-    #[error(
-        "the clerk daemon runs version {daemon} but this clerk is {client}; run `clerk daemon \
-         restart` to switch"
-    )]
-    VersionMismatch {
-        /// This client's version.
-        client: String,
-        /// The running daemon's version.
-        daemon: String,
-    },
     /// The daemon runs this version but speaks another protocol, or none
     /// (a daemon built before protocols).
     #[error(
@@ -108,9 +97,7 @@ impl ErrorCode for DaemonError {
     fn code(&self) -> &'static str {
         match self {
             DaemonError::Unavailable => "daemon_unavailable",
-            DaemonError::VersionMismatch { .. } | DaemonError::ProtocolMismatch { .. } => {
-                "version_mismatch"
-            }
+            DaemonError::ProtocolMismatch { .. } => "protocol_mismatch",
             DaemonError::Unresponsive { .. } => "daemon_unresponsive",
             DaemonError::SocketPathTooLong(_) => "socket_path_too_long",
         }
@@ -161,18 +148,14 @@ pub struct DaemonInfo {
 }
 
 impl DaemonInfo {
-    /// Whether this client can talk to the daemon: same version, same
-    /// protocol.
+    /// Whether this client can talk to the daemon: the same protocol (the
+    /// version may differ).
     ///
     /// # Errors
-    /// [`DaemonError::VersionMismatch`] or [`DaemonError::ProtocolMismatch`].
+    /// [`DaemonError::ProtocolMismatch`].
     pub fn check(&self) -> Result<(), DaemonError> {
-        if self.version != crate::VERSION {
-            return Err(DaemonError::VersionMismatch {
-                client: crate::VERSION.to_owned(),
-                daemon: self.version.clone(),
-            });
-        }
+        // Only the protocol decides compatibility: another version speaking
+        // the same protocol serves this client unchanged.
         if self.protocol != Some(crate::PROTOCOL) {
             return Err(DaemonError::ProtocolMismatch {
                 client: crate::PROTOCOL,
@@ -304,9 +287,8 @@ impl Client {
     /// Connect to the running daemon and check its version.
     ///
     /// # Errors
-    /// As [`Client::probe`]; [`DaemonError::VersionMismatch`] when the
-    /// daemon is another version, [`DaemonError::ProtocolMismatch`] when it
-    /// speaks another protocol (or none).
+    /// As [`Client::probe`]; [`DaemonError::ProtocolMismatch`] when the
+    /// daemon speaks another protocol (or none).
     pub async fn connect(paths: &Paths) -> Result<Self, DaemonError> {
         Self::connect_within(paths, PROBE_TIMEOUT).await
     }
@@ -379,8 +361,8 @@ impl Client {
     /// are started per call.
     ///
     /// # Errors
-    /// [`DaemonError::VersionMismatch`] when a daemon of another version
-    /// runs (it is not replaced); [`DaemonError::Unresponsive`] when a
+    /// [`DaemonError::ProtocolMismatch`] when a daemon speaking another
+    /// protocol runs (it is not replaced); [`DaemonError::Unresponsive`] when a
     /// daemon holds the lock but never answered; [`DaemonError::Unavailable`]
     /// when no daemon
     /// answered in time.

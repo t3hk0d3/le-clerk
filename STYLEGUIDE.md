@@ -51,3 +51,15 @@ The single styleguide for this project. Every task and plan follows it.
 ## Commits
 - Conventional Commits: `feat:`, `fix:`, `test:`, `docs:`, `chore:`,
   `refactor:`. One task per commit or fewer.
+
+## Protocol
+- `PROTOCOL` (`src/lib.rs`) is the wire contract between `clerk` clients and
+  the daemon; the crate version is not. A client works with any daemon that
+  speaks its protocol, whatever its version.
+- Bump `PROTOCOL` when a change breaks the other side: a route or RPC method
+  removed or renamed, a request or answer field removed, renamed or made
+  required, or a field's meaning changed.
+- Do not bump it for additive changes the other side tolerates: a new
+  optional answer field, a new route, or a new optional request field that
+  the client sends only when it is used (an old daemon refuses unknown
+  fields, so it must never see one by default).

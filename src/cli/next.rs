@@ -65,7 +65,7 @@ pub fn after_error(code: &str) -> &'static str {
         | "database_error" => {
             "Try again in a moment; if it fails again, tell the user the clerk is not working."
         }
-        "version_mismatch" | "protocol_mismatch" => {
+        "protocol_mismatch" => {
             "Tell the user the clerk daemon must be restarted (`clerk daemon restart`)."
         }
         "agent_unidentified" => "Tell the user Claude Code needs updating.",

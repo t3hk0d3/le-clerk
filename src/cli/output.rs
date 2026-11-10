@@ -211,7 +211,7 @@ fn exit_for(code: &str) -> u8 {
         "not_found" | "unknown_method" => EXIT_NOT_FOUND,
         "daemon_unavailable"
         | "daemon_unresponsive"
-        | "version_mismatch"
+        | "protocol_mismatch"
         | "engine_unavailable" => EXIT_DAEMON,
         "invalid_request"
         | "invalid_argument"
@@ -473,7 +473,7 @@ mod tests {
                 &[
                     "daemon_unavailable",
                     "daemon_unresponsive",
-                    "version_mismatch",
+                    "protocol_mismatch",
                     "engine_unavailable",
                 ],
             ),
