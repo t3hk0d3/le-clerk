@@ -176,26 +176,59 @@ async fn claim_if_offered(
     )
 }
 
-/// One `--follow` line for `notice`.
+/// The fields of a notice an agent acts on; the rest (its id, holder,
+/// creation time) only lengthen a Monitor event, which Monitor cuts short.
+fn compact_notice(notice: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for k in [
+        "kind",
+        "action",
+        "resource",
+        "unit",
+        "lease_id",
+        "request_id",
+        "deadline",
+        "position",
+        "other_purpose",
+    ] {
+        if let Some(v) = notice.get(k).filter(|v| !v.is_null()) {
+            out.insert(k.to_owned(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+/// One `--follow` line for `notice`: short, since Monitor cuts long events
+/// (the claimed lease's description and usage are in `clerk leases --mine`).
 fn follow_line(notice: &Value, claimed: Option<Result<Value, String>>) -> Value {
-    let mut summary = vec![action_of(notice)];
-    let mut line = json!({ "notice": notice });
+    let mut line = json!({ "notice": compact_notice(notice) });
     let next = match claimed {
         Some(Ok(lease)) => {
-            summary.push(format!(
-                "Claimed: you hold lease {} now; read its description and usage in `claimed`.",
-                lease["lease_id"].as_str().unwrap_or("?")
-            ));
-            line["claimed"] = lease;
-            "Use the unit, then `clerk release <lease>` when you are done.".to_owned()
+            // Claimed: the offer's deadline, request and "claim it" text are
+            // spent.
+            line["notice"] = json!({
+                "kind": notice["kind"],
+                "resource": notice["resource"],
+                "unit": notice["unit"],
+            });
+            let id = lease["lease_id"].as_str().unwrap_or("?").to_owned();
+            line["claimed"] = json!({
+                "lease_id": id,
+                "resource": lease["resource"],
+                "unit": lease["unit"],
+                "ends_at": lease["ends_at"],
+            });
+            format!(
+                "It is yours (claimed). Read its description and usage with `clerk leases --mine`, \
+                 use it, then `clerk release {id}`."
+            )
         }
-        Some(Err(e)) => {
-            summary.push(format!("Could not claim the offered lease: {e}."));
-            "Run `clerk leases --mine` to see where you stand.".to_owned()
-        }
+        Some(Err(e)) => format!(
+            "Could not claim the offered lease ({e}); run `clerk leases --mine` to see where you \
+             stand."
+        ),
         None => "Act on the notice as it says.".to_owned(),
     };
-    line["summary"] = json!(summary);
     line["next"] = json!(next);
     line
 }
@@ -257,6 +290,9 @@ fn print(format: Format, value: &Value) -> anyhow::Result<()> {
     let now = leclerk::clock::Clock::now_ms(&leclerk::clock::SystemClock);
     match format {
         Format::Json => writeln!(stdout, "{value}")?,
+        Format::Markdown if value.get("notice").is_some() => {
+            writeln!(stdout, "{}\n", super::md::follow(value, now))?;
+        }
         Format::Markdown => writeln!(stdout, "{}\n", super::md::wait(value, now))?,
         Format::Human => writeln!(stdout, "{}\n", human(value))?,
     }

@@ -102,6 +102,54 @@ pub fn wait(value: &Value, now_ms: i64) -> String {
     parts.join("\n\n")
 }
 
+/// A `clerk wait --follow` event: the notice's heading and action, its
+/// lease or request, deadline and the claimed lease on one line each, then
+/// `Next:`. Short, since Monitor cuts long events.
+#[must_use]
+pub fn follow(value: &Value, now_ms: i64) -> String {
+    let n = &value["notice"];
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    let mut lines = vec![format!(
+        "## Notice: {}",
+        s(n, "kind").unwrap_or_else(|| "notice".to_owned())
+    )];
+    if let Some(a) = s(n, "action") {
+        lines.push(a);
+    }
+    if let Some(r) = s(n, "resource") {
+        let at = s(n, "unit").map_or(r.clone(), |u| format!("{r}/{u}"));
+        lines.push(format!("- unit: {at}"));
+    }
+    for (k, label) in [
+        ("lease_id", "lease"),
+        ("request_id", "request"),
+        ("other_purpose", "other"),
+    ] {
+        if let Some(v) = s(n, k) {
+            lines.push(format!("- {label}: {v}"));
+        }
+    }
+    if let Some(p) = n.get("position").filter(|p| !p.is_null()) {
+        lines.push(format!("- position: {p}"));
+    }
+    if let Some(d) = n.get("deadline").filter(|d| !d.is_null()) {
+        lines.push(format!("- deadline: {}", scalar("deadline", d, now_ms)));
+    }
+    let c = &value["claimed"];
+    if let Some(id) = s(c, "lease_id") {
+        let ends = c
+            .get("ends_at")
+            .filter(|e| !e.is_null())
+            .map(|e| format!(", until {}", scalar("ends_at", e, now_ms)))
+            .unwrap_or_default();
+        lines.push(format!("- claimed: {id}{ends}"));
+    }
+    if let Some(next) = s(value, "next") {
+        lines.push(format!("Next: {next}"));
+    }
+    lines.join("\n")
+}
+
 /// An error, for an agent: heading, message (ending with the next step),
 /// then its details as labelled fields.
 #[must_use]

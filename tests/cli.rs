@@ -3708,7 +3708,7 @@ mod cli {
                     let first: Value =
                         serde_json::from_str(&out.recv_timeout(PATIENCE).unwrap()).unwrap();
                     assert_eq!(first["notice"]["kind"], "offered", "{first}");
-                    assert_eq!(first["claimed"]["state"], "held", "{first}");
+                    assert!(first["claimed"]["lease_id"].is_string(), "{first}");
                     assert!(first["next"].is_string(), "{first}");
                     let lease = first["claimed"]["lease_id"].as_str().unwrap().to_owned();
                     env.rpc(
@@ -3722,6 +3722,91 @@ mod cli {
                     assert_eq!(second["notice"]["kind"], "lease_ended", "{second}");
                     assert!(child.0.try_wait().unwrap().is_none(), "still running");
                 }
+            }
+        }
+
+        /// Research finding 2: Monitor cuts events at ~500 characters, so a
+        /// `--follow` event stays short even for a resource with long usage.
+        mod on_follow_with_long_usage {
+            use super::*;
+
+            fn first_event(env: &Env, dir: &Path, json: bool) -> String {
+                env.ok(&[
+                    "resource",
+                    "create",
+                    "board",
+                    "--type",
+                    "generic",
+                    "--usage",
+                    &"Flash it with the vendor tool; hold BOOT while plugging in. ".repeat(20),
+                ]);
+                env.ok(&["unit", "add", "board", "u1", "--key", "k1"]);
+                let theirs = hold(env, "x");
+                env.agent("sess-1", dir)
+                    .args(["acquire", "board", "--for", "10m"])
+                    .assert()
+                    .code(6);
+                let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"));
+                if json {
+                    cmd.arg("--json");
+                }
+                let mut child = cmd
+                    .args(["wait", "--follow"])
+                    .env("CLERK_HOME", env.home())
+                    .env(SESSION_VAR, "sess-1")
+                    .env(CLAUDE_PID, std::process::id().to_string())
+                    .current_dir(dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let out = lines(&mut child);
+                free(env, "x", &theirs);
+                let mut event = Vec::new();
+                while let Ok(line) = out.recv_timeout(Duration::from_secs(3)) {
+                    let last = json || line.starts_with("Next: ");
+                    event.push(line);
+                    if last {
+                        break;
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                event.join("\n")
+            }
+
+            #[test]
+            fn a_markdown_event_is_under_500_characters_with_notice_lease_and_next() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let event = first_event(&env, &dir, false);
+                assert!(
+                    event.chars().count() < 500,
+                    "{} chars:\n{event}",
+                    event.chars().count()
+                );
+                assert!(event.starts_with("## Notice: offered"), "{event}");
+                assert!(event.contains("lse_"), "{event}");
+                assert!(
+                    event.lines().last().unwrap().starts_with("Next: "),
+                    "{event}"
+                );
+            }
+
+            #[test]
+            fn a_json_event_is_under_500_characters_with_notice_lease_and_next() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let event = first_event(&env, &dir, true);
+                assert!(
+                    event.chars().count() < 500,
+                    "{} chars:\n{event}",
+                    event.chars().count()
+                );
+                let v: Value = serde_json::from_str(&event).unwrap();
+                assert_eq!(v["notice"]["kind"], "offered", "{v}");
+                assert!(v["claimed"]["lease_id"].is_string(), "{v}");
+                assert!(v["next"].is_string(), "{v}");
             }
         }
 
@@ -3794,7 +3879,7 @@ mod cli {
                 let _ = child.wait();
                 let text = seen.join("\n");
                 assert!(text.starts_with("## Notice: offered"), "{text}");
-                assert!(text.contains("## Lease lse_"), "{text}");
+                assert!(text.contains("- claimed: lse_"), "{text}");
                 assert!(text.ends_with(&seen.last().unwrap().clone()), "{text}");
                 assert!(seen.last().unwrap().starts_with("Next: "), "{text}");
             }
