@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stand-in API dev server for the demo: listens on $CLERK_UNIT_PORT a few seconds.
+echo "API listening on http://127.0.0.1:$CLERK_UNIT_PORT"
+python3 -m http.server "$CLERK_UNIT_PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+sleep "${SERVE_SECS:-6}"; kill $!
+echo "API stopped"
