@@ -605,6 +605,61 @@ impl Client {
         let result = decode(status, &body)?;
         serde_json::from_value(result).map_err(|e| ApiError::new("bad_response", e.to_string()))
     }
+
+    /// One step of agent session `session`'s notice wait from `host`, up to
+    /// `secs` seconds (the daemon caps it at 60): the daemon's
+    /// `{"status": ...}` answer (see `GET /v1/agent/wait`).
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub async fn agent_wait(
+        &self,
+        session: &str,
+        host: Host,
+        secs: u64,
+        first: bool,
+    ) -> Result<Value, ApiError> {
+        let host = serde_json::to_string(&host)
+            .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
+        let query = serde_urlencoded::to_string([
+            ("session", session.to_owned()),
+            ("host", host),
+            ("wait", secs.to_string()),
+            ("first", first.to_string()),
+        ])
+        .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
+        let path = format!("/v1/agent/wait?{query}");
+        let wait = Duration::from_secs(secs).min(crate::engine::MAX_WAIT);
+        let (status, body) = send(
+            &self.socket,
+            Method::GET,
+            &path,
+            None,
+            wait + LONG_POLL_SLACK,
+        )
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+        decode(status, &body)
+    }
+
+    /// Mark agent session `session`'s notices `ids` delivered.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub async fn agent_ack(&self, session: &str, ids: &[String]) -> Result<Value, ApiError> {
+        let body = serde_json::to_vec(&json!({ "session": session, "ids": ids }))
+            .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
+        let (status, body) = send(
+            &self.socket,
+            Method::POST,
+            "/v1/agent/ack",
+            Some(body),
+            CALL_TIMEOUT,
+        )
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+        decode(status, &body)
+    }
 }
 
 /// Why a daemon did not answer: [`DaemonError::Unavailable`] when nothing

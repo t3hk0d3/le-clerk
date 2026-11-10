@@ -128,6 +128,36 @@ impl Sessions {
         Ok(Reported { unhosted })
     }
 
+    /// Whether a notice wait of `session_id` from `host` may run, at
+    /// `now_ms`. A wait never takes a session back from the session its
+    /// process runs now (a wait started before `/clear` must not undo it):
+    /// refused when `host` runs another session and not this one.
+    /// Otherwise `host` is reported as the session's host (a wait may be
+    /// the first call of a resumed session) and the wait may run.
+    ///
+    /// # Errors
+    /// [`StoreError`] on storage failure.
+    pub fn admit_wait(
+        &mut self,
+        tx: &Tx,
+        session_id: &str,
+        host: Host,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        if self.host_of(session_id) == Some(host) {
+            return Ok(true);
+        }
+        let elsewhere = self
+            .known
+            .iter()
+            .any(|(id, s)| id.as_str() != session_id && s.host == Some(host));
+        if elsewhere {
+            return Ok(false);
+        }
+        self.report(tx, session_id, host, now_ms)?;
+        Ok(true)
+    }
+
     /// Unhost every session whose host process is gone at `now_ms`; their
     /// grace starts. Returns those sessions.
     ///

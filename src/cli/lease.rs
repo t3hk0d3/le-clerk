@@ -7,8 +7,7 @@
 //! `--wait`, it waits for the offer and claims it); `attach` claims an
 //! offered lease and prints it, and `cancel` withdraws a queued request.
 //!
-//! `wait` refuses to run in an agent session: MCP `lease_wait` owns its
-//! notices.
+//! `wait` in an agent session is [`super::wait::agent`].
 //!
 //! Leases of the user's CLI (no agent session) belong to lease-scoped
 //! `User` holders. `attach`, `release` and `extend` act as the holder the
@@ -138,7 +137,15 @@ pub struct RunArgs {
 pub struct WaitArgs {
     /// Return after the first batch of notices (or after 30 s with none).
     #[arg(long)]
-    once: bool,
+    pub once: bool,
+    /// Agent sessions: print one JSON line per notice as it arrives and
+    /// keep running until the session ends (for Claude Code's Monitor tool).
+    #[arg(long)]
+    pub follow: bool,
+    /// Agent sessions: give up after this long with an empty batch:
+    /// <n>s|m|h|d.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub timeout: Option<Duration>,
 }
 
 // ---------------------------------------------------------------------------
@@ -362,14 +369,7 @@ pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
 pub async fn wait(ctx: &Ctx, args: WaitArgs) -> anyhow::Result<()> {
     let caller = ctx.caller(CallerKind::Detached)?;
     if caller::is_agent(&caller) {
-        // MCP's lease_wait owns the session's notices (they stay pending
-        // until acknowledged); taking them here would hide them from it.
-        return Err(UsageError(format!(
-            "clerk wait does not run in an agent session ({} is set): call the clerk MCP tool \
-             lease_wait instead, which returns this session's notices and claims its offers.",
-            caller::SESSION_VAR
-        ))
-        .into());
+        return super::wait::agent(ctx, &caller, &args).await;
     }
     let client = ctx.client().await?;
     loop {

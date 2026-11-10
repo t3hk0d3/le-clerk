@@ -16,6 +16,7 @@ mod live;
 mod output;
 mod render;
 mod views;
+mod wait;
 
 use std::process::ExitCode;
 

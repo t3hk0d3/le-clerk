@@ -11,6 +11,14 @@
 //!   `leases=<id,id…>` and `requests=<id,id…>` narrow it to notices naming
 //!   one of those; the holder's other notices stay pending.
 //!
+//! - `GET /v1/agent/wait?session=<id>&host=<Host JSON>&wait=<secs, max
+//!   60>&first=<bool>` → `200 {"result": {"status": "notices", "notices":
+//!   [...]} | {"status": "timeout" | "armed" | "ended"}}`: one step of an
+//!   agent session's `clerk wait` (see [`EngineHandle::agent_wait`]); the
+//!   notices stay pending until acknowledged.
+//! - `POST /v1/agent/ack` with `{"session": "<id>", "ids": [...]}` →
+//!   `200 {"result": <count marked delivered>}`.
+//!
 //! Status mapping: 404 not found or unknown method, 409 conflict/refused,
 //! 422 invalid request or argument, 500 internal, 503 engine stopped.
 
@@ -27,7 +35,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::engine::{ApiError, Command, EngineHandle, ErrorKind, HookCommand, MAX_WAIT};
-use crate::model::{Caller, HolderRef, Host};
+use crate::model::{Caller, HolderRef, Host, NoticeId};
 use crate::store::notices::NoticeFilter;
 
 /// What `GET /v1/version` reports.
@@ -76,6 +84,8 @@ pub fn router_with(engine: EngineHandle, info: &ServerInfo) -> Router {
         )
         .route("/v1/rpc/{method}", post(rpc))
         .route("/v1/notices", get(notices))
+        .route("/v1/agent/wait", get(agent_wait))
+        .route("/v1/agent/ack", post(agent_ack))
         .with_state(engine)
 }
 
@@ -239,6 +249,68 @@ async fn notices(
     let wait = Duration::from_secs(query.wait).min(MAX_WAIT);
     match engine.wait_notices_matching(holder, filter, wait).await {
         Ok(list) => ok(list),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The query of `GET /v1/agent/wait`.
+#[derive(Deserialize)]
+struct AgentWaitQuery {
+    session: String,
+    /// The JSON encoding of the waiting process.
+    host: String,
+    #[serde(default)]
+    wait: u64,
+    #[serde(default)]
+    first: bool,
+}
+
+async fn agent_wait(
+    State(engine): State<EngineHandle>,
+    query: Result<Query<AgentWaitQuery>, QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(q) => q,
+        Err(e) => return ApiError::invalid_request(e.body_text()).into_response(),
+    };
+    let host: Host = match serde_json::from_str(&query.host) {
+        Ok(h) => h,
+        Err(e) => {
+            return ApiError::invalid_request(format!("host is not a valid Host: {e}"))
+                .into_response();
+        }
+    };
+    let wait = Duration::from_secs(query.wait);
+    match engine
+        .agent_wait(query.session, host, wait, query.first)
+        .await
+    {
+        Ok(answer) => ok(answer),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The body of `POST /v1/agent/ack`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentAck {
+    session: String,
+    ids: Vec<NoticeId>,
+}
+
+async fn agent_ack(State(engine): State<EngineHandle>, body: Bytes) -> Response {
+    let ack: AgentAck = match serde_json::from_slice(&body) {
+        Ok(a) => a,
+        Err(e) => {
+            return ApiError::invalid_request(format!("request body is not valid: {e}"))
+                .into_response();
+        }
+    };
+    let holder = HolderRef::AgentSession {
+        session_id: ack.session,
+    };
+    match engine.ack_notices(holder, ack.ids).await {
+        Ok(n) => ok(n),
         Err(e) => e.into_response(),
     }
 }

@@ -269,10 +269,29 @@ enum Job {
     PendingNotices(HolderRef, Reply<Vec<Notice>>),
     /// An agent call or hook reported the process running a session.
     ReportHost(String, Host, Reply<()>),
+    /// May a notice wait of a session from a host run? (See
+    /// [`Sessions::admit_wait`].)
+    AdmitWait(String, Host, Reply<bool>),
     /// Whether an agent session has a running host.
     SessionAlive(String, Reply<bool>),
     /// A Claude Code hook's RPC.
     Hook(Box<HookCommand>, Reply<HookAnswer>),
+}
+
+/// What one step of an agent session's notice wait came to
+/// ([`EngineHandle::agent_wait`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", content = "notices", rename_all = "snake_case")]
+pub enum AgentWait {
+    /// Pending notices, oldest first (not yet delivered).
+    Notices(Vec<Notice>),
+    /// None arrived in time.
+    Timeout,
+    /// Another wait of the session is open.
+    Armed,
+    /// The session's process runs another session now, so this wait is
+    /// over.
+    Ended,
 }
 
 /// The canonical key of a holder: its JSON encoding, as stored with its
@@ -577,6 +596,44 @@ impl EngineHandle {
             .get(&holder_key(holder))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// One step of an agent session's notice wait (`clerk wait`) from
+    /// `host`: up to `timeout` (capped at [`MAX_WAIT`]) for pending notices,
+    /// returned without delivering them (the CLI acknowledges them once
+    /// printed, [`EngineHandle::ack_notices`]). `first` marks a wait's
+    /// first step, which refuses to run while another wait of the session
+    /// is open. The wait counts as open (armed) while it blocks.
+    ///
+    /// # Errors
+    /// A storage failure, or `engine_unavailable`.
+    pub async fn agent_wait(
+        &self,
+        session_id: String,
+        host: Host,
+        timeout: Duration,
+        first: bool,
+    ) -> Result<AgentWait, ApiError> {
+        let holder = HolderRef::AgentSession {
+            session_id: session_id.clone(),
+        };
+        if !self
+            .ask(|reply| Job::AdmitWait(session_id, host, reply))
+            .await?
+        {
+            return Ok(AgentWait::Ended);
+        }
+        if first && self.open_waits(&holder) > 0 {
+            return Ok(AgentWait::Armed);
+        }
+        let _open = self.open_wait(&holder);
+        let got = self
+            .wait_until(&holder, timeout.min(MAX_WAIT), || async {
+                let got = self.return_notices(holder.clone(), None).await?;
+                Ok((!got.is_empty()).then_some(got))
+            })
+            .await?;
+        Ok(got.map_or(AgentWait::Timeout, AgentWait::Notices))
     }
 
     /// Agent session `session_id` is run by `host` (an agent call or hook
@@ -885,6 +942,17 @@ impl Engine {
             Job::PendingNotices(holder, reply) => {
                 let result = self.guarded("pending_notices", |engine| {
                     Ok(engine.store.tx(|tx| notices::pending(tx, &holder))?)
+                });
+                let _ = reply.send(result);
+            }
+            Job::AdmitWait(session_id, host, reply) => {
+                let result = self.guarded("admit_wait", |engine| {
+                    let now = engine.clock.now_ms();
+                    Ok(engine
+                        .sessions
+                        .transact(&mut engine.store, |tx, sessions| {
+                            sessions.admit_wait(tx, &session_id, host, now)
+                        })?)
                 });
                 let _ = reply.send(result);
             }

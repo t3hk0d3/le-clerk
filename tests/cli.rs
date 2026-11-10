@@ -3563,44 +3563,213 @@ mod cli {
             }
         }
 
-        /// MCP owns an agent session's notices (acknowledged delivery):
-        /// `clerk wait` must not take them from under `lease_wait`.
+        /// `sess-1` in `dir` queued for `board` behind user `x`; returns
+        /// x's lease.
+        fn agent_queued(env: &Env, dir: &Path) -> String {
+            seed(env, "board", "k1");
+            let theirs = hold(env, "x");
+            env.agent("sess-1", dir)
+                .args(["acquire", "board", "--for", "10m"])
+                .assert()
+                .code(6);
+            theirs
+        }
+
         mod on_an_agent_session {
             use super::*;
 
-            #[test]
-            fn exits_2_naming_the_lease_wait_tool() {
-                let env = Env::new();
-                let dir = env.dir("alpha");
-                let error = error_of(env.agent("sess-1", &dir).args(["wait", "--once"]), 2);
-                let message = error["message"].as_str().unwrap();
-                assert!(message.contains("lease_wait"), "{message}");
+            mod on_pending_notices {
+                use super::*;
+
+                #[test]
+                fn prints_one_batch_with_summary_and_next_and_exits_0() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let theirs = agent_queued(&env, &dir);
+                    free(&env, "x", &theirs);
+                    let body = json_of(env.agent("sess-1", &dir).args(["wait"]));
+                    let kinds = strings(&body["notices"], "kind");
+                    assert!(kinds.contains(&"offered".to_owned()), "{body}");
+                    assert!(body["summary"].is_array(), "{body}");
+                    assert!(
+                        body["next"].as_str().unwrap().contains("clerk wait"),
+                        "{body}"
+                    );
+                }
+
+                #[test]
+                fn claims_an_offered_lease_and_carries_the_grant() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let theirs = agent_queued(&env, &dir);
+                    free(&env, "x", &theirs);
+                    let body = json_of(env.agent("sess-1", &dir).args(["wait"]));
+                    let claimed = body["claimed"].as_array().unwrap();
+                    assert_eq!(claimed.len(), 1, "{body}");
+                    assert_eq!(claimed[0]["state"], "held", "{body}");
+                    let mine = json_of(env.agent("sess-1", &dir).args(["leases", "--mine"]));
+                    assert_eq!(mine["leases"][0]["state"], "held", "{mine}");
+                }
+
+                #[test]
+                fn marks_them_delivered_once_printed() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let theirs = agent_queued(&env, &dir);
+                    free(&env, "x", &theirs);
+                    json_of(env.agent("sess-1", &dir).args(["wait"]));
+                    let again =
+                        json_of(env.agent("sess-1", &dir).args(["wait", "--timeout", "1s"]));
+                    assert_eq!(again["notices"], json!([]), "{again}");
+                }
             }
 
-            #[test]
-            fn takes_no_notice() {
-                let env = Env::new();
-                seed(&env, "board", "k1");
-                let dir = env.dir("alpha");
-                let lease = lease_of(&json_of(
-                    env.agent("sess-1", &dir)
-                        .args(["acquire", "board", "--for", "10m"]),
-                ));
-                env.rpc(
-                    "admin_release",
-                    &user("admin"),
-                    json!({ "lease_id": lease }),
-                )
-                .unwrap();
-                env.agent("sess-1", &dir)
-                    .args(["wait", "--once"])
-                    .assert()
-                    .code(2);
-                let pending = pending_of(&env, "sess-1");
-                assert!(
-                    pending.iter().any(|n| n["kind"] == "lease_ended"),
-                    "{pending:?}"
-                );
+            mod on_timeout {
+                use super::*;
+
+                #[test]
+                fn exits_0_with_an_empty_batch_saying_to_start_it_again() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let body = json_of(env.agent("sess-1", &dir).args(["wait", "--timeout", "1s"]));
+                    assert_eq!(body["notices"], json!([]), "{body}");
+                    assert!(
+                        body["next"].as_str().unwrap().contains("clerk wait"),
+                        "{body}"
+                    );
+                }
+            }
+
+            mod on_another_wait_already_armed {
+                use super::*;
+
+                #[test]
+                fn exits_0_at_once_saying_one_is_armed_and_takes_nothing() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let theirs = agent_queued(&env, &dir);
+                    let mut first = spawn(&env, &["wait"], Some("sess-1"));
+                    std::thread::sleep(Duration::from_millis(800));
+                    let started = Instant::now();
+                    let body = json_of(env.agent("sess-1", &dir).args(["wait"]));
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                    assert_eq!(body["armed"], true, "{body}");
+                    assert!(
+                        body["summary"][0]
+                            .as_str()
+                            .unwrap()
+                            .contains("already armed"),
+                        "{body}"
+                    );
+                    free(&env, "x", &theirs);
+                    assert_eq!(code_of(&mut first), 0);
+                }
+            }
+
+            mod on_the_session_moved_on {
+                use super::*;
+
+                #[test]
+                fn exits_0_with_an_empty_batch() {
+                    // `/clear`: the same process now runs another session.
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    agent_queued(&env, &dir);
+                    let mut old = spawn(&env, &["wait"], Some("sess-1"));
+                    std::thread::sleep(Duration::from_millis(800));
+                    json_of(env.agent("sess-2", &dir).args(["leases", "--mine"]));
+                    assert_eq!(code_of(&mut old), 0);
+                }
+            }
+
+            mod on_the_host_process_exiting {
+                use super::*;
+
+                #[test]
+                fn exits_0_within_a_few_seconds() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let mut host = std::process::Command::new("sleep")
+                        .arg("300")
+                        .spawn()
+                        .unwrap();
+                    let mut wait = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"))
+                        .arg("wait")
+                        .env("CLERK_HOME", env.home())
+                        .env(SESSION_VAR, "sess-1")
+                        .env(CLAUDE_PID, host.id().to_string())
+                        .current_dir(&dir)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    std::thread::sleep(Duration::from_millis(800));
+                    host.kill().unwrap();
+                    host.wait().unwrap();
+                    let killed = Instant::now();
+                    loop {
+                        if let Some(status) = wait.try_wait().unwrap() {
+                            assert!(status.success());
+                            break;
+                        }
+                        assert!(killed.elapsed() < Duration::from_secs(5), "wait still runs");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+
+            mod on_sigterm {
+                use super::*;
+
+                #[test]
+                fn prints_an_empty_batch_saying_to_start_it_again_and_exits_0() {
+                    let env = Env::new();
+                    let mut child = spawn(&env, &["wait"], Some("sess-1"));
+                    std::thread::sleep(Duration::from_millis(800));
+                    let pid = i32::try_from(child.0.id()).unwrap();
+                    // SAFETY: plain kill(2) on our own child.
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                    let mut stdout = Vec::new();
+                    std::io::Read::read_to_end(&mut child.0.stdout.take().unwrap(), &mut stdout)
+                        .unwrap();
+                    assert!(child.0.wait().unwrap().success());
+                    let body: Value = serde_json::from_slice(&stdout).unwrap();
+                    assert_eq!(body["notices"], json!([]), "{body}");
+                    assert!(
+                        body["next"].as_str().unwrap().contains("clerk wait"),
+                        "{body}"
+                    );
+                }
+            }
+
+            mod on_follow {
+                use super::*;
+
+                #[test]
+                fn prints_one_line_per_notice_and_keeps_running() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let theirs = agent_queued(&env, &dir);
+                    let mut child = spawn(&env, &["wait", "--follow"], Some("sess-1"));
+                    let out = lines(&mut child.0);
+                    free(&env, "x", &theirs);
+                    let first: Value =
+                        serde_json::from_str(&out.recv_timeout(PATIENCE).unwrap()).unwrap();
+                    assert_eq!(first["notice"]["kind"], "offered", "{first}");
+                    assert_eq!(first["claimed"]["state"], "held", "{first}");
+                    assert!(first["next"].is_string(), "{first}");
+                    let lease = first["claimed"]["lease_id"].as_str().unwrap().to_owned();
+                    env.rpc(
+                        "admin_release",
+                        &user("admin"),
+                        json!({ "lease_id": lease }),
+                    )
+                    .unwrap();
+                    let second: Value =
+                        serde_json::from_str(&out.recv_timeout(PATIENCE).unwrap()).unwrap();
+                    assert_eq!(second["notice"]["kind"], "lease_ended", "{second}");
+                    assert!(child.0.try_wait().unwrap().is_none(), "still running");
+                }
             }
         }
 
