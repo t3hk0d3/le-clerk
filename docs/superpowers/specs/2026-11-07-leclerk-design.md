@@ -1016,7 +1016,7 @@ raw stdio relay; `spike-client` is rmcp's own Unix-socket client. Runs used
   subagents, the desktop app and VS Code, third-party providers, or sessions
   without feature-flag fetching. Those calls are plain blocking calls.
 - **§11.2 Progress past the idle limit: verified.** With
-  `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=20000` (applied as a 30 s window), a 40 s
+  `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=20000` (observed as a 30 s window; whether 30 s is a floor is unconfirmed), a 40 s
   call without progress aborted with "sent no response or progress for 30s",
   and a 40 s call with progress every 5 s succeeded (`logs/run7-*.json`).
   Appendix A's failed attempt most likely lost the variable before Claude Code
@@ -1071,7 +1071,7 @@ raw stdio relay; `spike-client` is rmcp's own Unix-socket client. Runs used
   - `hooks/hooks.json`: `{"hooks": {"<Event>": [{"matcher", "hooks": [{"type":
     "command", "command", "timeout"}]}]}}`, `timeout` in seconds.
     SessionEnd hooks get 1.5 s in total unless a settings-file hook raises it;
-    a plugin hook's `timeout` does not raise that budget. hooks.md.
+    whether a plugin hook's `timeout` raises that budget is inferred, not documented: design for 1.5 s. hooks.md.
   - Hook input, common: `session_id`, `transcript_path`, `cwd`,
     `permission_mode`, `hook_event_name`, plus `agent_id`/`agent_type` inside
     subagents. Stop: `stop_hook_active`, `last_assistant_message`,
@@ -1082,7 +1082,7 @@ raw stdio relay; `spike-client` is rmcp's own Unix-socket client. Runs used
     SessionStart: `source` (`startup`, `resume`, `clear`, `compact`, `fork`).
     hooks.md.
   - Hook output: Stop block is `{"decision": "block", "reason": "…"}`
-    (8-continuation cap); PreToolUse context is `{"hookSpecificOutput":
+    (a continuation cap is reported but not confirmed in the docs fetched); PreToolUse context is `{"hookSpecificOutput":
     {"hookEventName": "PreToolUse", "additionalContext": "…"}}` (10,000
     characters max). hooks.md.
 
