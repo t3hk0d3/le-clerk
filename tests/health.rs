@@ -4,13 +4,17 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use leclerk::health::{HealthChecker, HealthResult};
+use leclerk::health::{self, HealthChecker, HealthResult};
 use leclerk::model::{
     BuiltinCheck, Check, HealthSpec, ResourceId, ServiceMode, UnitId, UnitSettings,
 };
+use leclerk::scheduler::HealthProbe;
+use leclerk::scheduler::checks::{CHECK_CONCURRENCY, CheckJob, CheckPool, CheckTicket};
 
 fn checker() -> HealthChecker {
     HealthChecker::new(Duration::from_secs(1))
@@ -468,5 +472,140 @@ mod custom_command {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(!proc.exists(), "child still alive");
+    }
+}
+
+mod http_check {
+    use super::*;
+
+    #[test]
+    fn does_not_build_a_runtime_per_call() {
+        let port = free_port();
+        for _ in 0..3 {
+            let r = run(vec![builtin(BuiltinCheck::Http)], &service(port, None));
+            assert_ne!(r, HealthResult::Healthy);
+        }
+        assert_eq!(health::runtimes_built(), 1);
+    }
+}
+
+/// A job for unit row `row` with one custom check.
+fn job(row: i64) -> CheckJob {
+    CheckJob {
+        ticket: CheckTicket { row, token: 1 },
+        spec: spec(vec![custom("unused")]),
+        resource: ResourceId::parse("board").unwrap(),
+        unit: UnitId::parse("u1").unwrap(),
+        settings: UnitSettings::Generic {
+            identity_key: "k".into(),
+        },
+    }
+}
+
+/// A probe that does not answer until the test ends (the sender drops).
+struct Hanging {
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl HealthProbe for Hanging {
+    fn check(
+        &self,
+        _spec: &HealthSpec,
+        _resource: &ResourceId,
+        _unit: &UnitId,
+        _settings: &UnitSettings,
+    ) -> HealthResult {
+        let _ = self.release.lock().unwrap().recv();
+        HealthResult::Healthy
+    }
+}
+
+/// A probe that notes how many of its checks run at once.
+#[derive(Default)]
+struct Counting {
+    running: AtomicUsize,
+    most: AtomicUsize,
+}
+
+impl HealthProbe for Counting {
+    fn check(
+        &self,
+        _spec: &HealthSpec,
+        _resource: &ResourceId,
+        _unit: &UnitId,
+        _settings: &UnitSettings,
+    ) -> HealthResult {
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+        // Hold until the pool is full, then long enough for any excess
+        // check to show.
+        let patience = Instant::now() + Duration::from_secs(5);
+        while self.most.load(Ordering::SeqCst) < CHECK_CONCURRENCY && Instant::now() < patience {
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(100));
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        HealthResult::Healthy
+    }
+}
+
+mod scheduler_checks {
+    use super::*;
+
+    mod run {
+        use super::*;
+
+        const LIMIT: Duration = Duration::from_secs(1);
+
+        fn pool(
+            probe: Arc<dyn HealthProbe>,
+        ) -> (CheckPool, mpsc::Receiver<(CheckTicket, HealthResult)>) {
+            let (tx, rx) = mpsc::channel();
+            let tx = Mutex::new(tx);
+            let pool = CheckPool::new(probe, LIMIT, move |ticket, result| {
+                tx.lock().unwrap().send((ticket, result)).unwrap();
+            })
+            .unwrap();
+            (pool, rx)
+        }
+
+        mod on_a_check_that_hangs_past_health_timeout {
+            use super::*;
+
+            #[test]
+            fn reports_unhealthy_timed_out_after_health_timeout() {
+                let (_release, held) = mpsc::channel();
+                let (pool, done) = pool(Arc::new(Hanging {
+                    release: Mutex::new(held),
+                }));
+                let started = Instant::now();
+                pool.run(job(7));
+                let (ticket, result) = done.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(ticket, CheckTicket { row: 7, token: 1 });
+                assert_eq!(result, HealthResult::Unhealthy("timed out".into()));
+                let took = started.elapsed();
+                assert!(took >= LIMIT, "reported after {took:?}");
+                assert!(took < LIMIT * 3, "reported after {took:?}");
+            }
+        }
+
+        mod on_more_checks_than_the_bound {
+            use super::*;
+
+            #[test]
+            fn runs_at_most_four_at_once() {
+                let probe = Arc::new(Counting::default());
+                let (pool, done) = pool(probe.clone());
+                for row in 0..12 {
+                    pool.run(job(row));
+                }
+                for _ in 0..12 {
+                    let (_, result) = done.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert_eq!(result, HealthResult::Healthy);
+                }
+                assert_eq!(CHECK_CONCURRENCY, 4);
+                assert_eq!(probe.most.load(Ordering::SeqCst), 4);
+            }
+        }
     }
 }

@@ -5163,6 +5163,41 @@ mod cli {
         }
     }
 
+    /// Run `target`'s first health check to a failure, leaving no request
+    /// behind: checks run off the engine, so only after this does an
+    /// acquire find the unit unhealthy.
+    fn fail_first_check(env: &Env, target: &str) {
+        let out = env
+            .cmd()
+            .args(["acquire", target, "--for", "10m"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(6), "{out:?}");
+        let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+        env.ok(&["cancel", body["request_id"].as_str().unwrap()]);
+        let resource = target.split('/').next().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = env.ok(&["status"]);
+            let failed = status["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["id"] == resource)
+                .flat_map(|r| r["units"].as_array().unwrap())
+                .any(|u| {
+                    u["last_health"]
+                        .as_str()
+                        .is_some_and(|h| h.starts_with("unhealthy"))
+                });
+            if failed {
+                return;
+            }
+            assert!(Instant::now() < deadline, "no failed check: {status}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     mod skip_checks {
         use super::*;
 
@@ -5224,6 +5259,7 @@ mod cli {
         fn a_queued_agent_blocked_by_a_health_check_is_told_about_skip_checks() {
             let env = Env::new();
             let _busy = Kill(busy_device(&env));
+            fail_first_check(&env, "dev/u1");
             let dir = env.dir("alpha");
             let out = env
                 .agent("sess-1", &dir)
@@ -5904,6 +5940,7 @@ mod cli {
                 fn names_the_units_and_their_check_message_and_the_recheck() {
                     let env = Env::new();
                     bench(&env);
+                    fail_first_check(&env, "otbr");
                     let shown = human_detached(&env, "acquire otbr --for 10m");
                     assert!(
                         shown.contains("Queued: position 1 on otbr · req_"),
@@ -5922,11 +5959,36 @@ mod cli {
                 fn json_carries_blocked_by() {
                     let env = Env::new();
                     bench(&env);
+                    fail_first_check(&env, "otbr");
                     let body = queue_on(&env, "otbr");
                     let blocked = &body["blocked_by"];
                     assert_eq!(blocked["kind"], "unhealthy", "{body}");
                     assert_eq!(blocked["units"][0]["unit"], "main", "{body}");
                     assert_eq!(blocked["units"][0]["message"], "connect failed", "{body}");
+                }
+            }
+
+            mod on_a_free_unit_with_no_fresh_check {
+                use super::*;
+
+                #[test]
+                fn says_it_is_being_checked() {
+                    let env = Env::new();
+                    bench(&env);
+                    let shown = human_detached(&env, "acquire otbr --for 10m");
+                    assert!(
+                        shown.contains("\n  main is free and being health-checked; "),
+                        "{shown}"
+                    );
+                }
+
+                #[test]
+                fn json_carries_blocked_by_checking() {
+                    let env = Env::new();
+                    bench(&env);
+                    let body = queue_on(&env, "otbr");
+                    assert_eq!(body["blocked_by"]["kind"], "checking", "{body}");
+                    assert_eq!(body["blocked_by"]["units"][0], "main", "{body}");
                 }
             }
 
@@ -6191,6 +6253,7 @@ mod cli {
                 fn colours_stderr_on_a_tty_when_stdout_is_not() {
                     let env = Env::new();
                     bench(&env);
+                    fail_first_check(&env, "otbr");
                     let shown = env.tty(&format!(
                         "{COLOURED} timeout 2 \"$CLERK\" acquire otbr --for 10m --wait \
                          < /dev/null > /dev/null"
@@ -6203,6 +6266,7 @@ mod cli {
                 fn does_not_colour_stderr_that_is_not_a_tty() {
                     let env = Env::new();
                     bench(&env);
+                    fail_first_check(&env, "otbr");
                     let err = env.home().join("err.txt");
                     let shown = env.tty(&format!(
                         "{COLOURED} timeout 2 \"$CLERK\" acquire otbr --for 10m --wait \

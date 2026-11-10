@@ -1,9 +1,10 @@
 //! The engine: one actor that owns the store and every service.
 //!
-//! It runs on a dedicated OS thread, never inside a tokio runtime (the http
-//! health check builds its own runtime). Async callers reach it through an
-//! [`EngineHandle`], which sends jobs over a channel; each job carries a
-//! oneshot reply sender. Every command runs in one store transaction.
+//! It runs on a dedicated OS thread, never inside a tokio runtime. Async
+//! callers reach it through an [`EngineHandle`], which sends jobs over a
+//! channel; each job carries a oneshot reply sender. Every command runs in
+//! one store transaction. Health checks run off this thread in a
+//! [`CheckPool`]; each result comes back as a job and re-enters dispatch.
 //!
 //! The loop sleeps (`recv_timeout`) until the earliest of: the next job, the
 //! next scheduler deadline, the next liveness probe. After every mutating
@@ -33,8 +34,10 @@ use crate::admin::AdminError;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::ErrorCode;
+use crate::health::HealthResult;
 use crate::inventory::{Inventory, InventoryError, PromotionError, Promotions};
 use crate::model::{HolderRef, Host, NoticeId};
+use crate::scheduler::checks::{CheckPool, CheckTicket};
 use crate::scheduler::session::{Hosting, Sessions};
 use crate::scheduler::{HealthProbe, Scheduler, SchedulerError, liveness};
 use crate::store::notices::{self, Notice, NoticeFilter};
@@ -296,6 +299,11 @@ enum Job {
     SessionAlive(String, Reply<bool>),
     /// A Claude Code hook's RPC.
     Hook(Box<HookCommand>, Reply<HookAnswer>),
+    /// A health check came back.
+    CheckDone {
+        unit: CheckTicket,
+        result: HealthResult,
+    },
 }
 
 /// What one step of an agent session's notice wait came to
@@ -497,7 +505,9 @@ impl Drop for OpenWait {
 /// A cheap, cloneable handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
-    jobs: mpsc::Sender<Job>,
+    /// Shared so that the check pool can hold a weak reference: the engine
+    /// stops when the last handle goes.
+    jobs: Arc<mpsc::Sender<Job>>,
     waiters: Arc<Waiters>,
     stopped: watch::Receiver<bool>,
     open_waits: Arc<OpenWaits>,
@@ -910,6 +920,7 @@ pub struct Engine {
     inventory: Inventory,
     promotions: Promotions,
     scheduler: Scheduler,
+    checks: CheckPool,
     sessions: Sessions,
     waiters: Arc<Waiters>,
     options: EngineOptions,
@@ -946,6 +957,18 @@ impl Engine {
         options: EngineOptions,
     ) -> io::Result<EngineHandle> {
         let (jobs, inbox) = mpsc::channel();
+        let jobs = Arc::new(jobs);
+        let answers = Arc::downgrade(&jobs);
+        let checks = CheckPool::new(
+            health.clone(),
+            Duration::from_secs(config.health_timeout),
+            move |unit, result| {
+                // Gone means the engine is stopping: nobody needs the result.
+                if let Some(jobs) = answers.upgrade() {
+                    let _ = jobs.send(Job::CheckDone { unit, result });
+                }
+            },
+        )?;
         let (stop_tx, stopped) = watch::channel(false);
         let waiters = Arc::new(Waiters::default());
         let handle_config = Arc::new(config.clone());
@@ -956,6 +979,7 @@ impl Engine {
             inventory: Inventory::new(clock.clone()),
             promotions: Promotions::new(clock.clone()),
             scheduler: Scheduler::new(clock.clone(), config, health),
+            checks,
             sessions,
             clock,
             waiters: waiters.clone(),
@@ -992,6 +1016,7 @@ impl Engine {
         });
         self.boot_sessions();
         self.maintain();
+        self.start_checks();
         self.wake_waiters();
         let mut next_probe = Instant::now() + self.options.liveness_interval;
         loop {
@@ -1010,6 +1035,7 @@ impl Engine {
             if self.sessions_due() {
                 self.expire_sessions();
             }
+            self.start_checks();
             self.wake_waiters();
             if self.stopping {
                 tracing::info!("engine stopping on request");
@@ -1019,6 +1045,14 @@ impl Engine {
         // Close the inbox before the stop signal wakes parked long-polls, so
         // their next take fails at once instead of queueing.
         drop(inbox);
+    }
+
+    /// Hand the check jobs scheduling queued to the pool. Every transaction
+    /// that queued them has ended by now.
+    fn start_checks(&self) {
+        for job in self.scheduler.take_check_jobs() {
+            self.checks.run(job);
+        }
     }
 
     /// How long to wait for a job: until the next deadline, session grace
@@ -1159,6 +1193,16 @@ impl Engine {
                 if changed {
                     self.maintain();
                 }
+            }
+            Job::CheckDone { unit, result } => {
+                let recorded = self.guarded("check_done", |engine| {
+                    let sched = &engine.scheduler;
+                    Ok(engine.store.tx(|tx| sched.check_done(tx, unit, result))?)
+                });
+                if let Err(e) = recorded {
+                    tracing::error!(error = %e, "cannot record a health check");
+                }
+                self.maintain();
             }
         }
     }

@@ -11,11 +11,13 @@
 //! that group, and only while the paused lease is the group's sole live
 //! lease.
 //!
-//! Health checks run synchronously on the caller's thread. The http check
-//! builds its own runtime, so the scheduler must not be called from inside a
-//! tokio runtime. An unhealthy result is kept for [`HEALTH_RECHECK_BACKOFF`]
-//! so that a waiter on a failing unit does not stall every dispatch.
+//! Health checks that can block never run inside a transaction: scheduling
+//! reads a cached state and queues a check job for a unit with no fresh
+//! result (see `checks`). A request that needs such a unit stays queued
+//! until the result comes back. A healthy result stands for
+//! [`checks::HEALTHY_TTL`], an unhealthy one for [`HEALTH_RECHECK_BACKOFF`].
 
+pub mod checks;
 mod dispatch;
 mod forced;
 mod interrupt;
@@ -39,15 +41,16 @@ use crate::error::ErrorCode;
 use crate::health::{HealthChecker, HealthResult};
 use crate::inventory::{Inventory, InventoryError, View};
 use crate::model::{
-    Caller, DirtyInfo, EndCause, HealthSpec, HolderRef, LeaseId, LeaseState, Priority, ProjectKey,
-    RenderResource, RenderUnit, RequestId, Resource, ResourceId, ResourceType, Scope, ServiceMode,
-    TagSet, Unit, UnitId, UnitSettings, UsageTemplate,
+    BuiltinCheck, Caller, Check, DirtyInfo, EndCause, HealthSpec, HolderRef, LeaseId, LeaseState,
+    Priority, ProjectKey, RenderResource, RenderUnit, RequestId, Resource, ResourceId,
+    ResourceType, Scope, ServiceMode, TagSet, Unit, UnitId, UnitSettings, UsageTemplate,
 };
 use crate::store::inventory::{self as inventory_sql, ScopeFilter};
 use crate::store::leases::{self, LeaseRow, NewLease, NewRequest};
 use crate::store::notices::{self, Notice};
 use crate::store::{StoreError, Tx, audit};
 
+use checks::{CheckBook, CheckJob, CheckState, CheckTicket, HEALTHY_TTL};
 use dispatch::{HealthCache, QueueSnapshot};
 
 pub use forced::LeaseEdit;
@@ -64,6 +67,13 @@ pub trait HealthProbe: Send + Sync {
         unit: &UnitId,
         settings: &UnitSettings,
     ) -> HealthResult;
+
+    /// Whether running `spec` can block, so that it must run off the engine
+    /// thread. `false` (the default, for probes that answer at once) has
+    /// scheduling run it in place.
+    fn blocks(&self, _spec: &HealthSpec) -> bool {
+        false
+    }
 }
 
 impl HealthProbe for HealthChecker {
@@ -75,6 +85,15 @@ impl HealthProbe for HealthChecker {
         settings: &UnitSettings,
     ) -> HealthResult {
         self.check_unit(spec, resource, unit, settings)
+    }
+
+    /// A spec of only `none` checks has nothing to run; every other check
+    /// does I/O.
+    fn blocks(&self, spec: &HealthSpec) -> bool {
+        !spec
+            .checks
+            .iter()
+            .all(|c| matches!(c, Check::Builtin(BuiltinCheck::None)))
     }
 }
 
@@ -178,8 +197,8 @@ pub enum AcquireOutcome {
         /// 1 + the number of earlier queued requests (by priority, then
         /// clock time) whose target identity groups intersect this one's.
         position: u32,
-        /// `None` when unknown: a target unit is free but failing its health
-        /// check, nothing on the targets is leased, or a lease's remaining
+        /// `None` when unknown: a target unit is free but being checked or
+        /// failing its health check, nothing on the targets is leased, or a lease's remaining
         /// time is unknown (paused).
         estimated_wait: Option<Duration>,
         /// What keeps the request from a unit now; `None` when nothing
@@ -204,6 +223,9 @@ pub enum BlockedBy {
         units: Vec<UnhealthyUnit>,
         recheck_ms: u64,
     },
+    /// Free target units are being health-checked; the request is offered
+    /// one as soon as a check passes.
+    Checking { units: Vec<UnitId> },
     /// Target units are held: the lease that ends first.
     Held {
         unit: UnitId,
@@ -522,8 +544,29 @@ fn group_busy(tx: &Tx, group: &[i64]) -> Result<bool, SchedulerError> {
     Ok(!leases::live_leases_on(tx, group)?.is_empty())
 }
 
+/// The health checks `unit` must pass.
+fn health_spec(resource: &Resource, unit: &Unit) -> HealthSpec {
+    let mode: Option<ServiceMode> = match &unit.settings {
+        UnitSettings::Service { mode, .. } => Some(*mode),
+        _ => None,
+    };
+    resource
+        .health
+        .clone()
+        .unwrap_or_else(|| HealthSpec::default_for(resource.ty, mode))
+}
+
+/// A check result as recorded on the unit.
+fn health_text(result: HealthResult) -> String {
+    match result {
+        HealthResult::Healthy => "healthy".to_owned(),
+        HealthResult::Unhealthy(why) => format!("unhealthy: {why}"),
+    }
+}
+
 /// What keeps a request just queued on the resource at `resource_row`
-/// (only the unit at `pinned`, when set) from a unit: every free target unit
+/// (only the unit at `pinned`, when set) from a unit: a free target unit
+/// being checked (`checking` says which are), else every free target unit
 /// unhealthy, else the held lease that ends first, else a leased linked
 /// unit. `None` when a free target unit passed its last check: the acquire
 /// dispatches first and then grants any free healthy unit, so that is never
@@ -533,10 +576,12 @@ fn blocked_by(
     who: &Caller,
     resource_row: i64,
     pinned: Option<i64>,
+    checking: impl Fn(i64) -> bool,
 ) -> Result<Option<BlockedBy>, SchedulerError> {
     // Loaded afresh: the acquire's health checks have just been recorded.
     let resource = inventory_sql::load_resource(tx, resource_row)?;
     let mut unhealthy = Vec::new();
+    let mut being_checked = Vec::new();
     let mut free_healthy = false;
     let mut held: Vec<(&Unit, LeaseRow)> = Vec::new();
     let mut linked: Vec<(&Unit, LeaseRow)> = Vec::new();
@@ -547,6 +592,10 @@ fn blocked_by(
     {
         let live = leases::live_leases_on(tx, &group(tx, unit.row)?)?;
         if live.is_empty() {
+            if checking(unit.row) {
+                being_checked.push(unit.id.clone());
+                continue;
+            }
             match unit
                 .last_health
                 .as_deref()
@@ -568,6 +617,11 @@ fn blocked_by(
                 linked.push((unit, lease));
             }
         }
+    }
+    if !being_checked.is_empty() {
+        return Ok(Some(BlockedBy::Checking {
+            units: being_checked,
+        }));
     }
     if free_healthy {
         return Ok(None);
@@ -654,17 +708,26 @@ struct HandedOver {
 }
 
 /// How long an unhealthy health-check result stands before the unit is
-/// probed again. Healthy results are never kept: a unit is always checked
-/// again before it is handed over.
+/// probed again.
 pub const HEALTH_RECHECK_BACKOFF: Duration = Duration::from_secs(30);
 
-/// An unhealthy result kept for [`HEALTH_RECHECK_BACKOFF`], with what it
-/// was checked against: a unit whose settings or health spec differ (an
-/// update, or a reused row id) is probed afresh.
-struct KeptUnhealthy {
-    at: i64,
-    settings: UnitSettings,
-    spec: HealthSpec,
+/// What a health lookup found for a unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Healthy,
+    Unhealthy,
+    /// A check is on its way; the result re-enters dispatch.
+    Checking,
+}
+
+impl From<bool> for Verdict {
+    fn from(healthy: bool) -> Self {
+        if healthy {
+            Self::Healthy
+        } else {
+            Self::Unhealthy
+        }
+    }
 }
 
 /// The scheduler service.
@@ -672,9 +735,8 @@ pub struct Scheduler {
     clock: Arc<dyn Clock>,
     config: Config,
     health: Arc<dyn HealthProbe>,
-    /// Unhealthy results by unit row, in memory only (a restart forgets
-    /// them, which only costs a probe).
-    unhealthy: Mutex<HashMap<i64, KeptUnhealthy>>,
+    /// Check states and the check jobs not yet handed to the pool.
+    checks: Mutex<CheckBook>,
 }
 
 impl Scheduler {
@@ -686,7 +748,7 @@ impl Scheduler {
             clock,
             config,
             health,
-            unhealthy: Mutex::new(HashMap::new()),
+            checks: Mutex::new(CheckBook::default()),
         }
     }
 
@@ -695,75 +757,108 @@ impl Scheduler {
     }
 
     /// Forget the kept health results of `units`, so they are probed again
-    /// at the next chance (after an update of the unit or its resource).
+    /// at the next chance (after an update of the unit or its resource). A
+    /// check on its way is disowned: its result is dropped.
     pub fn forget_health(&self, units: &[i64]) {
-        let mut kept = self.kept_unhealthy();
+        let mut book = self.check_book();
         for unit in units {
-            kept.remove(unit);
+            book.forget(*unit);
         }
     }
 
-    fn kept_unhealthy(&self) -> MutexGuard<'_, HashMap<i64, KeptUnhealthy>> {
-        // Every operation leaves the map consistent, so a panic while it
+    fn check_book(&self) -> MutexGuard<'_, CheckBook> {
+        // Every operation leaves the book consistent, so a panic while it
         // was locked leaves nothing to repair.
-        self.unhealthy
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.checks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Run the resource's health checks on `unit` once per `cache`, recording
-    /// the result on the unit. An unhealthy result stands, without a probe,
-    /// for [`HEALTH_RECHECK_BACKOFF`] while the unit's settings and health
-    /// spec are unchanged, so a waiter on a failing unit does not make every
-    /// dispatch wait on a slow check.
+    /// The check jobs queued since the last call. The caller runs them once
+    /// its transaction has ended and reports through
+    /// [`Scheduler::check_done`].
+    pub fn take_check_jobs(&self) -> Vec<CheckJob> {
+        self.check_book().take_jobs()
+    }
+
+    /// A check came back: keep its result for its TTL and record it on the
+    /// unit. An out-of-date ticket changes nothing. After a failure, queued
+    /// requests may now ask holders to yield. The caller dispatches next.
+    ///
+    /// # Errors
+    /// [`SchedulerError::Store`] on storage failure.
+    pub fn check_done(
+        &self,
+        tx: &Tx,
+        ticket: CheckTicket,
+        result: HealthResult,
+    ) -> Result<(), SchedulerError> {
+        let now = self.now();
+        let healthy = result == HealthResult::Healthy;
+        let settled = self.check_book().settle(ticket, healthy, |healthy| {
+            let ttl = if healthy {
+                HEALTHY_TTL
+            } else {
+                HEALTH_RECHECK_BACKOFF
+            };
+            now.saturating_add(millis(ttl))
+        });
+        if !settled {
+            return Ok(());
+        }
+        inventory_sql::record_health(tx, ticket.row, &health_text(result), now)?;
+        if !healthy {
+            let mut waiting = leases::queued_requests(tx)?;
+            waiting.sort_by_key(dispatch::queue_key);
+            for request in waiting {
+                self.maybe_request_yield(tx, &request.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What is known of `unit`'s health, at most one in-place run per
+    /// `cache`. Reads the check state: a fresh result stands (recorded when
+    /// it came back), and with none a check is started. Only a probe that
+    /// says the spec cannot block runs here, in the transaction; its
+    /// unhealthy result stands for [`HEALTH_RECHECK_BACKOFF`] and its
+    /// healthy one for this pass.
     fn healthy(
         &self,
         tx: &Tx,
         cache: &mut HealthCache,
         resource: &Resource,
         unit: &Unit,
-    ) -> Result<bool, SchedulerError> {
+    ) -> Result<Verdict, SchedulerError> {
         if let Some(ok) = cache.get(&unit.row) {
-            return Ok(*ok);
+            return Ok(Verdict::from(*ok));
         }
-        let mode: Option<ServiceMode> = match &unit.settings {
-            UnitSettings::Service { mode, .. } => Some(*mode),
-            _ => None,
-        };
-        let spec = resource
-            .health
-            .clone()
-            .unwrap_or_else(|| HealthSpec::default_for(resource.ty, mode));
+        let spec = health_spec(resource, unit);
         let now = self.now();
-        let backoff = millis(HEALTH_RECHECK_BACKOFF);
-        if self.kept_unhealthy().get(&unit.row).is_some_and(|k| {
-            now < k.at.saturating_add(backoff) && k.settings == unit.settings && k.spec == spec
-        }) {
-            cache.insert(unit.row, false);
-            return Ok(false);
+        {
+            let mut book = self.check_book();
+            match book.state(unit.row, &unit.settings, &spec, now) {
+                CheckState::Fresh { healthy } => return Ok(Verdict::from(healthy)),
+                CheckState::Checking => return Ok(Verdict::Checking),
+                CheckState::Due => {}
+            }
+            if self.health.blocks(&spec) {
+                book.begin(unit.row, &resource.id, &unit.id, &unit.settings, &spec);
+                return Ok(Verdict::Checking);
+            }
         }
         let result = self
             .health
             .check(&spec, &resource.id, &unit.id, &unit.settings);
-        let (ok, text) = match result {
-            HealthResult::Healthy => (true, "healthy".to_owned()),
-            HealthResult::Unhealthy(why) => (false, format!("unhealthy: {why}")),
-        };
-        inventory_sql::record_health(tx, unit.row, &text, now)?;
+        let ok = result == HealthResult::Healthy;
+        inventory_sql::record_health(tx, unit.row, &health_text(result), now)?;
+        let mut book = self.check_book();
         if ok {
-            self.kept_unhealthy().remove(&unit.row);
+            book.forget(unit.row);
         } else {
-            self.kept_unhealthy().insert(
-                unit.row,
-                KeptUnhealthy {
-                    at: now,
-                    settings: unit.settings.clone(),
-                    spec,
-                },
-            );
+            let until = now.saturating_add(millis(HEALTH_RECHECK_BACKOFF));
+            book.keep_unhealthy(unit.row, &unit.settings, &spec, until);
         }
         cache.insert(unit.row, ok);
-        Ok(ok)
+        Ok(Verdict::from(ok))
     }
 
     /// Write a lease on `unit` for `ask`, held (synchronous grant) or offered
@@ -897,7 +992,9 @@ impl Scheduler {
             if unit.retiring || group_busy(tx, &group(tx, unit.row)?)? {
                 continue;
             }
-            if !req.skip_checks && !self.healthy(tx, &mut cache, &resource, unit)? {
+            if !req.skip_checks
+                && self.healthy(tx, &mut cache, &resource, unit)? != Verdict::Healthy
+            {
                 continue;
             }
             let handed = self.hand_over(tx, &resource, unit, &ask, LeaseState::Held)?;
@@ -1035,7 +1132,12 @@ impl Scheduler {
         .filter(|u| !u.retiring)
         .collect();
         let estimated_wait = self.estimate(tx, &after, row, &eligible)?;
-        let blocked_by = blocked_by(tx, who, resource.row, pinned.map(|u| u.row))?;
+        let blocked_by = {
+            let book = self.check_book();
+            blocked_by(tx, who, resource.row, pinned.map(|u| u.row), |row| {
+                book.checking(row)
+            })?
+        };
         audit::record(
             tx,
             self.now(),

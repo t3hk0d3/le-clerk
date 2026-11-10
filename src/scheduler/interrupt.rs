@@ -32,7 +32,7 @@ use serde_json::json;
 
 use crate::model::{Caller, EndCause, LeaseId, LeaseState, RequestId, Resource, Unit, UnitId};
 use crate::scheduler::{
-    Lease, OtherParty, Scheduler, SchedulerError, clerk_actor, group, millis, notify,
+    Lease, OtherParty, Scheduler, SchedulerError, clerk_actor, group, group_busy, millis, notify,
 };
 use crate::store::inventory as inventory_sql;
 use crate::store::leases::{self, LeaseRow, RequestRow};
@@ -83,6 +83,11 @@ impl Scheduler {
             return Ok(());
         };
         if leases::asked_for(tx, &request.id)?.is_some() {
+            return Ok(());
+        }
+        // A free target unit may yet pass its check: nobody need yield. A
+        // failed check brings the request back here.
+        if self.free_target_checking(tx, &request)? {
             return Ok(());
         }
         let now = self.now();
@@ -143,6 +148,21 @@ impl Scheduler {
             }),
         )?;
         Ok(())
+    }
+
+    /// Whether a free unit `request` could take is being health-checked.
+    fn free_target_checking(&self, tx: &Tx, request: &RequestRow) -> Result<bool, SchedulerError> {
+        let resource = inventory_sql::load_resource(tx, request.resource_row)?;
+        for unit in resource
+            .units
+            .iter()
+            .filter(|u| !u.retiring && request.unit_row.is_none_or(|p| p == u.row))
+        {
+            if self.check_book().checking(unit.row) && !group_busy(tx, &group(tx, unit.row)?)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Drop the yield ask pending on `lease` and move its request on to the

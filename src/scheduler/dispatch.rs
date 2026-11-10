@@ -12,15 +12,15 @@ use crate::model::{
     DirtyReason, EndCause, LeaseState, Priority, Resource, ResourceId, Unit, UnitId,
 };
 use crate::scheduler::{
-    Ask, HandedOver, Scheduler, SchedulerError, clerk_actor, group, group_busy, notify,
+    Ask, HandedOver, Scheduler, SchedulerError, Verdict, clerk_actor, group, group_busy, notify,
 };
 use crate::store::inventory as inventory_sql;
 use crate::store::leases::{self, LeaseRow, RequestRow};
 use crate::store::notices::{Notice, NoticeKind};
 use crate::store::{Tx, audit};
 
-/// Health results of one scheduling pass, by unit row, so that a unit is
-/// checked at most once per pass.
+/// Results of checks run in place in one scheduling pass, by unit row, so
+/// that a unit is checked at most once per pass.
 pub(super) type HealthCache = HashMap<i64, bool>;
 
 /// Queue order: override requests that displaced a lease first, then higher
@@ -384,9 +384,20 @@ impl Scheduler {
                     .collect();
                 candidates.sort_by(|a, b| a.id.cmp(&b.id));
                 for unit in candidates {
-                    if waiter.skip_checks || self.healthy(tx, cache, &resource, unit)? {
-                        self.offer(tx, &resource, unit, waiter)?;
-                        break 'waiters;
+                    let verdict = if waiter.skip_checks {
+                        Verdict::Healthy
+                    } else {
+                        self.healthy(tx, cache, &resource, unit)?
+                    };
+                    match verdict {
+                        Verdict::Healthy => {
+                            self.offer(tx, &resource, unit, waiter)?;
+                            break 'waiters;
+                        }
+                        Verdict::Unhealthy => {}
+                        // The group waits for the result rather than go to
+                        // someone later in the queue; it re-enters dispatch.
+                        Verdict::Checking => break 'waiters,
                     }
                 }
             }

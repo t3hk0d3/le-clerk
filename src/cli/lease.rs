@@ -1047,6 +1047,17 @@ fn blocked_text(b: &Value, style: Style) -> Option<String> {
                 ),
             })
         }
+        "checking" => {
+            let names: Vec<String> = b["units"].as_array()?.iter().map(text).collect();
+            Some(format!(
+                "{} free and being health-checked; you are offered a unit as soon as a check \
+                 passes.",
+                match names.as_slice() {
+                    [one] => format!("{one} is"),
+                    _ => format!("{} are", names.join(", ")),
+                }
+            ))
+        }
         "held" => Some(format!(
             "{} is held by {}{}{}.",
             text(&b["unit"]),

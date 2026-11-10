@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,6 +77,8 @@ fn on_unit(resource: &str, unit: &str) -> Target {
 struct StubProbe {
     unhealthy: Mutex<HashSet<String>>,
     calls: Mutex<Vec<String>>,
+    /// Report every spec as blocking, so checks go through the check jobs.
+    blocking: AtomicBool,
 }
 
 impl StubProbe {
@@ -106,6 +109,10 @@ impl HealthProbe for StubProbe {
         } else {
             HealthResult::Healthy
         }
+    }
+
+    fn blocks(&self, _spec: &HealthSpec) -> bool {
+        self.blocking.load(Ordering::SeqCst)
     }
 }
 
@@ -1846,6 +1853,246 @@ mod health_backoff {
             f.end(&g.lease_id);
             f.grant(&caller("b"), req(on("board"), MIN, Priority::Normal, "y"));
             assert_eq!(f.probe.calls().len(), 2);
+        }
+    }
+}
+
+/// Two-phase dispatch: a probe that blocks runs off the transaction.
+mod dispatch {
+    use super::*;
+    use leclerk::scheduler::checks::{CheckJob, HEALTHY_TTL};
+    use leclerk::scheduler::{BlockedBy, HEALTH_RECHECK_BACKOFF};
+
+    fn blocking() -> Fixture {
+        let mut f = fixture();
+        f.probe.blocking.store(true, Ordering::SeqCst);
+        f.seed("board", &["u1"]);
+        f
+    }
+
+    impl Fixture {
+        fn jobs(&self) -> Vec<CheckJob> {
+            self.sched.take_check_jobs()
+        }
+
+        /// Run `jobs` the way the pool does, report them and dispatch.
+        fn finish(&mut self, jobs: Vec<CheckJob>) {
+            for job in jobs {
+                let result = self
+                    .probe
+                    .check(&job.spec, &job.resource, &job.unit, &job.settings);
+                let sched = &self.sched;
+                self.store
+                    .tx(|tx| sched.check_done(tx, job.ticket, result))
+                    .unwrap();
+            }
+            self.dispatch();
+        }
+
+        /// A check of `board/u1` for a request that is then withdrawn,
+        /// leaving its result in the cache and the unit free.
+        fn cached(&mut self) {
+            let id = match self.ask("first") {
+                AcquireOutcome::Queued { request_id, .. } => request_id,
+                other => panic!("expected queued, got {other:?}"),
+            };
+            let jobs = self.jobs();
+            self.finish(jobs);
+            let who = caller("first");
+            let sched = &self.sched;
+            self.store.tx(|tx| sched.cancel(tx, &who, &id)).unwrap();
+        }
+
+        fn ask(&mut self, who: &str) -> AcquireOutcome {
+            self.acquire(&caller(who), req(on("board"), MIN, Priority::Normal, who))
+                .unwrap()
+        }
+    }
+
+    fn blocked_by(out: &AcquireOutcome) -> BlockedBy {
+        match out {
+            AcquireOutcome::Queued { blocked_by, .. } => blocked_by.clone().unwrap(),
+            other => panic!("expected queued, got {other:?}"),
+        }
+    }
+
+    fn checking() -> BlockedBy {
+        BlockedBy::Checking {
+            units: vec![uid("u1")],
+        }
+    }
+
+    mod on_a_free_unit_with_no_fresh_check {
+        use super::*;
+
+        #[test]
+        fn leaves_the_request_queued_with_blocked_by_checking() {
+            let mut f = blocking();
+            assert_eq!(blocked_by(&f.ask("a")), checking());
+        }
+
+        #[test]
+        fn runs_no_check_inside_the_transaction() {
+            let mut f = blocking();
+            f.ask("a");
+            assert_eq!(f.probe.calls().len(), 0);
+        }
+
+        #[test]
+        fn enqueues_one_check_however_many_passes_run() {
+            let mut f = blocking();
+            f.ask("a");
+            f.ask("b");
+            f.dispatch();
+            assert_eq!(f.jobs().len(), 1);
+            f.dispatch();
+            assert!(f.jobs().is_empty());
+        }
+
+        #[test]
+        fn grants_it_once_the_check_reports_healthy() {
+            let mut f = blocking();
+            f.ask("a");
+            let jobs = f.jobs();
+            f.finish(jobs);
+            assert_eq!(f.count(&holder("a"), NoticeKind::Offered), 1);
+        }
+
+        #[test]
+        fn offers_it_in_queue_order() {
+            let mut f = blocking();
+            f.ask("a");
+            f.ask("b");
+            let jobs = f.jobs();
+            f.finish(jobs);
+            assert_eq!(f.count(&holder("a"), NoticeKind::Offered), 1);
+            assert_eq!(f.count(&holder("b"), NoticeKind::Offered), 0);
+        }
+
+        #[test]
+        fn records_the_result_on_the_unit() {
+            let mut f = blocking();
+            f.probe.fail("u1");
+            f.ask("a");
+            let jobs = f.jobs();
+            f.finish(jobs);
+            let unit = f.unit("board", "u1");
+            assert_eq!(unit.last_health.as_deref(), Some("unhealthy: stub says no"));
+        }
+
+        #[test]
+        fn skip_checks_grants_without_a_check() {
+            let mut f = blocking();
+            let mut r = req(on_unit("board", "u1"), MIN, Priority::Normal, "a");
+            r.skip_checks = true;
+            let out = f.acquire(&caller("a"), r).unwrap();
+            assert!(matches!(out, AcquireOutcome::Granted(_)), "{out:?}");
+            assert!(f.jobs().is_empty());
+        }
+    }
+
+    mod on_a_fresh_healthy_result {
+        use super::*;
+
+        #[test]
+        fn grants_in_the_same_pass_without_a_new_check() {
+            let mut f = blocking();
+            f.cached();
+            let calls = f.probe.calls().len();
+            let out = f.ask("b");
+            assert!(matches!(out, AcquireOutcome::Granted(_)), "{out:?}");
+            assert!(f.jobs().is_empty());
+            assert_eq!(f.probe.calls().len(), calls);
+        }
+
+        #[test]
+        fn checks_again_once_the_cache_expires() {
+            let mut f = blocking();
+            f.cached();
+            f.clock.advance(HEALTHY_TTL);
+            assert_eq!(blocked_by(&f.ask("b")), checking());
+            assert_eq!(f.jobs().len(), 1);
+        }
+    }
+
+    mod on_a_fresh_unhealthy_result {
+        use super::*;
+
+        fn failed() -> Fixture {
+            let mut f = blocking();
+            f.probe.fail("u1");
+            f.ask("a");
+            let jobs = f.jobs();
+            f.finish(jobs);
+            f
+        }
+
+        #[test]
+        fn keeps_blocked_by_unhealthy_until_the_cache_expires() {
+            let mut f = failed();
+            f.clock
+                .advance(HEALTH_RECHECK_BACKOFF.saturating_sub(Duration::from_millis(1)));
+            assert!(matches!(
+                blocked_by(&f.ask("b")),
+                BlockedBy::Unhealthy { .. }
+            ));
+            assert!(f.jobs().is_empty());
+        }
+
+        #[test]
+        fn checks_again_once_the_cache_expires() {
+            let mut f = failed();
+            f.clock.advance(HEALTH_RECHECK_BACKOFF);
+            assert_eq!(blocked_by(&f.ask("b")), checking());
+            assert_eq!(f.jobs().len(), 1);
+        }
+    }
+
+    mod on_a_result_for_a_forgotten_check {
+        use super::*;
+
+        #[test]
+        fn is_dropped_and_the_unit_checked_again() {
+            let mut f = blocking();
+            f.ask("a");
+            let stale = f.jobs();
+            let row = f.unit("board", "u1").row;
+            f.sched.forget_health(&[row]);
+            f.finish(stale);
+            assert_eq!(f.count(&holder("a"), NoticeKind::Offered), 0);
+            assert_eq!(f.jobs().len(), 1);
+        }
+    }
+
+    mod on_a_free_unit_being_checked_beside_a_held_one {
+        use super::*;
+
+        /// Unit `u1` held by an interruptible lease, `u2` free and being
+        /// checked for a queued request that may interrupt it.
+        fn mixed() -> Fixture {
+            let mut f = fixture();
+            f.seed("board", &["u1", "u2"]);
+            let mut holder_req = req(on_unit("board", "u1"), MIN * 60, Priority::Normal, "h");
+            holder_req.interruptible = true;
+            f.grant(&caller("h"), holder_req);
+            f.probe.blocking.store(true, Ordering::SeqCst);
+            f.ask("a");
+            f
+        }
+
+        #[test]
+        fn asks_no_holder_to_yield_while_it_is_checked() {
+            let mut f = mixed();
+            assert_eq!(f.count(&holder("h"), NoticeKind::YieldRequested), 0);
+        }
+
+        #[test]
+        fn asks_the_holder_to_yield_once_the_check_fails() {
+            let mut f = mixed();
+            f.probe.fail("u2");
+            let jobs = f.jobs();
+            f.finish(jobs);
+            assert_eq!(f.count(&holder("h"), NoticeKind::YieldRequested), 1);
         }
     }
 }

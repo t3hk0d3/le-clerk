@@ -1,8 +1,8 @@
 //! Health checks: pure I/O against a unit's settings.
 //!
-//! The checker is synchronous from the caller's view. The HTTP check builds a
-//! small current-thread tokio runtime internally, so it must not be called
-//! from inside another tokio runtime's thread.
+//! The checker is synchronous from the caller's view. The HTTP check blocks
+//! on the process's one check [`runtime`], so it must not be called from
+//! inside a tokio runtime's async context.
 
 use std::ffi::CString;
 use std::fs;
@@ -13,7 +13,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,11 +22,46 @@ use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
+use tokio::runtime::{Handle, Runtime};
+use tokio::task::JoinHandle;
 
 use crate::model::{BuiltinCheck, Check, HealthSpec, ResourceId, UnitId, UnitSettings};
 
 /// Longest stderr excerpt kept from a failing custom command.
 const STDERR_LIMIT: usize = 1024;
+
+/// The runtime http checks and the check pool use; built on first use and
+/// kept for the life of the process.
+static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
+/// How many times [`RUNTIME`] was built.
+static RUNTIMES_BUILT: AtomicUsize = AtomicUsize::new(0);
+
+/// A handle to the process's one check runtime.
+///
+/// # Errors
+/// [`io::Error`] when the runtime cannot be started.
+pub fn runtime() -> io::Result<Handle> {
+    // Only ever holds a finished runtime, so a panic leaves nothing to repair.
+    let mut slot = RUNTIME.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(runtime) = slot.as_ref() {
+        return Ok(runtime.handle().clone());
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("clerk-check")
+        .enable_all()
+        .build()?;
+    RUNTIMES_BUILT.fetch_add(1, Ordering::Relaxed);
+    let handle = runtime.handle().clone();
+    *slot = Some(runtime);
+    Ok(handle)
+}
+
+/// How many check runtimes this process has built; at most one.
+#[must_use]
+pub fn runtimes_built() -> usize {
+    RUNTIMES_BUILT.load(Ordering::Relaxed)
+}
 
 /// Outcome of a health check run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,8 +99,8 @@ impl HealthChecker {
     /// Run `spec` in order against `settings`, stopping at the first failure.
     ///
     /// # Panics
-    /// The http check panics when called from inside a tokio runtime (it
-    /// blocks on its own current-thread runtime).
+    /// The http check panics when called from a tokio runtime's async
+    /// context (it blocks on the check runtime).
     ///
     /// Custom commands get no `CLERK_RESOURCE` / `CLERK_UNIT`; use
     /// [`HealthChecker::check_unit`] when the ids are known.
@@ -145,10 +181,7 @@ impl HealthChecker {
         if scheme.is_some_and(|s| !s.eq_ignore_ascii_case("http")) {
             return unhealthy(format!("{} not supported", scheme.unwrap_or_default()));
         }
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
+        let rt = match runtime() {
             Ok(rt) => rt,
             Err(e) => return unhealthy(format!("http error: {e}")),
         };
@@ -361,6 +394,16 @@ fn port_free(host: &str, port: u16) -> HealthResult {
     }
 }
 
+/// Ends a task when dropped: the runtime outlives the check, and a
+/// connection must not.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A plain HTTP/1.1 `GET /`; yields the response status.
 async fn http_get_status(host: &str, port: u16) -> Result<hyper::StatusCode, String> {
     let stream = tokio::net::TcpStream::connect((host, port))
@@ -369,7 +412,7 @@ async fn http_get_status(host: &str, port: u16) -> Result<hyper::StatusCode, Str
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|e| e.to_string())?;
-    tokio::spawn(conn);
+    let _conn = AbortOnDrop(tokio::spawn(conn));
     let req = Request::get("/")
         .header(hyper::header::HOST, host_header(host, port))
         .body(Empty::<Bytes>::new())

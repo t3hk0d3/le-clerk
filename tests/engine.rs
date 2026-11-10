@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
@@ -7,7 +7,7 @@ use leclerk::clock::ManualClock;
 use leclerk::config::Config;
 use leclerk::daemon::server as http;
 use leclerk::engine::{ApiError, Command, Engine, EngineHandle, EngineOptions, MAX_WAIT};
-use leclerk::health::HealthResult;
+use leclerk::health::{HealthChecker, HealthResult};
 use leclerk::model::{
     Caller, HealthSpec, HolderRef, Host, LeaseId, NoticeId, ProjectKey, ResourceId, UnitId,
     UnitSettings,
@@ -163,8 +163,249 @@ fn kinds(notices: &[Notice]) -> Vec<NoticeKind> {
     notices.iter().map(|n| n.kind).collect()
 }
 
+/// A resource `slow` whose unit `u1` has a custom check that touches
+/// `marker`, then sleeps 8 s; an engine that runs real checks.
+async fn slow_check(marker: &std::path::Path) -> EngineHandle {
+    let clock = Arc::new(ManualClock::new(T0));
+    let h = Engine::spawn(
+        Store::open_in_memory().unwrap(),
+        clock,
+        Config::default(),
+        Arc::new(HealthChecker::new(Duration::from_secs(10))),
+    )
+    .unwrap();
+    let admin = user("admin");
+    let command = format!("touch {}; sleep 8", marker.display());
+    ok(
+        &h,
+        "create_resource",
+        &admin,
+        json!({"id": "slow", "type": "generic", "scope": "user",
+               "health": [{"custom": command}]}),
+    )
+    .await;
+    ok(
+        &h,
+        "add_unit",
+        &admin,
+        json!({"resource": "slow", "id": "u1",
+               "settings": {"type": "generic", "identity_key": "slow-u1"}}),
+    )
+    .await;
+    h
+}
+
+/// Start an acquire of `slow` (without waiting for it) and return once its
+/// health check is running.
+async fn start_slow_acquire(h: &EngineHandle, marker: &std::path::Path) {
+    let engine = h.clone();
+    tokio::spawn(async move {
+        let _ = rpc(
+            &engine,
+            "acquire",
+            &user("slow-user"),
+            json!({"target": {"resource": "slow"}, "duration_ms": 60_000, "purpose": "test"}),
+        )
+        .await;
+    });
+    tokio::time::timeout(PATIENCE, async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the check never started");
+}
+
+/// A probe that blocks past any test's `health_timeout`.
+struct Hanging {
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl HealthProbe for Hanging {
+    fn check(
+        &self,
+        _spec: &HealthSpec,
+        _resource: &ResourceId,
+        _unit: &UnitId,
+        _settings: &UnitSettings,
+    ) -> HealthResult {
+        let _ = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(8));
+        HealthResult::Healthy
+    }
+
+    fn blocks(&self, _spec: &HealthSpec) -> bool {
+        true
+    }
+}
+
+const FAST: Duration = Duration::from_secs(1);
+
 mod engine {
     use super::*;
+
+    mod on_a_slow_custom_check_during_hook_calls {
+        use super::*;
+        use leclerk::engine::{AgentWait, HookCommand};
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn session_brief_answers_within_1_s() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("started");
+            let h = slow_check(&marker).await;
+            start_slow_acquire(&h, &marker).await;
+            let started = Instant::now();
+            let brief = HookCommand::parse("session_brief", json!({"session_id": "s1"})).unwrap();
+            h.hook(brief).await.unwrap();
+            assert!(started.elapsed() < FAST, "took {:?}", started.elapsed());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn agent_wait_steps_keep_their_arm_hold() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("started");
+            let h = slow_check(&marker).await;
+            let step = Duration::from_millis(50);
+            let first = h
+                .agent_wait("s1".into(), me(), step, true, "arm-a".into())
+                .await
+                .unwrap();
+            assert_eq!(first, AgentWait::Timeout);
+            start_slow_acquire(&h, &marker).await;
+            let second = h
+                .agent_wait("s1".into(), me(), step, true, "arm-b".into())
+                .await
+                .unwrap();
+            assert_eq!(second, AgentWait::Armed);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_acquire_answers_queued_with_blocked_by_checking() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("started");
+            let h = slow_check(&marker).await;
+            let started = Instant::now();
+            let out = ok(
+                &h,
+                "acquire",
+                &user("a"),
+                json!({"target": {"resource": "slow"}, "duration_ms": 60_000, "purpose": "t"}),
+            )
+            .await;
+            assert!(started.elapsed() < FAST, "took {:?}", started.elapsed());
+            assert_eq!(out["outcome"], "queued", "{out}");
+            assert_eq!(out["blocked_by"]["kind"], "checking", "{out}");
+        }
+    }
+
+    mod on_a_check_that_passes {
+        use super::*;
+
+        /// Every check passes, off the engine thread.
+        struct OffThread;
+
+        impl HealthProbe for OffThread {
+            fn check(
+                &self,
+                _spec: &HealthSpec,
+                _resource: &ResourceId,
+                _unit: &UnitId,
+                _settings: &UnitSettings,
+            ) -> HealthResult {
+                HealthResult::Healthy
+            }
+
+            fn blocks(&self, _spec: &HealthSpec) -> bool {
+                true
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_queued_request_gets_an_offer() {
+            let h = Engine::spawn(
+                Store::open_in_memory().unwrap(),
+                Arc::new(ManualClock::new(T0)),
+                Config::default(),
+                Arc::new(OffThread),
+            )
+            .unwrap();
+            seed_board(&h, &["u1"]).await;
+            let who = user("a");
+            let out = acquire(&h, &who, 60_000).await;
+            assert_eq!(out["outcome"], "queued", "{out}");
+            let notices = h.wait_notices(who.holder.clone(), PATIENCE).await.unwrap();
+            assert!(
+                kinds(&notices).contains(&NoticeKind::Offered),
+                "{notices:?}"
+            );
+        }
+    }
+
+    mod on_a_check_that_hangs_past_health_timeout {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn other_engine_jobs_complete_within_1_s_meanwhile() {
+            let (_release, held) = mpsc::channel();
+            let config = Config {
+                health_timeout: 1,
+                ..Config::default()
+            };
+            let h = Engine::spawn(
+                Store::open_in_memory().unwrap(),
+                Arc::new(ManualClock::new(T0)),
+                config,
+                Arc::new(Hanging {
+                    release: Mutex::new(held),
+                }),
+            )
+            .unwrap();
+            seed_board(&h, &["u1"]).await;
+            let who = user("a");
+            let out = acquire(&h, &who, 60_000).await;
+            assert_eq!(out["blocked_by"]["kind"], "checking", "{out}");
+            let started = Instant::now();
+            ok(&h, "status", &who, json!({})).await;
+            assert!(started.elapsed() < FAST, "took {:?}", started.elapsed());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_unit_reads_unhealthy_timed_out() {
+            let (_release, held) = mpsc::channel();
+            let config = Config {
+                health_timeout: 1,
+                ..Config::default()
+            };
+            let h = Engine::spawn(
+                Store::open_in_memory().unwrap(),
+                Arc::new(ManualClock::new(T0)),
+                config,
+                Arc::new(Hanging {
+                    release: Mutex::new(held),
+                }),
+            )
+            .unwrap();
+            seed_board(&h, &["u1"]).await;
+            let who = user("a");
+            acquire(&h, &who, 60_000).await;
+            tokio::time::timeout(PATIENCE, async {
+                loop {
+                    let status = ok(&h, "status", &who, json!({})).await;
+                    let health = status["resources"][0]["units"][0]["last_health"].clone();
+                    if health == "unhealthy: timed out" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the check never reported");
+        }
+    }
 
     mod call {
         use super::*;
