@@ -781,7 +781,7 @@ The user dropped MCP after the CLI-only spike (spec §6, Appendix C): agents use
 the `clerk` CLI from Bash, one `clerk` skill and the plugin's hooks. Tasks 2–4's
 MCP code is removed (Task 9) and the old Task 8 (`/clear` link) is superseded:
 with the session ID as holder and the process only as its host, `/clear`
-releases after the grace (user decision) and needs no link. Tasks 0–7
+releases through SessionEnd (user decision) and needs no link. Tasks 0–7
 stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, §8.3,
 §9, §11, Appendix C.
 
@@ -807,7 +807,7 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
   (dropped by a migration). Every agent call and hook reports (session, host);
   the latest report wins. A report of session N from a host makes every
   other session hosted by that same process (pid and start time) **unhosted**.
-  SessionEnd unhosts its session at once.
+  SessionEnd ends its session at once (below).
 - **Liveness:** a session is alive while it has a host whose process runs.
   When it stops being alive, `reconnect_grace` (60 s) starts; a report of the
   same session from any process within it re-hosts the session and cancels
@@ -816,9 +816,13 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
   (§5.7). After a daemon start every session with live leases or requests
   gets the grace from boot (sessions from the MCP era have no host and end
   then).
-- **`/clear` releases** (user decision): the old session is unhosted by the
-  new session's first report, so its leases end after the grace unless it is
-  resumed.
+- **SessionEnd releases at once** (user decision): `session_end { reason }`
+  from the session's current host ends the session with no grace, whatever
+  the reason: leases end with cause `session_ended` (cleanup not confirmed,
+  §5.4), requests drop, audited `session_ended { reason }`. From a process
+  that is not the current host: nothing changes. Crashes run no hook, so the
+  grace covers them; without hooks, `/clear` is noticed by the next report
+  and released after the grace.
 - **`clerk wait` for agents:**
   - returns one batch: blocks until the agent has pending notices, claims any
     `offered` lease in the batch (the result carries the grant brief), prints
@@ -850,10 +854,10 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
 - **Hooks** (budgets unchanged: 2 s; SessionEnd 1.5 s; fail open):
   - session-start: reports the host; for `clear`, `compact` and `resume`,
     when the session holds or waits for anything, or (for `clear`) the
-    previous session of the same process has leases in its grace, prints a
+    previous session of the same process released something, prints a
     brief as `additionalContext`: its leases and requests (IDs, resource,
-    unit, ends), whether a wait is armed, the previous session's ending leases
-    with "`/resume` it within 60 s to keep them", "use the clerk skill", and,
+    unit, ends), whether a wait is armed, what the previous session of the
+    same process released (for `clear`), "use the clerk skill", and,
     when no wait is armed but something is held, the exact `clerk wait`
     command to run in the background. Nothing for `startup` or `fork`, or
     when there is nothing to say.
@@ -861,8 +865,7 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
     no wait is armed and `stop_hook_active` is false; the reason names the
     background `clerk wait` command.
   - pre-tool-use: unchanged (pending notices not yet shown by a hook).
-  - session-end: unhosts the session now; the grace still applies (so
-    `/clear` and a quick `--continue` behave the same).
+  - session-end: `session_end { reason }` (above); 1 s RPC budget.
 - **Plugin:** `integrations/claude-code/` holds `.claude-plugin/plugin.json`,
   `hooks/hooks.json` and `skills/clerk/{SKILL.md,leasing.md,registering.md}`;
   the `leasing` and `registering-resources` skills and `.mcp.json` are
@@ -874,10 +877,10 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
 1. **A killed Claude Code keeps its boards:** `kill -9` of the agent's process
    (its background `clerk wait` keeps running, Appendix C). The wait must
    exit and the leases end after the grace. → Tasks 10, 11.
-2. **`/clear` keeps boards forever, or `--continue` loses them:** after
-   `/clear` the old session's leases end after the grace even though the
-   process lives on; a `--continue` within the grace keeps them. → Tasks
-   10, 12.
+2. **Boards kept or lost at the wrong time:** `/clear` and quitting release
+   at once; a crash keeps the leases for the grace, so `--continue` after a
+   crash keeps them; a second process on the same session is not released
+   by the first one's SessionEnd. → Tasks 10, 12.
 3. **Notices lost between two waits:** a wait killed mid-print, two waits
    racing, a wait woken by an offer it fails to claim. Nothing is lost or
    delivered twice. → Task 11.
@@ -972,8 +975,8 @@ cli::hook
     session-start
         On clear | compact | resume while holding or queued
             - prints the brief; with no armed wait it includes the background clerk wait command
-        On clear with the previous session's leases in their grace
-            - the brief names them and says /resume within 60 s keeps them
+        On clear after the previous session released leases
+            - the brief names what was released
         On startup | fork, or nothing to say
             - prints nothing
     stop
@@ -982,8 +985,13 @@ cli::hook
         On a wait armed, or stop_hook_active true, or holding nothing
             - no output
     session-end
-        On any reason
-            - unhosts the session; its leases end only after the grace
+        On any reason from the session's current host
+            - leases end at once with cause session_ended, cleanup not confirmed; requests drop
+            - audits session_ended { reason }
+        From a process that is not the current host
+            - nothing changes
+        On the daemon down or slow
+            - exits 0 within 1.5 s; the grace covers it
 
 plugin
     files
@@ -1135,8 +1143,7 @@ plugin
 - Produces: the plugin per Part 2 Global Constraints; `docs/claude-code.md`
   install steps without MCP and a checklist: two agents on one pool (the
   second woken by its background wait), an idle agent woken by an expiry
-  warning, `/clear` releases the old session's leases after the grace and
-  the brief says so, `/clear` then `/resume` within the grace keeps them,
+  warning, `/clear` and quitting release at once and the brief says what,
   `kill -9` frees the board after the grace, `--continue` keeps it, the Stop reminder fires once,
   "register the boards on my hub" follows `registering.md`.
 

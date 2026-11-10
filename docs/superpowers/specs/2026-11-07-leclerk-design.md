@@ -540,11 +540,11 @@ agents works in layers:
    hooks.
 4. **Briefs at session start.** After compaction or a resume the
    conversation has lost track of its leases; after `/clear` the previous
-   session's leases are ending (§7.3), yet a wait started before still wakes
+   session's leases were released (§7.3), yet a wait started before still wakes
    the new conversation (Appendix C). A **SessionStart hook** for `clear`,
    `compact` and `resume` adds a short brief: what the session holds or waits
-   for, whether a wait is armed, the previous session's leases that are
-   ending and how to keep them, and to use the clerk skill.
+   for, whether a wait is armed, what the previous session released, and to
+   use the clerk skill.
 5. **Optional extra wake-up: `asyncRewake`.** A hook that runs in the
    background and exits with code 2 when a notice arrives. Hook timeouts are
    enforced, as the spike confirmed, so it must be bounded and re-armed on each
@@ -630,13 +630,19 @@ other's mistakes, not against a hostile process of the same user.
     cancels the grace: resuming needs nothing else, since the session ID stays
     the same.
   - After the grace, the session is dead (§5.7).
-  - A `SessionEnd` hook ends the host at once (the grace still applies).
+  - **`SessionEnd` releases at once** (user decision, 2026-11-10): when the
+    session ends on purpose (`/clear`, quitting, `/resume` of another
+    conversation, logout), the hook ends it with no grace: its leases go
+    through §5.4 as "not confirmed: session ended" and its requests drop.
+    Only the session's current host can do this, so a second process running
+    the same session keeps it. A crash or `kill -9` runs no hook, so the
+    grace still covers `--continue` after a crash; `--continue` after a
+    normal quit starts with nothing held.
 - **What follows from it:**
-  - **`/clear` releases** (user decision, "use the session ID as is"): the new
-    conversation is a new session, so the old one loses its host and its
-    leases end after the grace, unless it is resumed within it. The
-    SessionStart brief (§6, layer 4) tells the new conversation which leases
-    are ending and how to keep them (`/resume`).
+  - **`/clear` releases** (user decision): the new conversation is a new
+    session; SessionEnd (reason `clear`) releases the old one's leases at
+    once. The SessionStart brief (§6, layer 4) tells the new conversation
+    what was released.
   - `/resume` of another conversation inside a running Claude Code does the
     same to the session it leaves.
   - Compaction keeps the session ID, so it keeps the leases; the brief
@@ -644,7 +650,8 @@ other's mistakes, not against a hostile process of the same user.
   - Two processes running the same session (e.g. `--resume` in a second
     terminal) share its leases; the latest to report is the host.
   - Without the plugin's hooks, a session left by `/clear` is noticed when
-    the new session first calls `clerk`, or when the process exits.
+    the new session first calls `clerk`, or when the process exits, and
+    released after the grace.
 - **Other kinds of holder (user decision): the CLI without an agent.** The
   user, scripts and smoke tests can hold and wait for leases through the CLI
   (§8.4). My calls on how:
@@ -950,8 +957,8 @@ stops the MVP):
 - local only;
 - Claude Code only for the MVP;
 - documented mechanisms only;
-- the session ID as the agent holder, with `/clear` releasing after the
-  grace (2026-11-10);
+- the session ID as the agent holder; a SessionEnd hook releases at once on
+  a deliberate end, including `/clear`; crashes get the grace (2026-11-10);
 - no MCP: agents use the CLI, one skill and the plugin's hooks (2026-11-10;
   phase 3's MCP Tasks design is superseded);
 - one `clerk` skill, to keep agents' context small (2026-11-10);
