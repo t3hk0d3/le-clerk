@@ -1,136 +1,64 @@
-//! Agent-session liveness.
+//! Agent-session hosts and liveness.
 //!
-//! An `AgentSession` holder is alive while at least one of its liveness
-//! streams (`GET /v1/session/live`, opened by `clerk mcp`) is open. When the
-//! last one closes, the reconnect grace starts; a stream of the session
-//! opening inside it cancels it, and when it runs out the session's leases
-//! end with cause `holder_gone` and its requests are dropped, as for a CLI
-//! process that went away ([`Scheduler::holder_gone`]). After a daemon
-//! restart every `AgentSession` holder with a live lease or a queued request
-//! gets the same grace from boot, so its proxy can reconnect.
+//! An `AgentSession` holder is the Claude Code session
+//! (`CLAUDE_CODE_SESSION_ID`). Every agent call and hook also reports its
+//! **host**, the Claude Code process (`CLAUDE_PID`, with its start time so
+//! a reused pid is never mistaken for it); the latest report wins. A process
+//! runs one session at a time, so a report of another session from the same
+//! process leaves the sessions it hosted before **unhosted** (`/clear`,
+//! `/resume` of another conversation).
 //!
-//! [`Sessions`] is the engine's in-memory record of that; the engine drives
-//! [`Sessions::expire`] from its clock. Grace algorithm:
+//! A session is alive while it has a host whose process runs. When it stops
+//! being alive (unhosted, or its process gone as [`Sessions::probe`] finds),
+//! the reconnect grace starts; a report of the same session from any
+//! process within it re-hosts the session and cancels the grace (`--continue`
+//! and `--resume` keep the session id). When the grace runs out the
+//! session's leases end with cause `holder_gone` and its requests are
+//! dropped ([`Sessions::expire`]). `SessionEnd` ends a session at once, but
+//! only from its current host ([`Sessions::end`]).
 //!
 //! ```text
-//! on connect(s, c):   open[s] += {c}; cancel grace[s]
-//! on disconnect(c):   s = owner(c); open[s] -= {c}
-//!                     if open[s] empty: grace[s] = now + reconnect_grace
-//! on tick(now):       for s with grace[s] <= now: end_holder(AgentSession(s)); forget s
-//! on daemon start:    for each AgentSession with live leases or requests:
-//!                         grace[s] = boot + reconnect_grace
+//! on report(s, h):  for t != s hosted by h: unhost t; grace[t] = now + grace
+//!                   host[s] = h; cancel grace[s]
+//! on probe:         for s hosted by a dead process: unhost s; grace[s] = now + grace
+//! on tick(now):     for s with grace[s] <= now: end_holder(AgentSession(s)); forget s
+//! on daemon start:  hosts loaded from the store; every AgentSession with live
+//!                   leases or requests and no running host: grace[s] = boot + grace
 //! ```
 //!
-//! Hooks run as children of the Claude Code process, whose session id may
-//! differ from the proxy's (`--continue`, `/clear`). [`Sessions::resolve`]
-//! maps a hook to the live proxy session with the same Claude Code PID, and
-//! [`Sessions::alias`] (the SessionStart-resume hook) hands a resumed
-//! session's leases, requests and pending notices to the live proxy session.
-//! Aliases are kept in the store (`session_aliases`) and loaded at boot, so
-//! a chain of resumes (`--continue` twice) resolves across daemon restarts.
+//! Hosts are kept in the store (`agent_hosts`), so a daemon restart keeps
+//! a running agent's leases without waiting for it to call again.
 //!
 //! Work that writes the store goes through [`Sessions::transact`]: it runs
 //! on a copy of the record, which replaces the record only once the store
 //! transaction has committed, so a failed commit leaves memory and store
 //! in agreement.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
-use serde::Serialize;
 use serde_json::json;
-use ulid::Ulid;
 
-use crate::model::{EndCause, HolderRef, ProjectKey};
-use crate::scheduler::liveness::HolderEnded;
+use crate::model::{EndCause, HolderRef, Host};
+use crate::scheduler::liveness::{HolderEnded, process_alive};
 use crate::scheduler::{Scheduler, SchedulerError, clerk_actor};
-use crate::store::{Store, StoreError, Tx, audit, leases, notices, sessions as alias_store};
+use crate::store::{Store, StoreError, Tx, audit, leases, sessions as host_store};
 
-/// What [`Sessions::alias`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "outcome", content = "reason")]
-pub enum Aliased {
-    /// The live proxy session took the resumed session over.
-    TakenOver,
-    /// Both ids already stand for the same session.
-    Unchanged,
-    /// Nothing moved; a `session_alias_refused` audit entry says why.
-    Refused(AliasRefusal),
-}
-
-/// What [`Sessions::start_resume`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "outcome", content = "reason")]
-pub enum Resume {
-    /// The live proxy session took the resumed session over.
-    TakenOver,
-    /// Both ids already stand for the same session.
-    Unchanged,
-    /// Nothing moved; a `session_alias_refused` audit entry says why.
-    Refused(AliasRefusal),
-    /// The resumed session holds nothing (no live lease, queued request
-    /// or pending notice): there is nothing to take over.
-    NothingHeld,
-    /// No proxy of that Claude Code process is connected yet, or the
-    /// resumed session still is (its old proxy's end not yet noticed). The
-    /// resume
-    /// is remembered (see [`Sessions::resume_pending`]) and may be asked
-    /// again.
-    Pending,
-}
-
-impl From<Aliased> for Resume {
-    fn from(a: Aliased) -> Self {
-        match a {
-            Aliased::TakenOver => Self::TakenOver,
-            Aliased::Unchanged => Self::Unchanged,
-            Aliased::Refused(r) => Self::Refused(r),
-        }
-    }
-}
-
-/// A `SessionStart` resume whose proxy had not connected yet.
-#[derive(Debug, Clone)]
-struct PendingResume {
-    /// The resumed session id, as the hook named it.
-    session_id: String,
-    /// When it is forgotten, unix ms: the resumed session's grace is over
-    /// by then anyway.
-    until: i64,
-}
-
-/// Why an alias was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AliasRefusal {
-    /// The new proxy session has no open liveness stream (yet): what it
-    /// took over would never get a grace.
-    NotConnected,
-    /// The resumed session still has an open liveness stream: another
-    /// Claude Code process is running it.
-    ResumedStillConnected,
-    /// The two sessions belong to different projects.
-    ProjectMismatch,
+/// What [`Sessions::report`] did besides recording the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reported {
+    /// The sessions the reporting process hosted before and left, whose
+    /// grace started.
+    pub unhosted: Vec<String>,
 }
 
 /// One agent session as the liveness record knows it.
 #[derive(Debug, Clone, Default)]
 struct Session {
-    /// Open liveness streams, by connection (a connection may briefly have
-    /// two while a proxy reconnects).
-    open: HashMap<Ulid, usize>,
-    /// The Claude Code process its proxy last named.
-    claude_pid: Option<u32>,
-    /// When the reconnect grace runs out, unix ms; set only while no stream
-    /// is open.
+    /// The process running it; `None` once it left or died.
+    host: Option<Host>,
+    /// When the grace runs out, unix ms; set only while it has no host.
     grace_until: Option<i64>,
-    /// Order of the latest connect, to prefer the newest proxy in
-    /// [`Sessions::resolve`].
-    connected: u64,
-    /// Whether a liveness stream of it ever opened (in this daemon).
-    streamed: bool,
-    /// The project of its latest liveness stream.
-    project: Option<ProjectKey>,
 }
 
 /// The liveness record of every agent session the engine has seen.
@@ -138,14 +66,6 @@ struct Session {
 pub struct Sessions {
     grace_ms: i64,
     known: HashMap<String, Session>,
-    /// Which session each open connection belongs to.
-    owners: HashMap<Ulid, String>,
-    /// Resumed session id → the session that took it over (a mirror of
-    /// the store's `session_aliases`, loaded at boot).
-    aliases: HashMap<String, String>,
-    /// Resumes waiting for their proxy, by Claude Code PID.
-    pending: HashMap<u32, PendingResume>,
-    connects: u64,
 }
 
 impl Sessions {
@@ -155,10 +75,6 @@ impl Sessions {
         Self {
             grace_ms: i64::try_from(reconnect_grace.as_millis()).unwrap_or(i64::MAX),
             known: HashMap::new(),
-            owners: HashMap::new(),
-            aliases: HashMap::new(),
-            pending: HashMap::new(),
-            connects: 0,
         }
     }
 
@@ -179,79 +95,81 @@ impl Sessions {
         Ok(value)
     }
 
-    /// The id `session_id` stands for: the end of its chain of resume
-    /// aliases (itself when it has none).
-    fn follow(&self, session_id: &str) -> String {
-        let mut id = session_id;
-        let mut seen = HashSet::new();
-        while let Some(next) = self.aliases.get(id) {
-            // Aliases only ever point at chain ends, so a cycle cannot be
-            // written; the guard keeps a damaged table from hanging us.
-            if !seen.insert(id) {
-                break;
-            }
-            id = next;
-        }
-        id.to_owned()
-    }
-
-    /// A liveness stream of `session_id` (after alias resolution) opened on
-    /// `connection` in `project`: the session is alive and any grace is
-    /// cancelled. Returns the session the stream counts for.
-    pub fn connect(
+    /// `session_id` was reported by `host` at `now_ms`: `host` runs it now
+    /// (any grace is cancelled), and every other session `host` ran before
+    /// is unhosted and gets the grace.
+    ///
+    /// # Errors
+    /// [`StoreError`] on storage failure.
+    pub fn report(
         &mut self,
+        tx: &Tx,
         session_id: &str,
-        connection: Ulid,
-        claude_pid: Option<u32>,
-        project: Option<ProjectKey>,
-    ) -> String {
-        let id = self.follow(session_id);
-        self.connects += 1;
-        let session = self.known.entry(id.clone()).or_default();
-        *session.open.entry(connection).or_insert(0) += 1;
+        host: Host,
+        now_ms: i64,
+    ) -> Result<Reported, StoreError> {
+        let mut unhosted: Vec<String> = self
+            .known
+            .iter()
+            .filter(|(id, s)| id.as_str() != session_id && s.host == Some(host))
+            .map(|(id, _)| id.clone())
+            .collect();
+        unhosted.sort();
+        for id in &unhosted {
+            self.unhost(tx, id, now_ms)?;
+        }
+        let session = self.known.entry(session_id.to_owned()).or_default();
+        let changed = session.host != Some(host) || session.grace_until.is_some();
+        session.host = Some(host);
         session.grace_until = None;
-        session.connected = self.connects;
-        session.streamed = true;
-        session.project = project;
-        if claude_pid.is_some() {
-            session.claude_pid = claude_pid;
+        if changed {
+            host_store::set_host(tx, session_id, host, now_ms)?;
         }
-        self.owners.insert(connection, id.clone());
-        id
+        Ok(Reported { unhosted })
     }
 
-    /// A liveness stream on `connection` closed at `now_ms`. When it was its
-    /// session's last open stream, the reconnect grace starts.
-    pub fn disconnect(&mut self, connection: Ulid, now_ms: i64) {
-        let Some(id) = self.owners.get(&connection).cloned() else {
-            return;
-        };
-        let Some(session) = self.known.get_mut(&id) else {
-            self.owners.remove(&connection);
-            return;
-        };
-        if let Some(n) = session.open.get_mut(&connection) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                session.open.remove(&connection);
-                self.owners.remove(&connection);
-            }
+    /// Unhost every session whose host process is gone at `now_ms`; their
+    /// grace starts. Returns those sessions.
+    ///
+    /// # Errors
+    /// [`StoreError`] on storage failure.
+    pub fn probe(&mut self, tx: &Tx, now_ms: i64) -> Result<Vec<String>, StoreError> {
+        let mut gone: Vec<String> = self
+            .known
+            .iter()
+            .filter(|(_, s)| s.host.is_some_and(|h| !process_alive(h.pid, h.start_time)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        gone.sort();
+        for id in &gone {
+            tracing::info!(session = %id, "agent session's host process is gone");
+            self.unhost(tx, id, now_ms)?;
         }
-        if session.open.is_empty() {
-            session.grace_until = Some(now_ms.saturating_add(self.grace_ms));
-        }
+        Ok(gone)
     }
 
-    /// True while `session_id` (after alias resolution) has an open
-    /// liveness stream.
+    /// `session_id` has no host from `now_ms`; its grace starts.
+    fn unhost(&mut self, tx: &Tx, session_id: &str, now_ms: i64) -> Result<(), StoreError> {
+        let session = self.known.entry(session_id.to_owned()).or_default();
+        session.host = None;
+        session.grace_until = Some(now_ms.saturating_add(self.grace_ms));
+        host_store::clear_host(tx, session_id, now_ms)
+    }
+
+    /// True while `session_id` has a host (whose process ran at the last
+    /// report or probe).
     #[must_use]
     pub fn is_alive(&self, session_id: &str) -> bool {
-        self.known
-            .get(&self.follow(session_id))
-            .is_some_and(|s| !s.open.is_empty())
+        self.host_of(session_id).is_some()
     }
 
-    /// When `session_id`'s reconnect grace runs out, if one is running.
+    /// The process running `session_id`, if any.
+    #[must_use]
+    pub fn host_of(&self, session_id: &str) -> Option<Host> {
+        self.known.get(session_id).and_then(|s| s.host)
+    }
+
+    /// When `session_id`'s grace runs out, if one is running.
     #[must_use]
     pub fn grace_ends(&self, session_id: &str) -> Option<i64> {
         self.known.get(session_id).and_then(|s| s.grace_until)
@@ -263,156 +181,23 @@ impl Sessions {
         self.known.values().filter_map(|s| s.grace_until).min()
     }
 
-    /// The session a hook (or request) of `session_id` from Claude Code
-    /// process `claude_pid` acts for: the live proxy session with that
-    /// Claude PID (the session id itself when it is one of them, else the
-    /// newest), otherwise `session_id` after alias resolution.
-    #[must_use]
-    pub fn resolve(&self, claude_pid: Option<u32>, session_id: &str) -> String {
-        let own = self.follow(session_id);
-        let Some(pid) = claude_pid else {
-            return own;
-        };
-        let mut live: Vec<(&String, &Session)> = self
-            .known
-            .iter()
-            .filter(|(_, s)| !s.open.is_empty() && s.claude_pid == Some(pid))
-            .collect();
-        if live.iter().any(|(id, _)| **id == own) {
-            return own;
-        }
-        live.sort_by_key(|(_, s)| s.connected);
-        live.last().map_or(own, |(id, _)| (*id).clone())
-    }
-
-    /// The live proxy session of Claude Code process `claude_pid`, as
-    /// [`Sessions::resolve`] picks it for a hook of `session_id`; `None`
-    /// when no proxy of that process is connected.
-    #[must_use]
-    pub fn proxy_of(&self, claude_pid: u32, session_id: &str) -> Option<String> {
-        let id = self.resolve(Some(claude_pid), session_id);
-        self.known
-            .get(&id)
-            .is_some_and(|s| !s.open.is_empty() && s.claude_pid == Some(claude_pid))
-            .then_some(id)
-    }
-
-    /// `SessionStart` with `source: "resume"` from a hook of Claude Code
-    /// process `claude_pid` naming the resumed session `session_id`, at
-    /// `now_ms`: the process's live proxy session takes `session_id` over
-    /// ([`Sessions::alias`]). When no proxy of the process is connected yet
-    /// (the hook can run before the proxy's liveness stream opens), nothing
-    /// moves and the resume is remembered for [`Sessions::resume_pending`];
-    /// likewise while the resumed session itself is still connected (its
-    /// old process just died, its stream not yet noticed closed). Remembered
-    /// until the reconnect grace from now is over. Without a Claude PID the
-    /// proxy cannot be found: `Pending`, remembering nothing. A resumed
-    /// session that holds nothing is left alone (`NothingHeld`).
-    ///
-    /// # Errors
-    /// [`SchedulerError::Store`] on storage failure.
-    pub fn start_resume(
-        &mut self,
-        tx: &Tx,
-        sched: &Scheduler,
-        claude_pid: Option<u32>,
-        session_id: &str,
-        now_ms: i64,
-    ) -> Result<Resume, SchedulerError> {
-        let resumed = HolderRef::AgentSession {
-            session_id: self.follow(session_id),
-        };
-        if !holds_anything(tx, &resumed)? {
-            return Ok(Resume::NothingHeld);
-        }
-        let Some(pid) = claude_pid else {
-            return Ok(Resume::Pending);
-        };
-        let proxy = self.proxy_of(pid, session_id);
-        // The resumed session still counts as connected right after its
-        // Claude Code process died (until its stream is noticed closed):
-        // wait for that like for a proxy not yet connected.
-        let Some(proxy) = proxy.filter(|p| !self.resumed_elsewhere(p, session_id)) else {
-            self.pending.retain(|_, p| p.until > now_ms);
-            self.pending.insert(
-                pid,
-                PendingResume {
-                    session_id: session_id.to_owned(),
-                    until: now_ms.saturating_add(self.grace_ms),
-                },
-            );
-            return Ok(Resume::Pending);
-        };
-        self.pending.remove(&pid);
-        Ok(self.alias(tx, sched, &proxy, session_id)?.into())
-    }
-
-    /// A later hook of Claude Code process `claude_pid` for session
-    /// `session_id` at `now_ms`: when a [`Sessions::start_resume`] of that
-    /// process and session is still pending, its proxy is connected now
-    /// and the resumed session no longer is, the alias is made (once,
-    /// whatever its outcome). `None` when nothing was pending or it still
-    /// has to wait.
-    ///
-    /// # Errors
-    /// [`SchedulerError::Store`] on storage failure.
-    pub fn resume_pending(
-        &mut self,
-        tx: &Tx,
-        sched: &Scheduler,
-        claude_pid: Option<u32>,
-        session_id: &str,
-        now_ms: i64,
-    ) -> Result<Option<Aliased>, SchedulerError> {
-        let Some(pid) = claude_pid else {
-            return Ok(None);
-        };
-        let Some(pending) = self.pending.get(&pid) else {
-            return Ok(None);
-        };
-        if pending.until <= now_ms {
-            self.pending.remove(&pid);
-            return Ok(None);
-        }
-        if pending.session_id != session_id {
-            return Ok(None);
-        }
-        let Some(proxy) = self.proxy_of(pid, session_id) else {
-            return Ok(None);
-        };
-        if self.resumed_elsewhere(&proxy, session_id) {
-            return Ok(None);
-        }
-        self.pending.remove(&pid);
-        Ok(Some(self.alias(tx, sched, &proxy, session_id)?))
-    }
-
-    /// Whether resumed session `session_id` is another session than
-    /// `proxy` and still has an open liveness stream.
-    fn resumed_elsewhere(&self, proxy: &str, session_id: &str) -> bool {
-        self.follow(session_id) != proxy && self.is_alive(session_id)
-    }
-
-    /// Forget a pending resume of Claude Code process `claude_pid` (its
-    /// session ended).
-    pub fn drop_pending(&mut self, claude_pid: u32) {
-        self.pending.remove(&claude_pid);
-    }
-
-    /// Daemon start at `now_ms`: the resume aliases are loaded from the
-    /// store, and every `AgentSession` holder with a live lease or a queued
-    /// request gets the reconnect grace from now. Returns the sessions
-    /// graced.
+    /// Daemon start at `now_ms`: hosts are loaded from the store, and every
+    /// `AgentSession` holder with a live lease or a queued request and no
+    /// running host gets the grace from now. Returns the sessions graced.
     ///
     /// # Errors
     /// [`StoreError`] on storage failure.
     pub fn boot(&mut self, tx: &Tx, now_ms: i64) -> Result<Vec<String>, StoreError> {
-        self.aliases.extend(alias_store::aliases(tx)?);
+        for (id, host) in host_store::hosts(tx)? {
+            if process_alive(host.pid, host.start_time) {
+                self.known.entry(id).or_default().host = Some(host);
+            }
+        }
         let until = now_ms.saturating_add(self.grace_ms);
         let mut graced = Vec::new();
         for id in agent_holders(tx)? {
             let session = self.known.entry(id.clone()).or_default();
-            if session.open.is_empty() && session.grace_until.is_none() {
+            if session.host.is_none() && session.grace_until.is_none() {
                 session.grace_until = Some(until);
                 graced.push(id);
             }
@@ -441,130 +226,48 @@ impl Sessions {
             .collect();
         due.sort();
         for id in &due {
-            tracing::info!(session = %id, "agent session's reconnect grace is over");
-            end_session(tx, sched, id)?;
-            self.forget(id);
+            tracing::info!(session = %id, "agent session's grace is over");
+            end_session(tx, sched, id, "holder_gone", &json!({}))?;
+            self.forget(tx, id)?;
         }
         Ok(due)
     }
 
-    /// `SessionEnd`: end `session_id`'s leases and requests now, without
-    /// grace. Its open streams, if any, still count it as connected.
+    /// `SessionEnd` of `session_id` with `reason`, from `host`: end its
+    /// leases and requests now, without grace, and forget it. Refused
+    /// (`None`, nothing changes) when another process runs the session
+    /// now: a second Claude Code on the same session keeps it.
     ///
     /// # Errors
     /// [`SchedulerError::Store`] on storage failure.
-    pub fn end_now(
+    pub fn end(
         &mut self,
         tx: &Tx,
         sched: &Scheduler,
         session_id: &str,
-    ) -> Result<HolderEnded, SchedulerError> {
-        if let Some(session) = self.known.get_mut(session_id) {
-            session.grace_until = None;
-            if session.open.is_empty() {
-                self.forget(session_id);
-            }
+        host: Option<Host>,
+        reason: &str,
+    ) -> Result<Option<HolderEnded>, SchedulerError> {
+        if let Some(current) = self.host_of(session_id)
+            && host != Some(current)
+        {
+            return Ok(None);
         }
-        end_session(tx, sched, session_id)
-    }
-
-    /// `SessionStart` with `source: "resume"`: the live proxy session `from`
-    /// (Claude Code's start-up id) takes over the resumed session `to`,
-    /// both resolved through the alias chain. The leases, queued requests
-    /// and pending notices of `to` are handed to `from`, `to`'s grace is
-    /// cancelled, and `to` resolves to `from` from now on (persisted).
-    ///
-    /// Refused, moving nothing and auditing `session_alias_refused`, when
-    /// `from` has no open liveness stream, when `to` still has one, or when
-    /// they belong to different projects (as their streams, leases and
-    /// requests say).
-    ///
-    /// # Errors
-    /// [`SchedulerError::Store`] on storage failure.
-    pub fn alias(
-        &mut self,
-        tx: &Tx,
-        sched: &Scheduler,
-        from: &str,
-        to: &str,
-    ) -> Result<Aliased, SchedulerError> {
-        let live = self.follow(from);
-        let resumed = self.follow(to);
-        if live == resumed {
-            return Ok(Aliased::Unchanged);
-        }
-        let resumed_holder = HolderRef::AgentSession {
-            session_id: resumed.clone(),
-        };
-        if let Some(reason) = self.refusal(tx, &live, &resumed, &resumed_holder)? {
-            tracing::info!(from = %live, to = %resumed, ?reason, "resume alias refused");
-            audit::record(
-                tx,
-                sched.now(),
-                &clerk_actor(),
-                "session_alias_refused",
-                &json!({ "from": from, "to": to, "session": live, "resumed": resumed,
-                         "reason": reason }),
-            )?;
-            return Ok(Aliased::Refused(reason));
-        }
-        sched.take_over_holder(
+        let ended = end_session(
             tx,
-            &resumed_holder,
-            &HolderRef::AgentSession {
-                session_id: live.clone(),
-            },
+            sched,
+            session_id,
+            "session_ended",
+            &json!({ "session": session_id, "reason": reason }),
         )?;
-        alias_store::insert_alias(tx, &resumed, &live, sched.now())?;
-        self.known.remove(&resumed);
-        self.aliases.insert(resumed, live);
-        Ok(Aliased::TakenOver)
-    }
-
-    /// Why `live` may not take over `resumed`, if it may not.
-    fn refusal(
-        &self,
-        tx: &Tx,
-        live: &str,
-        resumed: &str,
-        resumed_holder: &HolderRef,
-    ) -> Result<Option<AliasRefusal>, StoreError> {
-        let Some(session) = self.known.get(live).filter(|s| !s.open.is_empty()) else {
-            return Ok(Some(AliasRefusal::NotConnected));
-        };
-        if self.is_alive(resumed) {
-            return Ok(Some(AliasRefusal::ResumedStillConnected));
-        }
-        let project = session.project.clone();
-        let mut theirs: Vec<Option<ProjectKey>> = Vec::new();
-        if let Some(recorded) = self.known.get(resumed).filter(|s| s.streamed) {
-            theirs.push(recorded.project.clone());
-        }
-        theirs.extend(
-            leases::live_leases(tx)?
-                .into_iter()
-                .filter(|l| l.holder == *resumed_holder)
-                .map(|l| l.project),
-        );
-        theirs.extend(
-            leases::queued_requests(tx)?
-                .into_iter()
-                .filter(|r| r.holder == *resumed_holder)
-                .map(|r| r.project),
-        );
-        if theirs.iter().any(|p| *p != project) {
-            return Ok(Some(AliasRefusal::ProjectMismatch));
-        }
-        Ok(None)
+        self.forget(tx, session_id)?;
+        Ok(Some(ended))
     }
 
     /// Drop everything known about `session_id`.
-    fn forget(&mut self, session_id: &str) {
-        if let Some(session) = self.known.remove(session_id) {
-            for connection in session.open.keys() {
-                self.owners.remove(connection);
-            }
-        }
+    fn forget(&mut self, tx: &Tx, session_id: &str) -> Result<(), StoreError> {
+        self.known.remove(session_id);
+        host_store::forget(tx, session_id)
     }
 }
 
@@ -584,22 +287,15 @@ fn agent_holders(tx: &Tx) -> Result<Vec<String>, StoreError> {
     Ok(ids)
 }
 
-/// Whether `holder` has a live lease, a queued request or a pending
-/// notice.
-fn holds_anything(tx: &Tx, holder: &HolderRef) -> Result<bool, StoreError> {
-    Ok(leases::live_leases(tx)?.iter().any(|l| l.holder == *holder)
-        || leases::queued_requests(tx)?
-            .iter()
-            .any(|r| r.holder == *holder)
-        || !notices::pending(tx, holder)?.is_empty())
-}
-
 /// End `session_id`'s leases and requests as [`Scheduler::holder_gone`]
-/// does, when it has any (nothing is audited otherwise).
+/// does, auditing `action` with `extra` merged into the details; nothing is
+/// audited when it has neither.
 fn end_session(
     tx: &Tx,
     sched: &Scheduler,
     session_id: &str,
+    action: &str,
+    extra: &serde_json::Value,
 ) -> Result<HolderEnded, SchedulerError> {
     let holder = HolderRef::AgentSession {
         session_id: session_id.to_owned(),
@@ -612,62 +308,15 @@ fn end_session(
         return Ok(HolderEnded::default());
     }
     let ended = sched.end_holders(tx, &|h| *h == holder, EndCause::HolderGone, false)?;
-    audit::record(
-        tx,
-        sched.now(),
-        &clerk_actor(),
-        "holder_gone",
-        &json!({
-            "holder": holder,
-            "requests_dropped": ended.requests,
-            "leases_ended": ended.leases,
-        }),
-    )?;
+    let mut details = json!({
+        "holder": holder,
+        "requests_dropped": ended.requests,
+        "leases_ended": ended.leases,
+    });
+    if let (Some(d), Some(e)) = (details.as_object_mut(), extra.as_object()) {
+        d.extend(e.clone());
+    }
+    audit::record(tx, sched.now(), &clerk_actor(), action, &details)?;
     sched.dispatch(tx)?;
     Ok(ended)
-}
-
-impl Scheduler {
-    /// Hand everything `old` has to `new`: its live leases, its queued
-    /// requests (keeping their place) and its undelivered notices. One
-    /// `session_resumed` audit entry lists what moved.
-    ///
-    /// # Errors
-    /// [`SchedulerError::Store`] on storage failure.
-    pub fn take_over_holder(
-        &self,
-        tx: &Tx,
-        old: &HolderRef,
-        new: &HolderRef,
-    ) -> Result<(), SchedulerError> {
-        let mut moved_leases = Vec::new();
-        for lease in leases::live_leases(tx)? {
-            if lease.holder == *old {
-                leases::set_holder(tx, lease.row, new)?;
-                moved_leases.push(lease.id);
-            }
-        }
-        let mut moved_requests = Vec::new();
-        for request in leases::queued_requests(tx)? {
-            if request.holder == *old {
-                leases::set_request_holder(tx, request.row, new)?;
-                moved_requests.push(request.id);
-            }
-        }
-        let moved_notices = notices::rehome_all(tx, old, new)?;
-        audit::record(
-            tx,
-            self.now(),
-            &clerk_actor(),
-            "session_resumed",
-            &json!({
-                "from": old,
-                "to": new,
-                "leases": moved_leases,
-                "requests": moved_requests,
-                "notices": moved_notices,
-            }),
-        )?;
-        Ok(())
-    }
 }

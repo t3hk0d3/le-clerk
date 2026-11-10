@@ -3,8 +3,8 @@
 //!
 //! - Each reads one JSON document (Claude Code's documented hook input,
 //!   at most [`MAX_INPUT`] bytes) from stdin and `CLAUDE_PID` (the Claude
-//!   Code process) from the environment, and asks the daemon about the
-//!   session they resolve to (see [`leclerk::engine::HookCommand`]).
+//!   Code process, the session's host) from the environment, and asks the
+//!   daemon about the input's session (see [`leclerk::engine::HookCommand`]).
 //! - They never start the daemon (probe only), and they fail open: on any
 //!   error, timeout, missing daemon or malformed input they exit 0 with no
 //!   output. Everything, start to exit, fits Claude Code's budget: 2 s,
@@ -12,21 +12,18 @@
 //! - stdout carries only the documented hook output, or nothing.
 //!
 //! Per event:
-//! - session-start, `source: "resume"`: the proxy session takes the resumed
-//!   one over. The hook may run before the proxy's liveness stream opens;
-//!   it retries every [`RETRY`] while the budget lasts, then gives up
-//!   silently. Likewise it waits for a daemon that is not answering yet
-//!   (the proxy may be starting it), without starting one itself. The daemon remembers the pending resume, and the next stop
-//!   or pre-tool-use hook (whose brief makes it) finishes it.
-//! - stop: a block decision telling the agent to call `lease_wait`, when
+//! - session-start: reports the session's host (the Claude Code process),
+//!   which unhosts the session that process ran before (`/clear`).
+//! - stop: a block decision telling the agent to start `clerk wait`, when
 //!   the session holds a live lease or a queued request, has no open wait,
 //!   and `stop_hook_active` is false.
 //! - pre-tool-use (not inside a subagent, whose input has `agent_id`): the
-//!   session's pending notices that no hook has shown yet, as `additionalContext` (at most [`MAX_CONTEXT`] characters; the
-//!   rest are counted and shown by a later hook), then marked shown. They
-//!   stay pending for `lease_wait`.
-//! - session-end: the session's leases and requests end now, unless
-//!   `reason` is `clear` or `resume` and its proxy is still connected.
+//!   session's pending notices that no hook has shown yet, as
+//!   `additionalContext` (at most [`MAX_CONTEXT`] characters; the rest are
+//!   counted and shown by a later hook), then marked shown. They stay
+//!   pending for `clerk wait`.
+//! - session-end: the session's leases and requests end now, when this
+//!   process is the session's host.
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
@@ -37,11 +34,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::ValueEnum;
-use leclerk::client::{self, Client, DaemonError, PROBE_TIMEOUT};
+use leclerk::client::{self, Client, PROBE_TIMEOUT};
 use leclerk::config::Paths;
-use leclerk::model::Caller;
+use leclerk::model::{Caller, Host};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+use super::caller;
 
 /// Claude Code's budget for session-start, stop and pre-tool-use hooks.
 const BUDGET: Duration = Duration::from_secs(2);
@@ -59,10 +58,6 @@ const MAX_CONTEXT: usize = 10_000;
 const MAX_NOTICE_LINE: usize = 1_000;
 /// Room kept for the "and N more" line.
 const SUMMARY_ROOM: usize = 120;
-/// Pause between session-start attempts while the proxy is not connected.
-const RETRY: Duration = Duration::from_millis(150);
-/// The variable Claude Code sets for hook commands.
-const CLAUDE_PID_VAR: &str = "CLAUDE_PID";
 
 /// The hook event a `clerk hook` runs for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -121,9 +116,7 @@ pub fn main(event: Event) -> ExitCode {
 /// The hook's output, if it has one.
 fn run(event: Event, deadline: Instant) -> anyhow::Result<Option<Value>> {
     let input = read_input(deadline)?;
-    let claude_pid = std::env::var(CLAUDE_PID_VAR)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok());
+    let host = caller::host();
     let paths = Paths::resolve()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -131,7 +124,7 @@ fn run(event: Event, deadline: Instant) -> anyhow::Result<Option<Value>> {
     let hook = Hook {
         paths,
         input,
-        claude_pid,
+        host,
         deadline,
     };
     let result = runtime.block_on(async {
@@ -173,7 +166,8 @@ fn read_input(deadline: Instant) -> anyhow::Result<HookInput> {
 struct Hook {
     paths: Paths,
     input: HookInput,
-    claude_pid: Option<u32>,
+    /// The Claude Code process running the session (`CLAUDE_PID`).
+    host: Option<Host>,
     deadline: Instant,
 }
 
@@ -200,49 +194,25 @@ impl Hook {
             caller: client::cli_caller(),
             args: json!({
                 "session_id": self.input.session_id,
-                "claude_pid": self.claude_pid,
+                "host": self.host,
             }),
         })
     }
 
-    /// `source: "resume"`: alias, retrying while the proxy is not
-    /// connected. Nothing for any other source.
+    /// Report the session's host, whatever the source (that unhosts the
+    /// session this process ran before, e.g. on `/clear`).
     async fn session_start(&self) -> anyhow::Result<Option<Value>> {
-        if self.input.source.as_deref() != Some("resume") || self.claude_pid.is_none() {
+        let Some(source) = self.input.source.as_deref() else {
+            bail!("the session-start input has no source");
+        };
+        if self.host.is_none() {
             return Ok(None);
         }
-        // The proxy, started alongside this hook, may be starting the
-        // daemon: wait for it within the budget (never start one here).
-        let session = loop {
-            match self.client().await {
-                Ok(session) => break session,
-                Err(e)
-                    if self.left() >= RETRY * 2
-                        && matches!(
-                            e.downcast_ref::<DaemonError>(),
-                            Some(DaemonError::Unavailable | DaemonError::Unresponsive { .. })
-                        ) =>
-                {
-                    tokio::time::sleep(RETRY).await;
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        loop {
-            let outcome = session
-                .call("session_start", json!({ "source": "resume" }), self.left())
-                .await?;
-            let retry = match outcome["outcome"].as_str() {
-                Some("pending") => true,
-                Some("refused") => outcome["reason"] == json!("not_connected"),
-                _ => false,
-            };
-            // Leave room for one more answer after the pause.
-            if !retry || self.left() < RETRY * 2 {
-                return Ok(None);
-            }
-            tokio::time::sleep(RETRY).await;
-        }
+        let session = self.client().await?;
+        session
+            .call("session_start", json!({ "source": source }), self.left())
+            .await?;
+        Ok(None)
     }
 
     /// Block once while the session holds or waits for something without

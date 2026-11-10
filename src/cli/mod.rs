@@ -180,7 +180,9 @@ impl Ctx {
     /// # Errors
     /// [`DaemonError`] when no daemon of this version answers.
     pub async fn client(&self) -> Result<Client, DaemonError> {
-        Client::ensure_running(&self.paths).await
+        // An agent session reports the process running it with every call.
+        let host = std::env::var_os(caller::SESSION_VAR).and(caller::host());
+        Ok(Client::ensure_running(&self.paths).await?.with_host(host))
     }
 }
 

@@ -68,6 +68,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0012_notice_returned.sql")),
         M::up(include_str!("migrations/0013_session_aliases.sql")),
         M::up(include_str!("migrations/0014_notice_hook_shown.sql")),
+        M::up(include_str!("migrations/0015_agent_hosts.sql")),
     ])
 }
 

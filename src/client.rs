@@ -24,7 +24,7 @@ use tokio::net::UnixStream;
 
 use crate::config::{Paths, SocketPathTooLong, check_socket_path};
 use crate::error::ErrorCode;
-use crate::model::{Caller, HolderRef, LeaseId, RequestId};
+use crate::model::{Caller, HolderRef, Host, LeaseId, RequestId};
 use crate::scheduler::liveness;
 use crate::store::notices::{Notice, NoticeFilter};
 
@@ -295,6 +295,9 @@ pub fn cli_caller() -> Caller {
 pub struct Client {
     socket: PathBuf,
     daemon: DaemonInfo,
+    /// The agent session's host, sent with every request (see
+    /// [`Client::with_host`]).
+    host: Option<Host>,
 }
 
 impl Client {
@@ -319,6 +322,7 @@ impl Client {
         Ok(Self {
             socket: paths.socket.clone(),
             daemon,
+            host: None,
         })
     }
 
@@ -443,6 +447,7 @@ impl Client {
         let client = Self {
             socket: paths.socket.clone(),
             daemon,
+            host: None,
         };
         let deadline = Instant::now() + STOP_TIMEOUT;
         let asked = client
@@ -483,6 +488,14 @@ impl Client {
         &self.daemon
     }
 
+    /// This client with every request also reporting `host`, the process
+    /// running the calling agent session (`CLAUDE_PID`).
+    #[must_use]
+    pub fn with_host(mut self, host: Option<Host>) -> Self {
+        self.host = host;
+        self
+    }
+
     /// Call RPC `method` as `caller` with `args`, waiting up to
     /// [`CALL_TIMEOUT`] for the answer.
     ///
@@ -520,7 +533,11 @@ impl Client {
         args: Value,
         limit: Duration,
     ) -> Result<Value, ApiError> {
-        let body = serde_json::to_vec(&json!({ "caller": caller, "args": args }))
+        let mut body = json!({ "caller": caller, "args": args });
+        if let Some(host) = self.host {
+            body["host"] = json!(host);
+        }
+        let body = serde_json::to_vec(&body)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let path = format!("/v1/rpc/{method}");
         let (status, body) = send(&self.socket, Method::POST, &path, Some(body), limit)
@@ -558,6 +575,9 @@ impl Client {
         let holder = serde_json::to_string(holder)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let mut params = vec![("holder", holder), ("wait", secs.to_string())];
+        if let Some(host) = self.host {
+            params.push(("host", json!(host).to_string()));
+        }
         if let Some(f) = filter {
             let join = |ids: Vec<&str>| ids.join(",");
             params.push((

@@ -28,15 +28,14 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{Notify, oneshot, watch};
-use ulid::Ulid;
 
 use crate::admin::AdminError;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::ErrorCode;
 use crate::inventory::{Inventory, InventoryError, PromotionError, Promotions};
-use crate::model::{HolderRef, NoticeId, ProjectKey};
-use crate::scheduler::session::{Aliased, Sessions};
+use crate::model::{HolderRef, Host, NoticeId};
+use crate::scheduler::session::Sessions;
 use crate::scheduler::{HealthProbe, Scheduler, SchedulerError, liveness};
 use crate::store::notices::{self, Notice, NoticeFilter};
 use crate::store::{Store, StoreError};
@@ -268,43 +267,12 @@ enum Job {
     AckNotices(HolderRef, Vec<NoticeId>, Reply<usize>),
     /// Every pending notice of a holder, changing nothing.
     PendingNotices(HolderRef, Reply<Vec<Notice>>),
-    /// A liveness stream of an agent session opened.
-    SessionConnect(SessionConnect, Reply<()>),
-    /// A liveness stream closed (nobody waits for the answer).
-    SessionDisconnect(Ulid),
-    /// End an agent session's leases and requests now (`SessionEnd`).
-    SessionEndNow(String, Reply<()>),
-    /// A live proxy session (first) takes over a resumed one (second).
-    SessionAlias(String, String, Reply<Aliased>),
-    /// The session a hook or request acts for.
-    SessionResolve(Option<u32>, String, Reply<String>),
-    /// Whether an agent session has an open liveness stream.
+    /// An agent call or hook reported the process running a session.
+    ReportHost(String, Host, Reply<()>),
+    /// Whether an agent session has a running host.
     SessionAlive(String, Reply<bool>),
     /// A Claude Code hook's RPC.
     Hook(Box<HookCommand>, Reply<HookAnswer>),
-}
-
-/// A liveness stream that opened.
-struct SessionConnect {
-    session_id: String,
-    connection: Ulid,
-    claude_pid: Option<u32>,
-    project: Option<ProjectKey>,
-}
-
-/// One open liveness stream of an agent session (see
-/// [`EngineHandle::session_connect`]); dropping it closes the stream, which
-/// starts the session's reconnect grace when it was the last one.
-pub struct SessionLink {
-    jobs: mpsc::Sender<Job>,
-    connection: Ulid,
-}
-
-impl Drop for SessionLink {
-    fn drop(&mut self) {
-        // A stopped engine has nothing left to tell.
-        let _ = self.jobs.send(Job::SessionDisconnect(self.connection));
-    }
 }
 
 /// The canonical key of a holder: its JSON encoding, as stored with its
@@ -504,14 +472,6 @@ impl EngineHandle {
         filter: Option<NoticeFilter>,
         timeout: Duration,
     ) -> Result<Vec<Notice>, ApiError> {
-        // Park under the session the engine will deliver to, so its
-        // notices wake this wait.
-        let holder = match holder {
-            HolderRef::AgentSession { session_id } => HolderRef::AgentSession {
-                session_id: self.session_resolve(None, session_id).await?,
-            },
-            other => other,
-        };
         let got = self
             .wait_until(&holder, timeout.min(MAX_WAIT), || async {
                 let got = self.take(holder.clone(), filter.clone()).await?;
@@ -619,73 +579,17 @@ impl EngineHandle {
             .unwrap_or(0)
     }
 
-    /// A liveness stream of agent session `session_id` opened on
-    /// `connection` (a `clerk mcp` process) for Claude Code process
-    /// `claude_pid` in `project`: the session is alive and its grace, if
-    /// any, cancelled, until the returned link is dropped.
-    ///
-    /// # Errors
-    /// `engine_unavailable`.
-    pub async fn session_connect(
-        &self,
-        session_id: String,
-        connection: Ulid,
-        claude_pid: Option<u32>,
-        project: Option<ProjectKey>,
-    ) -> Result<SessionLink, ApiError> {
-        let connect = SessionConnect {
-            session_id,
-            connection,
-            claude_pid,
-            project,
-        };
-        self.ask(|reply| Job::SessionConnect(connect, reply))
-            .await?;
-        Ok(SessionLink {
-            jobs: self.jobs.clone(),
-            connection,
-        })
-    }
-
-    /// `SessionEnd`: end agent session `session_id`'s leases and requests
-    /// now, without grace.
+    /// Agent session `session_id` is run by `host` (an agent call or hook
+    /// said so): see [`Sessions::report`].
     ///
     /// # Errors
     /// A storage failure, or `engine_unavailable`.
-    pub async fn session_end_now(&self, session_id: String) -> Result<(), ApiError> {
-        self.ask(|reply| Job::SessionEndNow(session_id, reply))
+    pub async fn report_host(&self, session_id: String, host: Host) -> Result<(), ApiError> {
+        self.ask(|reply| Job::ReportHost(session_id, host, reply))
             .await
     }
 
-    /// `SessionStart` resume: the live proxy session `from` takes over the
-    /// resumed session `to` (its leases, requests and pending notices; its
-    /// grace is cancelled; `to` resolves to `from` from now on, also after
-    /// a restart). Refused, moving nothing, when `from` has no open
-    /// liveness stream, `to` still has one, or their projects differ; the
-    /// answer says which, so a caller can retry once the proxy connected.
-    ///
-    /// # Errors
-    /// A storage failure, or `engine_unavailable`.
-    pub async fn session_alias(&self, from: String, to: String) -> Result<Aliased, ApiError> {
-        self.ask(|reply| Job::SessionAlias(from, to, reply)).await
-    }
-
-    /// The session a hook or request of `session_id` from Claude Code
-    /// process `claude_pid` acts for: the live proxy session with that PID,
-    /// else `session_id` after alias resolution.
-    ///
-    /// # Errors
-    /// `engine_unavailable`.
-    pub async fn session_resolve(
-        &self,
-        claude_pid: Option<u32>,
-        session_id: String,
-    ) -> Result<String, ApiError> {
-        self.ask(|reply| Job::SessionResolve(claude_pid, session_id, reply))
-            .await
-    }
-
-    /// Whether agent session `session_id` has an open liveness stream.
+    /// Whether agent session `session_id` has a running host.
     ///
     /// # Errors
     /// `engine_unavailable`.
@@ -953,8 +857,7 @@ impl Engine {
     fn handle(&mut self, job: Job) {
         match job {
             Job::Command(command, reply) => self.handle_command(*command, reply),
-            Job::TakeNotices(mut holder, filter, reply) => {
-                self.resolve_holder(&mut holder);
+            Job::TakeNotices(holder, filter, reply) => {
                 let result = self.guarded("take_notices", |engine| {
                     let now = engine.clock.now_ms();
                     Ok(engine.store.tx(|tx| {
@@ -963,8 +866,7 @@ impl Engine {
                 });
                 let _ = reply.send(result);
             }
-            Job::ReturnNotices(mut holder, filter, reply) => {
-                self.resolve_holder(&mut holder);
+            Job::ReturnNotices(holder, filter, reply) => {
                 let result = self.guarded("return_notices", |engine| {
                     let now = engine.clock.now_ms();
                     Ok(engine.store.tx(|tx| {
@@ -973,57 +875,30 @@ impl Engine {
                 });
                 let _ = reply.send(result);
             }
-            Job::AckNotices(mut holder, ids, reply) => {
-                self.resolve_holder(&mut holder);
+            Job::AckNotices(holder, ids, reply) => {
                 let result = self.guarded("ack_notices", |engine| {
                     let now = engine.clock.now_ms();
                     Ok(engine.store.tx(|tx| notices::ack(tx, &holder, &ids, now))?)
                 });
                 let _ = reply.send(result);
             }
-            Job::PendingNotices(mut holder, reply) => {
-                self.resolve_holder(&mut holder);
+            Job::PendingNotices(holder, reply) => {
                 let result = self.guarded("pending_notices", |engine| {
                     Ok(engine.store.tx(|tx| notices::pending(tx, &holder))?)
                 });
                 let _ = reply.send(result);
             }
-            Job::SessionConnect(c, reply) => {
-                self.sessions
-                    .connect(&c.session_id, c.connection, c.claude_pid, c.project);
-                let _ = reply.send(Ok(()));
-            }
-            Job::SessionDisconnect(connection) => {
-                let now = self.clock.now_ms();
-                self.sessions.disconnect(connection, now);
-            }
-            Job::SessionEndNow(session_id, reply) => {
-                let result = self.guarded("session_end_now", |engine| {
-                    let sched = &engine.scheduler;
+            Job::ReportHost(session_id, host, reply) => {
+                let result = self.guarded("report_host", |engine| {
+                    let now = engine.clock.now_ms();
                     engine
                         .sessions
                         .transact(&mut engine.store, |tx, sessions| {
-                            sessions.end_now(tx, sched, &session_id)
+                            sessions.report(tx, &session_id, host, now)
                         })?;
                     Ok(())
                 });
                 let _ = reply.send(result);
-                self.maintain();
-            }
-            Job::SessionAlias(from, to, reply) => {
-                let result = self.guarded("session_alias", |engine| {
-                    let sched = &engine.scheduler;
-                    Ok(engine
-                        .sessions
-                        .transact(&mut engine.store, |tx, sessions| {
-                            sessions.alias(tx, sched, &from, &to)
-                        })?)
-                });
-                let _ = reply.send(result);
-                self.maintain();
-            }
-            Job::SessionResolve(claude_pid, session_id, reply) => {
-                let _ = reply.send(Ok(self.sessions.resolve(claude_pid, &session_id)));
             }
             Job::SessionAlive(session_id, reply) => {
                 let _ = reply.send(Ok(self.sessions.is_alive(&session_id)));
@@ -1045,10 +920,8 @@ impl Engine {
         }
     }
 
-    /// Run an RPC command for its caller (resolved through the resume
-    /// aliases) and answer `reply`.
-    fn handle_command(&mut self, mut command: Command, reply: Reply<Value>) {
-        self.resolve_holder(&mut command.caller_mut().holder);
+    /// Run an RPC command for its caller and answer `reply`.
+    fn handle_command(&mut self, command: Command, reply: Reply<Value>) {
         // Reads see overdue deadlines processed.
         if self.deadline_due() {
             self.maintain();
@@ -1064,16 +937,6 @@ impl Engine {
         let _ = reply.send(result);
         if mutating {
             self.maintain();
-        }
-    }
-
-    /// An agent session holder stands for the session its resume aliases
-    /// lead to (the live proxy session that took it over), whoever calls:
-    /// the CLI from an agent's shell after `--continue`, an RPC or MCP.
-    /// Other holders are left alone.
-    fn resolve_holder(&self, holder: &mut HolderRef) {
-        if let HolderRef::AgentSession { session_id } = holder {
-            *session_id = self.sessions.resolve(None, session_id);
         }
     }
 
@@ -1122,8 +985,20 @@ impl Engine {
         };
     }
 
-    /// End the leases and requests of CLI-process holders that are gone.
+    /// End the leases and requests of CLI-process holders that are gone,
+    /// and start the grace of agent sessions whose host process is gone.
     fn probe(&mut self) {
+        let hosts = self.guarded("host probe", |engine| {
+            let now = engine.clock.now_ms();
+            Ok(engine
+                .sessions
+                .transact(&mut engine.store, |tx, sessions| sessions.probe(tx, now))?)
+        });
+        match hosts {
+            Ok(gone) if gone.is_empty() => {}
+            Ok(gone) => tracing::info!(?gone, "agent sessions lost their host; grace started"),
+            Err(e) => tracing::error!(error = %e, "host probe failed"),
+        }
         let result = self.guarded("liveness probe", |engine| {
             let sched = &engine.scheduler;
             Ok(engine.store.tx(|tx| liveness::probe_all(tx, sched))?)

@@ -48,6 +48,7 @@ fn clerk_with(env: &Env, args: &[&str], vars: &[(&str, &str)]) -> Output {
     cmd.args(args)
         .env("CLERK_HOME", env.home())
         .env_remove(SESSION_VAR)
+        .env_remove("CLAUDE_PID")
         .envs(vars.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::engine::{ApiError, Command, EngineHandle, ErrorKind, HookCommand, MAX_WAIT};
-use crate::model::{Caller, HolderRef};
+use crate::model::{Caller, HolderRef, Host};
 use crate::store::notices::NoticeFilter;
 
 /// What `GET /v1/version` reports.
@@ -103,6 +103,9 @@ struct RpcRequest {
     caller: Caller,
     #[serde(default)]
     args: Value,
+    /// The process running the calling agent session, if it is one.
+    #[serde(default)]
+    host: Option<Host>,
 }
 
 async fn rpc(
@@ -133,6 +136,9 @@ async fn rpc(
             Err(e) => e.into_response(),
         };
     }
+    if let Err(e) = report(&engine, &request.caller.holder, request.host).await {
+        return e.into_response();
+    }
     let command = match Command::parse(&method, request.caller, request.args) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
@@ -140,6 +146,21 @@ async fn rpc(
     match engine.call(command).await {
         Ok(result) => ok(result),
         Err(e) => e.into_response(),
+    }
+}
+
+/// Record `host` as the process running `holder`, when both are an agent
+/// session and its host.
+async fn report(
+    engine: &EngineHandle,
+    holder: &HolderRef,
+    host: Option<Host>,
+) -> Result<(), ApiError> {
+    match (holder, host) {
+        (HolderRef::AgentSession { session_id }, Some(host)) => {
+            engine.report_host(session_id.clone(), host).await
+        }
+        _ => Ok(()),
     }
 }
 
@@ -157,6 +178,9 @@ struct NoticesQuery {
     /// Comma-separated request ids: with `leases`, the filter.
     #[serde(default)]
     requests: Option<String>,
+    /// The JSON encoding of the waiting agent session's host.
+    #[serde(default)]
+    host: Option<String>,
 }
 
 /// Comma-separated ids; empty entries are skipped.
@@ -202,6 +226,16 @@ async fn notices(
         Ok(f) => f,
         Err(e) => return e.into_response(),
     };
+    let host: Option<Host> = match query.host.as_deref().map(serde_json::from_str).transpose() {
+        Ok(h) => h,
+        Err(e) => {
+            return ApiError::invalid_request(format!("host is not a valid Host: {e}"))
+                .into_response();
+        }
+    };
+    if let Err(e) = report(&engine, &holder, host).await {
+        return e.into_response();
+    }
     let wait = Duration::from_secs(query.wait).min(MAX_WAIT);
     match engine.wait_notices_matching(holder, filter, wait).await {
         Ok(list) => ok(list),

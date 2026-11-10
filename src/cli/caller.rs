@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use leclerk::model::{Caller, HolderRef, ProjectKey};
+use leclerk::client::ApiError;
+use leclerk::model::{Caller, HolderRef, Host, ProjectKey};
 use leclerk::scheduler::liveness;
 use leclerk::scope::{ProjectResolver, ScopeError};
 use ulid::Ulid;
@@ -11,6 +12,50 @@ use super::UsageError;
 
 /// The variable Claude Code sets in an agent session's environment.
 pub const SESSION_VAR: &str = "CLAUDE_CODE_SESSION_ID";
+
+/// The variable Claude Code sets to its own process id for Bash and hook
+/// commands (Claude Code 2.1.214 or later).
+pub const PID_VAR: &str = "CLAUDE_PID";
+
+/// The Claude Code process running this agent session: `CLAUDE_PID` with
+/// its start time; `None` when unset, unparsable or no longer running.
+#[must_use]
+pub fn host() -> Option<Host> {
+    host_from(std::env::var(PID_VAR).ok(), liveness::start_time)
+}
+
+/// [`host`] with its inputs given.
+fn host_from(pid: Option<String>, start_time: impl Fn(u32) -> Option<u64>) -> Option<Host> {
+    let pid: u32 = pid?.trim().parse().ok()?;
+    Some(Host {
+        pid,
+        start_time: start_time(pid)?,
+    })
+}
+
+/// The host of `caller` when it is an agent session, for commands that
+/// hold or queue for it: such a lease must be tied to a running process.
+///
+/// # Errors
+/// `agent_unidentified` for an agent session without a usable
+/// `CLAUDE_PID`.
+pub fn require_host(caller: &Caller) -> Result<Option<Host>, ApiError> {
+    if !is_agent(caller) {
+        return Ok(None);
+    }
+    match host() {
+        Some(host) => Ok(Some(host)),
+        None => Err(ApiError {
+            code: "agent_unidentified".to_owned(),
+            message: format!(
+                "this agent session cannot hold leases: {PID_VAR} is not set or names no running \
+                 process. The clerk needs Claude Code 2.1.214 or later, which sets {PID_VAR} for \
+                 Bash commands; update Claude Code and run the command again."
+            ),
+            details: None,
+        }),
+    }
+}
 
 /// How the command holds what it gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +156,26 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn host_is_claude_pid_with_its_start_time() {
+        let host = host_from(Some("42".to_owned()), |pid| (pid == 42).then_some(7));
+        assert_eq!(
+            host,
+            Some(Host {
+                pid: 42,
+                start_time: 7
+            })
+        );
+    }
+
+    #[test]
+    fn no_host_without_claude_pid_or_with_a_gone_or_bad_one() {
+        assert_eq!(host_from(None, |_| Some(7)), None);
+        assert_eq!(host_from(Some("42".to_owned()), |_| None), None);
+        assert_eq!(host_from(Some("x".to_owned()), |_| Some(7)), None);
+        assert_eq!(host_from(Some(String::new()), |_| Some(7)), None);
+    }
 
     fn project() -> ProjectKey {
         ProjectKey(PathBuf::from("/work/repo/.git"))

@@ -36,7 +36,11 @@ impl TestEnv {
     /// A `clerk` command bound to this environment.
     pub fn cmd(&self) -> Command {
         let mut cmd = Command::cargo_bin("clerk").expect("clerk binary");
-        cmd.env("CLERK_HOME", self.home.path());
+        // Tests may run inside a Claude Code session: none of its identity
+        // leaks into the commands under test.
+        cmd.env("CLERK_HOME", self.home.path())
+            .env_remove(SESSION_VAR)
+            .env_remove(PID_VAR);
         cmd
     }
 }
@@ -85,6 +89,8 @@ pub fn insert_queued_request(tx: &Tx, resource: &Resource, unit: Option<&Unit>) 
 pub const PATIENCE: Duration = Duration::from_secs(30);
 /// The variable that marks an agent session.
 pub const SESSION_VAR: &str = "CLAUDE_CODE_SESSION_ID";
+/// The variable Claude Code sets to its own pid for Bash commands.
+pub const PID_VAR: &str = "CLAUDE_PID";
 /// Ctrl+C.
 pub const CTRL_C: &[u8] = b"\x03";
 /// Ctrl+].
@@ -158,6 +164,7 @@ impl Drop for Env {
             .args(["daemon", "stop"])
             .env("CLERK_HOME", self.home())
             .env_remove(SESSION_VAR)
+            .env_remove(PID_VAR)
             .stdin(Stdio::null())
             .output();
     }
@@ -182,6 +189,7 @@ impl Tty {
             .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
             .env("CLERK_HOME", env.home())
             .env_remove(SESSION_VAR)
+            .env_remove(PID_VAR)
             .envs(vars.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

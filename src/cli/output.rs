@@ -231,6 +231,7 @@ fn exit_for(code: &str) -> u8 {
         | "settings_empty_field"
         | "settings_zero_port"
         | "extend_not_later"
+        | "agent_unidentified"
         | "no_such_directory" => EXIT_USAGE,
         "internal_error" | "database_error" | "corrupt_database" | "migration_error"
         | "io_error" | "json_error" | "bad_response" | "git_failed" => EXIT_INTERNAL,

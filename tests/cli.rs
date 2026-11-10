@@ -22,6 +22,7 @@ use common::TestEnv;
 const PATIENCE: Duration = Duration::from_secs(30);
 /// The variable that marks an agent session.
 const SESSION_VAR: &str = "CLAUDE_CODE_SESSION_ID";
+const CLAUDE_PID: &str = "CLAUDE_PID";
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -52,12 +53,25 @@ impl Env {
     /// A clerk command run by the user: no agent session, stdin closed.
     fn cmd(&self) -> Command {
         let mut cmd = self.env.cmd();
-        cmd.env_remove(SESSION_VAR).timeout(PATIENCE);
+        cmd.env_remove(SESSION_VAR)
+            .env_remove(CLAUDE_PID)
+            .timeout(PATIENCE);
         cmd
     }
 
-    /// A clerk command run by agent session `session` in `cwd`.
+    /// A clerk command run by agent session `session` in `cwd`, hosted by
+    /// this test process (alive for the whole test).
     fn agent(&self, session: &str, cwd: &Path) -> Command {
+        let mut cmd = self.cmd();
+        cmd.env(SESSION_VAR, session)
+            .env(CLAUDE_PID, std::process::id().to_string())
+            .current_dir(cwd);
+        cmd
+    }
+
+    /// A clerk command run by agent session `session` in `cwd` without
+    /// `CLAUDE_PID` (Claude Code older than 2.1.214).
+    fn agent_without_pid(&self, session: &str, cwd: &Path) -> Command {
         let mut cmd = self.cmd();
         cmd.env(SESSION_VAR, session).current_dir(cwd);
         cmd
@@ -89,6 +103,7 @@ impl Env {
             .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
             .env("CLERK_HOME", self.home())
             .env_remove(SESSION_VAR)
+            .env_remove(CLAUDE_PID)
             .timeout(PATIENCE)
             .output()
             .unwrap();
@@ -114,6 +129,7 @@ impl Drop for Env {
             .args(["daemon", "stop"])
             .env("CLERK_HOME", self.home())
             .env_remove(SESSION_VAR)
+            .env_remove(CLAUDE_PID)
             .stdin(Stdio::null())
             .output();
     }
@@ -524,6 +540,7 @@ mod cli {
                         .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
                         .env("CLERK_HOME", env.home())
                         .env_remove(SESSION_VAR)
+                        .env_remove(CLAUDE_PID)
                         .args([
                             "-c",
                             "mkdir gone && cd gone && rmdir ../gone && exec \"$CLERK\" resource \
@@ -1106,6 +1123,7 @@ mod cli {
                     .args(["resource", "create", "probe", "--type", "generic"])
                     .env("CLERK_HOME", env.home())
                     .env_remove(SESSION_VAR)
+                    .env_remove(CLAUDE_PID)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .spawn()
@@ -1320,6 +1338,92 @@ mod cli {
                     body["resource"]["scope"],
                     json!({"project": canonical(&dir)})
                 );
+            }
+        }
+
+        mod on_session_id_without_claude_pid {
+            use super::*;
+
+            #[test]
+            fn acquire_fails_with_agent_unidentified_naming_2_1_214() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let dir = env.dir("alpha");
+                let error = error_of(
+                    env.agent_without_pid("sess-1", &dir)
+                        .args(["acquire", "board", "--for", "10m"]),
+                    2,
+                );
+                assert_eq!(error["code"], "agent_unidentified", "{error}");
+                assert!(
+                    error["message"].as_str().unwrap().contains("2.1.214"),
+                    "{error}"
+                );
+                assert_eq!(env.ok(&["leases"]).as_array().map(Vec::len), Some(0));
+            }
+
+            #[test]
+            fn read_only_commands_run_as_the_agent() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                json_of(
+                    env.agent_without_pid("sess-1", &dir)
+                        .args(["leases", "--mine"]),
+                );
+            }
+        }
+
+        mod on_claude_pid_whose_process_is_gone {
+            use super::*;
+
+            #[test]
+            fn acquire_fails_with_agent_unidentified() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let dir = env.dir("alpha");
+                let mut gone = std::process::Command::new("true").spawn().unwrap();
+                let pid = gone.id();
+                gone.wait().unwrap();
+                let error = error_of(
+                    env.agent_without_pid("sess-1", &dir)
+                        .env(CLAUDE_PID, pid.to_string())
+                        .args(["acquire", "board", "--for", "10m"]),
+                    2,
+                );
+                assert_eq!(error["code"], "agent_unidentified", "{error}");
+            }
+        }
+
+        mod on_claude_pid_set {
+            use super::*;
+
+            /// Review Focus 1: a killed Claude Code frees its board after
+            /// the grace.
+            #[test]
+            fn the_lease_ends_after_the_grace_once_its_host_dies() {
+                let env = Env::new();
+                let config = env.home().join("config");
+                fs::create_dir_all(&config).unwrap();
+                fs::write(config.join("config.toml"), "reconnect_grace = 1\n").unwrap();
+                seed(&env, "board", "k1");
+                let dir = env.dir("alpha");
+                let mut host = std::process::Command::new("sleep")
+                    .arg("300")
+                    .spawn()
+                    .unwrap();
+                json_of(
+                    env.agent_without_pid("sess-1", &dir)
+                        .env(CLAUDE_PID, host.id().to_string())
+                        .args(["acquire", "board", "--for", "10m"]),
+                );
+                assert_eq!(env.ok(&["leases"]).as_array().map(Vec::len), Some(1));
+                host.kill().unwrap();
+                host.wait().unwrap();
+                let until = Instant::now() + Duration::from_secs(10);
+                while env.ok(&["leases"]).as_array().map(Vec::len) != Some(0) {
+                    assert!(Instant::now() < until, "the lease never ended");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
         }
 
@@ -1678,6 +1782,7 @@ mod cli {
                     .arg("status")
                     .env("CLERK_HOME", env.home())
                     .env_remove(SESSION_VAR)
+                    .env_remove(CLAUDE_PID)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .spawn()
@@ -2208,11 +2313,13 @@ mod cli {
             .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
             .env("CLERK_HOME", env.home())
             .env_remove(SESSION_VAR)
+            .env_remove(CLAUDE_PID)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(session) = session {
-            cmd.env(SESSION_VAR, session);
+            cmd.env(SESSION_VAR, session)
+                .env(CLAUDE_PID, std::process::id().to_string());
         }
         Bg(cmd.spawn().unwrap())
     }
@@ -4364,9 +4471,10 @@ mod cli {
                     let env = Env::new();
                     let beta = linked_elsewhere(&env);
                     let shown = env.tty(&format!(
-                        "{PLAIN} cd '{}' && {SESSION_VAR}=sess-b \"$CLERK\" acquire shared \
-                         --for 1m < /dev/null",
-                        beta.display()
+                        "{PLAIN} cd '{}' && {SESSION_VAR}=sess-b {CLAUDE_PID}={} \"$CLERK\" \
+                         acquire shared --for 1m < /dev/null",
+                        beta.display(),
+                        std::process::id()
                     ));
                     assert!(
                         shown.contains(

@@ -211,6 +211,17 @@ pub enum HolderRef {
     },
 }
 
+/// The Claude Code process hosting an agent session, identified by pid and
+/// start time (field 22 of `/proc/<pid>/stat`) so a reused pid is never
+/// mistaken for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Host {
+    /// Process id (`CLAUDE_PID`).
+    pub pid: u32,
+    /// Process start time.
+    pub start_time: u64,
+}
+
 /// Who is calling the API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Caller {

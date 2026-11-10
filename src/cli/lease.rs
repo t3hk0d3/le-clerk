@@ -158,6 +158,7 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
         CallerKind::Detached
     };
     let caller = ctx.caller(kind)?;
+    caller::require_host(&caller)?;
     interruptible_needs_session(&args.lease, &caller)?;
     let body = request_args(
         &target,
@@ -243,6 +244,7 @@ async fn detach_from_process(
 pub async fn attach(ctx: &Ctx, lease: String) -> anyhow::Result<()> {
     let client = ctx.client().await?;
     let caller = lease_caller(ctx, &client, &lease).await?;
+    caller::require_host(&caller)?;
     let view = client
         .call("get_lease", &caller, json!({ "lease_id": lease }))
         .await?;
@@ -336,6 +338,7 @@ pub async fn extend(ctx: &Ctx, args: ExtendArgs) -> anyhow::Result<()> {
 pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
     let target = target_arg(&args.target)?;
     let caller = ctx.caller(CallerKind::Run)?;
+    caller::require_host(&caller)?;
     interruptible_needs_session(&args.lease, &caller)?;
     let purpose = purpose_of(&args.command);
     let body = request_args(&target, &args.lease, purpose, &caller);
