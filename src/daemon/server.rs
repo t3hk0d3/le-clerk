@@ -1,6 +1,7 @@
 //! The JSON RPC surface over HTTP (axum), served on any listener.
 //!
-//! - `GET /v1/version` → `{"version": "<semver>", "pid": <daemon pid>}`
+//! - `GET /v1/version` → `{"version": "<semver>", "protocol": <n>, "pid":
+//!   <daemon pid>}` (see [`crate::PROTOCOL`])
 //! - `POST /v1/rpc/{method}` with `{"caller": Caller, "args": {...}}` →
 //!   `200 {"result": ...}` or an error status with
 //!   `{"error": {"code": "...", "message": "..."}}`. The hook methods
@@ -50,6 +51,9 @@ pub struct ServerInfo {
     /// The version the server reports (the crate version, unless a test
     /// overrides it).
     pub version: String,
+    /// The protocol the server reports ([`crate::PROTOCOL`], unless a test
+    /// overrides it; `None` leaves it out, as daemons before protocols).
+    pub protocol: Option<u32>,
     /// The serving process.
     pub pid: u32,
 }
@@ -60,6 +64,7 @@ impl ServerInfo {
     pub fn current() -> Self {
         Self {
             version: crate::VERSION.to_owned(),
+            protocol: Some(crate::PROTOCOL),
             pid: std::process::id(),
         }
     }
@@ -72,7 +77,10 @@ pub fn router(engine: EngineHandle) -> Router {
 
 /// The router for `engine`, reporting `info` on `/v1/version`.
 pub fn router_with(engine: EngineHandle, info: &ServerInfo) -> Router {
-    let version = json!({ "version": info.version, "pid": info.pid });
+    let mut version = json!({ "version": info.version, "pid": info.pid });
+    if let Some(protocol) = info.protocol {
+        version["protocol"] = json!(protocol);
+    }
     Router::new()
         .route(
             "/v1/version",

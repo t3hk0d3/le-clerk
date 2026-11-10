@@ -1172,14 +1172,15 @@ mod server {
         use super::*;
 
         #[tokio::test]
-        async fn returns_the_crate_version() {
+        async fn returns_the_crate_version_and_protocol() {
             let (h, _clock) = spawn();
             let req = Request::get("/v1/version").body(Body::empty()).unwrap();
             let (status, body) = send(&h, req).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(
                 body,
-                json!({"version": leclerk::VERSION, "pid": std::process::id()})
+                json!({"version": leclerk::VERSION, "protocol": leclerk::PROTOCOL,
+                       "pid": std::process::id()})
             );
         }
     }

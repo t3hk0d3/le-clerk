@@ -515,6 +515,63 @@ mod daemon {
             }
         }
 
+        mod on_a_daemon_of_the_same_version_without_a_protocol {
+            use super::*;
+
+            /// A daemon of this version that reports no protocol, as a
+            /// daemon built before protocols existed.
+            async fn old_daemon(h: &Harness) -> DaemonError {
+                let launcher = h.launcher_with(&[("CLERK_TEST_DAEMON_PROTOCOL", "none")]);
+                Client::ensure_running_with(&h.paths, &launcher)
+                    .await
+                    .err()
+                    .unwrap()
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn returns_protocol_mismatch() {
+                let h = Harness::new();
+                let err = old_daemon(&h).await;
+                assert_eq!(
+                    err,
+                    DaemonError::ProtocolMismatch {
+                        client: leclerk::PROTOCOL,
+                        daemon: None
+                    }
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_message_says_to_run_clerk_daemon_restart() {
+                let h = Harness::new();
+                let err = old_daemon(&h).await;
+                assert!(err.to_string().contains("clerk daemon restart"), "{err}");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn connect_reports_it_too() {
+                let h = Harness::new();
+                old_daemon(&h).await;
+                let err = Client::connect(&h.paths).await.err().unwrap();
+                assert!(
+                    matches!(err, DaemonError::ProtocolMismatch { .. }),
+                    "{err:?}"
+                );
+            }
+        }
+
+        mod on_the_current_daemon {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn version_reports_protocol_3() {
+                let h = Harness::new();
+                let client = h.start().await;
+                assert_eq!(client.daemon().protocol, Some(3));
+                assert_eq!(leclerk::PROTOCOL, 3);
+            }
+        }
+
         mod on_version_mismatch {
             use super::*;
 
@@ -545,6 +602,7 @@ mod daemon {
                     }
                     other @ (DaemonError::Unavailable
                     | DaemonError::Unresponsive { .. }
+                    | DaemonError::ProtocolMismatch { .. }
                     | DaemonError::SocketPathTooLong(_)) => {
                         panic!("expected a version mismatch, got {other:?}")
                     }

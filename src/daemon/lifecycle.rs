@@ -34,6 +34,10 @@ use crate::store::{Store, StoreError};
 /// Test hook: when set, the daemon reports this version instead of its own
 /// (to exercise the client's version check).
 pub const VERSION_OVERRIDE_ENV: &str = "CLERK_TEST_DAEMON_VERSION";
+/// Test hook: when set, the daemon reports this protocol instead of its
+/// own; `none` leaves the protocol out (to play a daemon built before
+/// protocols).
+pub const PROTOCOL_OVERRIDE_ENV: &str = "CLERK_TEST_DAEMON_PROTOCOL";
 
 /// How long in-flight requests may take, against the live engine, once the
 /// daemon stops accepting connections.
@@ -93,6 +97,11 @@ pub fn run(paths: &Paths, config: Config) -> Result<(), RunError> {
     init_logging(&paths.log)?;
     let info = ServerInfo {
         version: std::env::var(VERSION_OVERRIDE_ENV).unwrap_or_else(|_| crate::VERSION.into()),
+        protocol: match std::env::var(PROTOCOL_OVERRIDE_ENV) {
+            Ok(v) if v == "none" => None,
+            Ok(v) => Some(v.parse().unwrap_or(crate::PROTOCOL)),
+            Err(_) => Some(crate::PROTOCOL),
+        },
         pid: std::process::id(),
     };
     tracing::info!(pid = info.pid, version = %info.version, "daemon starting");

@@ -15,7 +15,12 @@
 //!   process lives and is reopened after a daemon restart. Relaying starts
 //!   once it is open (or after [`LIVE_FIRST_WAIT`]), so nothing is leased
 //!   before the session counts as alive.
-//! - The daemon is started when needed, as every clerk command does.
+//! - The daemon is started when needed, as every clerk command does. Every
+//!   message is relayed only to a daemon of this version and protocol: a
+//!   daemon of another (an older build still running) gets nothing, each
+//!   request is answered with a JSON-RPC error saying to run `clerk daemon
+//!   restart`, and no liveness stream is opened to it until it is
+//!   replaced.
 //! - stdin EOF ends the process (exit 0), closing the stream, once the
 //!   answers in flight are written (for at most [`EOF_DRAIN`]).
 //! - stdout carries MCP JSON-RPC only; logs go to stderr.
@@ -32,7 +37,7 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use leclerk::client::Client;
+use leclerk::client::{Client, DaemonError, DaemonInfo};
 use leclerk::config::Paths;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -173,11 +178,12 @@ impl Relay {
         }));
     }
 
-    /// A connection to the daemon; started when none answers.
+    /// A connection to a daemon of this version and protocol; started
+    /// when none answers.
+    ///
+    /// # Errors
+    /// [`DaemonError`] (a mismatch among them) when no such daemon answers.
     async fn connect(&self) -> anyhow::Result<UnixStream> {
-        if let Ok(stream) = UnixStream::connect(&self.paths.socket).await {
-            return Ok(stream);
-        }
         Client::ensure_running(&self.paths).await?;
         UnixStream::connect(&self.paths.socket)
             .await
@@ -243,11 +249,29 @@ async fn write_stdout(mut lines: mpsc::UnboundedReceiver<String>) {
 }
 
 /// Keep a liveness stream open, reopening it whenever it ends; `up` fires
-/// at the first one.
+/// at the first one, or when the daemon turns out to be of another version
+/// or protocol (requests are then answered with errors at once). Such a
+/// daemon gets no liveness stream: it is only checked again, every
+/// [`LIVE_BACKOFF_MAX`], until another daemon answers.
 async fn liveness(relay: Arc<Relay>, up: oneshot::Sender<()>) {
     let mut up = Some(up);
     let mut backoff = LIVE_BACKOFF_MIN;
+    let mut refused: Option<DaemonInfo> = None;
     loop {
+        if let Ok(daemon) = Client::probe(&relay.paths).await
+            && let Err(e) = daemon.check()
+        {
+            if refused.as_ref() != Some(&daemon) {
+                tracing::warn!(error = %e, "not opening a liveness stream to this daemon");
+                refused = Some(daemon);
+            }
+            if let Some(up) = up.take() {
+                let _ = up.send(());
+            }
+            tokio::time::sleep(LIVE_BACKOFF_MAX).await;
+            continue;
+        }
+        refused = None;
         match open_live(&relay).await {
             Ok(mut body) => {
                 if let Some(up) = up.take() {
@@ -310,11 +334,14 @@ async fn forward(relay: Arc<Relay>, line: String) {
         Err(e) => {
             tracing::warn!(error = %e, "relaying a message failed");
             if let Some(id) = &request_id {
-                relay.emit_error(
-                    id,
-                    INTERNAL_ERROR,
-                    &format!("the clerk daemon could not be reached: {e:#}"),
-                );
+                let message = match e.downcast_ref::<DaemonError>() {
+                    Some(
+                        mismatch @ (DaemonError::VersionMismatch { .. }
+                        | DaemonError::ProtocolMismatch { .. }),
+                    ) => mismatch.to_string(),
+                    _ => format!("the clerk daemon could not be reached: {e:#}"),
+                };
+                relay.emit_error(id, INTERNAL_ERROR, &message);
             }
         }
     }

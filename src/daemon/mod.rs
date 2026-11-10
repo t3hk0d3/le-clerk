@@ -4,4 +4,4 @@
 pub mod lifecycle;
 pub mod server;
 
-pub use lifecycle::{RunError, VERSION_OVERRIDE_ENV, run};
+pub use lifecycle::{PROTOCOL_OVERRIDE_ENV, RunError, VERSION_OVERRIDE_ENV, run};

@@ -67,6 +67,19 @@ pub enum DaemonError {
         /// The running daemon's version.
         daemon: String,
     },
+    /// The daemon runs this version but speaks another protocol, or none
+    /// (a daemon built before protocols).
+    #[error(
+        "the clerk daemon speaks protocol {} but this clerk speaks {client}; run `clerk daemon \
+         restart` to switch",
+        protocol_text(*.daemon)
+    )]
+    ProtocolMismatch {
+        /// This client's protocol.
+        client: u32,
+        /// The running daemon's protocol, when it reports one.
+        daemon: Option<u32>,
+    },
     /// The socket path is too long to bind or connect to.
     #[error(transparent)]
     SocketPathTooLong(#[from] SocketPathTooLong),
@@ -83,6 +96,10 @@ pub enum DaemonError {
     },
 }
 
+fn protocol_text(protocol: Option<u32>) -> String {
+    protocol.map_or_else(|| "none (an older build)".to_owned(), |p| p.to_string())
+}
+
 fn pid_text(pid: Option<u32>) -> String {
     pid.map_or_else(|| "pid unknown".to_owned(), |p| format!("pid {p}"))
 }
@@ -91,7 +108,9 @@ impl ErrorCode for DaemonError {
     fn code(&self) -> &'static str {
         match self {
             DaemonError::Unavailable => "daemon_unavailable",
-            DaemonError::VersionMismatch { .. } => "version_mismatch",
+            DaemonError::VersionMismatch { .. } | DaemonError::ProtocolMismatch { .. } => {
+                "version_mismatch"
+            }
             DaemonError::Unresponsive { .. } => "daemon_unresponsive",
             DaemonError::SocketPathTooLong(_) => "socket_path_too_long",
         }
@@ -134,8 +153,34 @@ impl ApiError {
 pub struct DaemonInfo {
     /// The daemon's version.
     pub version: String,
+    /// The daemon's protocol; absent from daemons built before protocols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
     /// The daemon's process id.
     pub pid: u32,
+}
+
+impl DaemonInfo {
+    /// Whether this client can talk to the daemon: same version, same
+    /// protocol.
+    ///
+    /// # Errors
+    /// [`DaemonError::VersionMismatch`] or [`DaemonError::ProtocolMismatch`].
+    pub fn check(&self) -> Result<(), DaemonError> {
+        if self.version != crate::VERSION {
+            return Err(DaemonError::VersionMismatch {
+                client: crate::VERSION.to_owned(),
+                daemon: self.version.clone(),
+            });
+        }
+        if self.protocol != Some(crate::PROTOCOL) {
+            return Err(DaemonError::ProtocolMismatch {
+                client: crate::PROTOCOL,
+                daemon: self.protocol,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Environment variables that locate clerk's files.
@@ -257,7 +302,8 @@ impl Client {
     ///
     /// # Errors
     /// As [`Client::probe`]; [`DaemonError::VersionMismatch`] when the
-    /// daemon is another version.
+    /// daemon is another version, [`DaemonError::ProtocolMismatch`] when it
+    /// speaks another protocol (or none).
     pub async fn connect(paths: &Paths) -> Result<Self, DaemonError> {
         Self::connect_within(paths, PROBE_TIMEOUT).await
     }
@@ -269,12 +315,7 @@ impl Client {
     /// As [`Client::connect`].
     pub async fn connect_within(paths: &Paths, limit: Duration) -> Result<Self, DaemonError> {
         let daemon = Self::probe_within(paths, limit).await?;
-        if daemon.version != crate::VERSION {
-            return Err(DaemonError::VersionMismatch {
-                client: crate::VERSION.to_owned(),
-                daemon: daemon.version,
-            });
-        }
+        daemon.check()?;
         Ok(Self {
             socket: paths.socket.clone(),
             daemon,

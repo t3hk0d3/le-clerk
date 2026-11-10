@@ -227,6 +227,21 @@ struct Fake {
     seen: Arc<Mutex<Seen>>,
     /// Liveness streams open now.
     open: Arc<AtomicUsize>,
+    /// What `GET /v1/version` answers.
+    version: Arc<Mutex<Value>>,
+    /// `GET /v1/version` requests so far.
+    probes: Arc<AtomicUsize>,
+}
+
+/// `/v1/version` of a daemon of this build.
+fn current_version() -> Value {
+    json!({"version": leclerk::VERSION, "protocol": leclerk::PROTOCOL, "pid": 1})
+}
+
+/// `/v1/version` of a daemon built before protocols: same version, no
+/// protocol (and, really, no `/mcp`).
+fn old_version() -> Value {
+    json!({"version": leclerk::VERSION, "pid": 1})
 }
 
 /// Counts an open liveness stream while alive.
@@ -241,6 +256,11 @@ impl Drop for OpenStream {
 impl Fake {
     /// Start serving on the current tokio runtime.
     fn start() -> Self {
+        Self::start_as(current_version())
+    }
+
+    /// Start serving, answering `/v1/version` with `version`.
+    fn start_as(version: Value) -> Self {
         let home = TempDir::new().unwrap();
         let run = home.path().join("run");
         fs::create_dir_all(&run).unwrap();
@@ -248,10 +268,17 @@ impl Fake {
         let seen = Arc::new(Mutex::new(Seen::default()));
         let open = Arc::new(AtomicUsize::new(0));
         let (live_seen, mcp_seen, live_open) = (seen.clone(), seen.clone(), open.clone());
+        let version = Arc::new(Mutex::new(version));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (answer, counted) = (version.clone(), probes.clone());
         let app = Router::new()
             .route(
                 "/v1/version",
-                get(|| async { axum::Json(json!({"version": leclerk::VERSION, "pid": 1})) }),
+                get(move || {
+                    let body = answer.lock().unwrap().clone();
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    async move { axum::Json(body) }
+                }),
             )
             .route(
                 "/v1/session/live",
@@ -285,7 +312,27 @@ impl Fake {
                 }),
             );
         tokio::spawn(async move { axum::serve(listener, app).await });
-        Self { home, seen, open }
+        Self {
+            home,
+            seen,
+            open,
+            version,
+            probes,
+        }
+    }
+
+    /// Answer `/v1/version` with `version` from now on.
+    fn report(&self, version: Value) {
+        *self.version.lock().unwrap() = version;
+    }
+
+    fn probes(&self) -> usize {
+        self.probes.load(Ordering::SeqCst)
+    }
+
+    /// `POST /mcp` requests so far.
+    fn relayed(&self) -> usize {
+        self.seen.lock().unwrap().mcp.len()
     }
 
     fn home(&self) -> &Path {
@@ -625,6 +672,55 @@ mod proxy {
             assert_eq!(lease_states(&env, &agent("s1")), vec!["held"]);
             let status = p.tool("lease_status", &json!({}));
             assert!(status.is_object(), "{status}");
+        }
+    }
+
+    mod on_a_daemon_of_another_protocol {
+        use super::*;
+
+        /// A proxy against a daemon built before protocols.
+        fn against_old() -> (Fake, Proxy) {
+            let fake = Fake::start_as(old_version());
+            let proxy = fake.proxy(Some("s1"));
+            (fake, proxy)
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn answers_each_request_with_an_error_naming_clerk_daemon_restart() {
+            let (_fake, mut p) = against_old();
+            for _ in 0..2 {
+                let reply = p.request("json/echo", json!({}));
+                let message = reply["error"]["message"].as_str().unwrap_or_default();
+                assert!(message.contains("clerk daemon restart"), "{reply}");
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn relays_nothing_to_it() {
+            let (fake, mut p) = against_old();
+            p.request("json/echo", json!({}));
+            p.request("json/echo", json!({}));
+            assert_eq!(fake.relayed(), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn opens_no_liveness_stream_while_it_stays() {
+            let (fake, mut p) = against_old();
+            p.request("json/echo", json!({}));
+            // Its liveness loop has checked the daemon more than once by now.
+            let at = fake.probes();
+            eventually(|| fake.probes() >= at + 2, "the daemon is checked again").await;
+            assert_eq!(fake.live().len(), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn opens_the_liveness_stream_and_relays_once_it_changes() {
+            let (fake, mut p) = against_old();
+            p.request("json/echo", json!({}));
+            fake.report(current_version());
+            eventually(|| fake.open_streams() == 1, "the liveness stream opens").await;
+            let reply = p.request("json/echo", json!({}));
+            assert_eq!(reply["result"]["method"], json!("json/echo"), "{reply}");
         }
     }
 
