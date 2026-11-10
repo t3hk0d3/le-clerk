@@ -100,9 +100,11 @@ fn note(command: &str, v: &Value) -> (Vec<String>, String) {
         ),
         "release" | "confirm" if v["state"] == "ended" => (
             vec![format!(
-                "Lease {lease} has ended; the unit is free for others."
+                "Lease {lease} has ended with its cleanup confirmed; the unit is free for others."
             )],
-            "Nothing more for this lease.".to_owned(),
+            "Nothing more for this lease (no `clerk confirm` needed). If you hold or wait for \
+             nothing else, you may stop your clerk wait."
+                .to_owned(),
         ),
         "confirm" => (
             vec![format!("Lease {lease} is {}.", s(v, "state"))],
@@ -169,6 +171,23 @@ mod tests {
         let m = error_message("not_found", "no such lease");
         assert!(m.ends_with("to see where you stand."), "{m}");
         assert_eq!(error_message("not_found", &m), m);
+    }
+
+    #[test]
+    fn an_ended_release_says_cleanup_is_confirmed_and_nothing_is_left_to_do() {
+        let mut v = json!({"lease_id": "L1", "state": "ended", "cleanup_deadline": 5});
+        annotate("release", &mut v);
+        assert!(
+            v["summary"][0]
+                .as_str()
+                .unwrap()
+                .contains("cleanup confirmed"),
+            "{v}"
+        );
+        assert!(
+            v["next"].as_str().unwrap().contains("no `clerk confirm`"),
+            "{v}"
+        );
     }
 
     #[test]

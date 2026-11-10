@@ -1,0 +1,24 @@
+                                                                                
+
+● Stop Task                                                                     
+  ⎿  clerk wait --follow · stopped
+
+● I released the board (c6-boards/c6-a, lease lse_01M72JJF9AXV468N20BDJ8V710),
+  and the clerk now shows you holding nothing.
+                                                                           
+  The clerk also opened a cleanup window that wanted a "clean" confirmation    
+  before its deadline, or the board would be marked dirty. I tried to send that
+  confirmation, and the clerk refused it because the lease had already ended. 
+  The window's deadline was 1794309398679 (ms since epoch), and the clerk gave  
+  no further instruction for ended leases. I can't confirm cleanup from here. If
+  the board ends up marked dirty, whoever leases it next will check it first.
+  If that matters, ask the clerk's admin to confirm it.                       
+                                                                                
+  I stopped the clerk wait I had armed, since nothing is held now.            
+
+✻ Churned for 16s · done 12:14                                                  
+
+────────────────────────────────────────────────────────────────────────────────
+❯                               
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                        

@@ -1397,3 +1397,21 @@ private tmux server, model haiku). Scripts and screens:
     (`evidence/g-monitor-expiry.txt`). The same in `claude -p`
     (`evidence/h-p-monitor.jsonl`; Monitor is a deferred tool there, loaded
     with ToolSearch). Hence §6 layer 1: Monitor on `clerk wait --follow`.
+13. **End-to-end with clerk 0.4.0 (plan Task 13), isolated** (private
+    `CLERK_HOME`, plugin by `--plugin-dir`, no user settings, haiku):
+    - two sessions, one board: A leased and armed Monitor on
+      `clerk wait --follow`; B queued and armed it; A released; B woke
+      unprompted with the offer already claimed (`evidence/e1-*.txt`);
+    - `/clear` in B released its lease at once (`session_ended`, reason
+      `clear`), and the new conversation knew from the brief
+      (`evidence/e3-B.txt`);
+    - `kill -9` then `claude --continue` within the 20 s grace kept the lease;
+      the Stop hook prompted the agent to re-arm its wait
+      (`evidence/e4-A.txt`);
+    - `kill -9` alone: the orphaned `clerk wait --follow` exited within 8 s,
+      and the board was free and dirty (`holder_gone`) after the grace.
+    - Found and fixed: after a plain `clerk release` the agent misread the
+      ended lease's `cleanup_deadline` and tried `clerk confirm`; the release
+      summary now says the cleanup is confirmed.
+    - Not run: registration by the skill (checklist item 6), the desktop app
+      and VS Code.

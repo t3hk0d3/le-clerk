@@ -1,0 +1,24 @@
+  ⎿  Monitor started · task b7ytv3sb2 · timeout 1800s
+  ⎿  Allowed by auto mode
+
+● I'm queued for an ESP32-C6 board and have not flashed anything.
+
+  - Resource: c6-boards, the only unit c6-a. Its usage note says to flash with
+    idf.py -p {unit.path} flash and that "clean" means erasing flash.
+  - Status: Queued at position 1 (request req_01M72JKV2AWXAE7M7KTKSEEWPV). The
+    current holder's lease ends at about 1794310376618 (ms epoch), and the clerk
+    estimates roughly 19 minutes until my turn.                               
+  - Wait: A clerk wait --follow Monitor is armed (task b7ytv3sb2, 30-minute   
+    timeout). It will claim the board for me when my turn comes.                
+                                                                                
+  I'll act on clerk notices as they arrive. When the board is granted, I'll read
+  its usage and grant details before using it. If the monitor expires while I'm 
+  still queued, I'll re-arm it. If you no longer need the board, I can cancel 
+  the request with clerk cancel req_01M72JKV2AWXAE7M7KTKSEEWPV.                 
+                                                                                
+✻ Worked for 12s · done 12:13 · 1 monitor still running                         
+                                                                              
+────────────────────────────────────────────────────────────────────────────────
+❯                              
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 monitor · ← 1 agent · ↓ to manage                   
