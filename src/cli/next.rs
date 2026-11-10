@@ -92,6 +92,38 @@ pub fn error_message(code: &str, message: &str) -> String {
     format!("{message}{sep}{next}")
 }
 
+/// The summary and next step of a queued request.
+fn queued(v: &Value) -> (Vec<String>, String) {
+    (
+        vec![format!(
+            "Queued for {} at position {} (request {}).",
+            v["unit"]
+                .as_str()
+                .map_or_else(|| s(v, "resource"), |u| format!("{}/{u}", s(v, "resource"))),
+            v["position"],
+            s(v, "request_id")
+        )],
+        format!(
+            "The unit is not yours yet: arm a wait to be told when it is. {ARM_AGAIN} \
+         `clerk cancel {}` drops the request.{}",
+            s(v, "request_id"),
+            unhealthy_hint(v)
+        ),
+    )
+}
+
+/// For a request a failed health check blocks: how to get past it when the
+/// caller's own job is what the check sees (`--override` does not).
+fn unhealthy_hint(v: &Value) -> &'static str {
+    if v["blocked_by"]["kind"] == "unhealthy" {
+        " The unit fails its health check (see blocked_by), which --override does not get \
+         past: if it is your own running job that holds it, cancel and `clerk acquire \
+         <resource>/<unit> --skip-checks`; otherwise wait, it is re-checked."
+    } else {
+        ""
+    }
+}
+
 /// A unix-ms time as local date and time plus how far away.
 fn time(v: &Value) -> String {
     v.as_i64().map_or_else(
@@ -115,21 +147,7 @@ fn s(v: &Value, key: &str) -> String {
 pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
     let lease = s(v, "lease_id");
     match command {
-        "acquire" | "claim" | "attach" if v["outcome"] == "queued" => (
-            vec![format!(
-                "Queued for {} at position {} (request {}).",
-                v["unit"]
-                    .as_str()
-                    .map_or_else(|| s(v, "resource"), |u| format!("{}/{u}", s(v, "resource"))),
-                v["position"],
-                s(v, "request_id")
-            )],
-            format!(
-                "The unit is not yours yet: arm a wait to be told when it is. {ARM_AGAIN} \
-                 `clerk cancel {}` drops the request.",
-                s(v, "request_id")
-            ),
-        ),
+        "acquire" | "claim" | "attach" if v["outcome"] == "queued" => queued(v),
         "acquire" | "claim" | "attach" | "reclaim" => (
             vec![format!(
                 "You hold lease {lease} ({}/{}); read its description and usage before using it.",

@@ -3580,6 +3580,37 @@ mod cli {
                     );
                 }
 
+                /// Peer report 3: a wait killed outright (no chance to
+                /// disarm) holds the arm a few seconds; the next wait waits
+                /// that out instead of exiting "already armed".
+                #[test]
+                fn a_wait_started_right_after_a_killed_one_arms() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let mut child = spawn(&env, &["wait"], Some("sess-1"));
+                    std::thread::sleep(Duration::from_millis(800));
+                    let pid = i32::try_from(child.0.id()).unwrap();
+                    // SAFETY: plain kill(2) on our own child.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    let _ = child.0.wait();
+                    let body = json_of(env.agent("sess-1", &dir).args(["wait", "--timeout", "8s"]));
+                    assert_ne!(body["armed"], true, "{body}");
+                }
+
+                /// Peer report 2: a `--follow` wait that ends says why.
+                #[test]
+                fn a_follow_wait_that_ends_says_why() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let out = env
+                        .agent_md("sess-1", &dir)
+                        .args(["wait", "--follow", "--timeout", "1s"])
+                        .output()
+                        .unwrap();
+                    let text = String::from_utf8(out.stdout).unwrap();
+                    assert!(text.contains("Next: "), "{text:?}");
+                }
+
                 /// Research finding 1: re-arming right after a Monitor
                 /// expiry (SIGTERM) arms, instead of "already armed".
                 #[test]
@@ -3610,7 +3641,8 @@ mod cli {
                     std::thread::sleep(Duration::from_millis(800));
                     let started = Instant::now();
                     let body = json_of(env.agent("sess-1", &dir).args(["wait"]));
-                    assert!(started.elapsed() < Duration::from_secs(5));
+                    // It waits out the other's arm (ARM_GRACE, 6 s) before giving way.
+                    assert!(started.elapsed() < Duration::from_secs(12));
                     assert_eq!(body["armed"], true, "{body}");
                     assert!(
                         body["summary"][0]
@@ -4488,6 +4520,26 @@ mod cli {
             env.ok(&["acquire", "dev/u1", "--for", "10m", "--skip-checks"]);
             let log = env.ok(&["log", "--action", "granted", "--limit", "1"]);
             assert_eq!(log[0]["detail"]["skip_checks"], true, "{log}");
+        }
+
+        /// Peer report 4: a queued answer blocked by a health check points
+        /// to --skip-checks (--override does not get past a health check).
+        #[test]
+        fn a_queued_agent_blocked_by_a_health_check_is_told_about_skip_checks() {
+            let env = Env::new();
+            let _busy = Kill(busy_device(&env));
+            let dir = env.dir("alpha");
+            let out = env
+                .agent("sess-1", &dir)
+                .args(["acquire", "dev/u1", "--for", "10m"])
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(6), "{out:?}");
+            let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert!(
+                body["next"].as_str().unwrap().contains("--skip-checks"),
+                "{body}"
+            );
         }
 
         #[test]

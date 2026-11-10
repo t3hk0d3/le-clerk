@@ -27,6 +27,10 @@ use super::Ctx;
 use super::caller;
 use super::lease::WaitArgs;
 
+/// How long a new wait waits out another wait's arm before giving way:
+/// longer than a killed wait's hold (its last step plus the daemon's hold).
+const ARM_GRACE: Duration = Duration::from_secs(6);
+
 /// One long-poll step; also how soon a dead host is noticed.
 const STEP: Duration = Duration::from_secs(2);
 
@@ -69,6 +73,7 @@ async fn steps(
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let deadline = args.timeout.map(|t| Instant::now() + t);
+    let started = Instant::now();
     let mut first = true;
     loop {
         if !process_alive(host.pid, host.start_time) {
@@ -92,9 +97,17 @@ async fn steps(
             _ = term.recv() => return finish(md, args, &stopped()),
             _ = int.recv() => return finish(md, args, &stopped()),
         };
+        let was_first = first;
         first = false;
         match step["status"].as_str() {
             Some("timeout") => {}
+            // Another wait holds the arm. It may be a wait that was killed
+            // outright and could not give it up: wait that hold out once
+            // before giving way.
+            Some("armed") if was_first && started.elapsed() < ARM_GRACE => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                first = true;
+            }
             Some("armed") => {
                 return print(
                     md,
@@ -288,10 +301,9 @@ fn stopped() -> Value {
 
 /// End the wait with `value`: printed for a one-batch wait; a `--follow`
 /// wait just ends (Monitor reports the end itself).
-fn finish(md: Format, args: &WaitArgs, value: &Value) -> anyhow::Result<()> {
-    if args.follow {
-        return Ok(());
-    }
+fn finish(md: Format, _args: &WaitArgs, value: &Value) -> anyhow::Result<()> {
+    // A `--follow` wait says why it ended too: Monitor shows the line, and
+    // the agent knows to arm again (or not).
     print(md, value)
 }
 
