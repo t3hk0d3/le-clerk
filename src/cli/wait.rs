@@ -45,13 +45,31 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
         anyhow::bail!("not an agent session");
     };
     let client = ctx.client().await?;
+    // This wait's arm token: its steps hold the session's one armed wait.
+    let arm = ulid::Ulid::new().to_string();
+    let result = steps(ctx, caller, args, &client, host, session_id, &arm).await;
+    // However it ended (a batch, a signal, an error), the wait gives its arm
+    // up at once, so a wait started right after arms (a Monitor re-armed on
+    // expiry). Best effort: the hold lapses by itself anyway.
+    let _ = client.agent_disarm(session_id, &arm).await;
+    result
+}
+
+/// The steps of an agent's wait, until it has something to print or ends.
+async fn steps(
+    ctx: &Ctx,
+    caller: &Caller,
+    args: &WaitArgs,
+    client: &Client,
+    host: leclerk::model::Host,
+    session_id: &str,
+    arm: &str,
+) -> anyhow::Result<()> {
     let md = Format::of(ctx.out);
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let deadline = args.timeout.map(|t| Instant::now() + t);
     let mut first = true;
-    // This wait's arm token: its steps hold the session's one armed wait.
-    let arm = ulid::Ulid::new().to_string();
     loop {
         if !process_alive(host.pid, host.start_time) {
             return finish(
@@ -64,7 +82,7 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
             return finish(md, args, &empty(&["No notices arrived before --timeout."]));
         }
         let step = tokio::select! {
-            got = client.agent_wait(session_id, host, STEP.as_secs(), first, &arm) => got?,
+            got = client.agent_wait(session_id, host, STEP.as_secs(), first, arm) => got?,
             _ = term.recv() => return finish(md, args, &stopped()),
             _ = int.recv() => return finish(md, args, &stopped()),
         };
@@ -95,16 +113,16 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
                 let notices = step["notices"].as_array().cloned().unwrap_or_default();
                 if args.follow {
                     for notice in notices {
-                        let claimed = claim_if_offered(&client, caller, &notice).await;
+                        let claimed = claim_if_offered(client, caller, &notice).await;
                         let line = follow_line(&notice, claimed);
                         print(md, &line)?;
-                        ack(&client, session_id, &[&notice]).await?;
+                        ack(client, session_id, &[&notice]).await?;
                     }
                 } else {
                     let mut claimed = Vec::new();
                     let mut summary = Vec::new();
                     for notice in &notices {
-                        match claim_if_offered(&client, caller, notice).await {
+                        match claim_if_offered(client, caller, notice).await {
                             Some(Ok(lease)) => claimed.push(lease),
                             Some(Err(e)) => summary.push(format!(
                                 "Could not claim lease {}: {e}.",
@@ -124,7 +142,7 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
                         }),
                     )?;
                     let all: Vec<&Value> = notices.iter().collect();
-                    ack(&client, session_id, &all).await?;
+                    ack(client, session_id, &all).await?;
                     return Ok(());
                 }
             }

@@ -435,6 +435,14 @@ impl OpenWaits {
         self.arms().insert(key.to_owned(), (arm.to_owned(), until));
     }
 
+    /// `arm` gives `key`'s wait up (another token's arm stays).
+    fn disarm(&self, key: &str, arm: &str) {
+        let mut arms = self.arms();
+        if arms.get(key).is_some_and(|(owner, _)| owner == arm) {
+            arms.remove(key);
+        }
+    }
+
     /// Whether `key` has a wait armed now (by any token).
     fn armed(&self, key: &str) -> bool {
         let now = tokio::time::Instant::now();
@@ -674,6 +682,13 @@ impl EngineHandle {
         self.open_waits
             .hold(&key, &arm, tokio::time::Instant::now() + ARM_HOLD);
         Ok(got?.map_or(AgentWait::Timeout, AgentWait::Notices))
+    }
+
+    /// The wait with token `arm` of agent session `session_id` ended: it
+    /// gives its arm up, so another wait may arm at once.
+    pub fn disarm(&self, session_id: String, arm: &str) {
+        let key = holder_key(&HolderRef::AgentSession { session_id });
+        self.open_waits.disarm(&key, arm);
     }
 
     /// Agent session `session_id` is run by `host` (an agent call or hook

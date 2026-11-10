@@ -770,6 +770,44 @@ mod engine {
                 .unwrap();
             assert_eq!(again, AgentWait::Timeout);
         }
+
+        /// Research finding 1: a wait that is stopped (Monitor expiry)
+        /// gives its arm up, so the next wait arms at once.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_disarmed_wait_lets_the_next_one_arm_at_once() {
+            let (store, clock) = seeded();
+            let engine = engine_on(store, clock);
+            let p = Proc::spawn();
+            let step = Duration::from_millis(100);
+            engine
+                .agent_wait("s1".into(), p.host, step, true, "arm-a".into())
+                .await
+                .unwrap();
+            engine.disarm("s1".into(), "arm-a");
+            let next = engine
+                .agent_wait("s1".into(), p.host, step, true, "arm-b".into())
+                .await
+                .unwrap();
+            assert_eq!(next, AgentWait::Timeout);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn disarming_with_another_token_changes_nothing() {
+            let (store, clock) = seeded();
+            let engine = engine_on(store, clock);
+            let p = Proc::spawn();
+            let step = Duration::from_millis(100);
+            engine
+                .agent_wait("s1".into(), p.host, step, true, "arm-a".into())
+                .await
+                .unwrap();
+            engine.disarm("s1".into(), "arm-x");
+            let next = engine
+                .agent_wait("s1".into(), p.host, step, true, "arm-b".into())
+                .await
+                .unwrap();
+            assert_eq!(next, AgentWait::Armed);
+        }
     }
 
     mod report_host {

@@ -3565,6 +3565,23 @@ mod cli {
                         "{body}"
                     );
                 }
+
+                /// Research finding 1: re-arming right after a Monitor
+                /// expiry (SIGTERM) arms, instead of "already armed".
+                #[test]
+                fn a_wait_started_right_after_arms() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let child = spawn(&env, &["wait"], Some("sess-1"));
+                    std::thread::sleep(Duration::from_millis(800));
+                    let pid = i32::try_from(child.0.id()).unwrap();
+                    // SAFETY: plain kill(2) on our own child.
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                    let mut child = child;
+                    assert!(child.0.wait().unwrap().success());
+                    let body = json_of(env.agent("sess-1", &dir).args(["wait", "--timeout", "1s"]));
+                    assert_ne!(body["armed"], true, "{body}");
+                }
             }
 
             mod on_another_wait_already_armed {

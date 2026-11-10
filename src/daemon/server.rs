@@ -19,6 +19,9 @@
 //! - `POST /v1/agent/ack` with `{"session": "<id>", "ids": [...]}` →
 //!   `200 {"result": <count marked delivered>}`.
 //!
+//! - `POST /v1/agent/disarm` with `{"session": "<id>", "arm": "<token>"}` →
+//!   `200 {"result": null}`: the wait with that token ended.
+//!
 //! Status mapping: 404 not found or unknown method, 409 conflict/refused,
 //! 422 invalid request or argument, 500 internal, 503 engine stopped.
 
@@ -86,6 +89,7 @@ pub fn router_with(engine: EngineHandle, info: &ServerInfo) -> Router {
         .route("/v1/notices", get(notices))
         .route("/v1/agent/wait", get(agent_wait))
         .route("/v1/agent/ack", post(agent_ack))
+        .route("/v1/agent/disarm", post(agent_disarm))
         .with_state(engine)
 }
 
@@ -316,4 +320,24 @@ async fn agent_ack(State(engine): State<EngineHandle>, body: Bytes) -> Response 
         Ok(n) => ok(n),
         Err(e) => e.into_response(),
     }
+}
+
+/// The body of `POST /v1/agent/disarm`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentDisarm {
+    session: String,
+    arm: String,
+}
+
+async fn agent_disarm(State(engine): State<EngineHandle>, body: Bytes) -> Response {
+    let d: AgentDisarm = match serde_json::from_slice(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return ApiError::invalid_request(format!("request body is not valid: {e}"))
+                .into_response();
+        }
+    };
+    engine.disarm(d.session, &d.arm);
+    ok(Value::Null)
 }

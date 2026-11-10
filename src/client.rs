@@ -644,6 +644,25 @@ impl Client {
         decode(status, &body)
     }
 
+    /// The wait with token `arm` of agent session `session` ended.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub async fn agent_disarm(&self, session: &str, arm: &str) -> Result<Value, ApiError> {
+        let body = serde_json::to_vec(&json!({ "session": session, "arm": arm }))
+            .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
+        let (status, body) = send(
+            &self.socket,
+            Method::POST,
+            "/v1/agent/disarm",
+            Some(body),
+            CALL_TIMEOUT,
+        )
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+        decode(status, &body)
+    }
+
     /// Mark agent session `session`'s notices `ids` delivered.
     ///
     /// # Errors
