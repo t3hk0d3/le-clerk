@@ -1,0 +1,8 @@
+1794289154379 holder_gone {"holder": {"kind": "agent_session", "session_id": "4f31dfcc-a0c2-45cb-a797-fab194098d40"}, "leases_ended": ["lse_01M71Z8GFFY266NBG5G8ZDJ64Z"], "requests_dropped": []}
+1794289154378 lease_ended {"cause": "holder_gone", "cleanup_confirmed": false, "dirty": {"at": 1794289154378, "previous_holder": {"kind": "agent_session", "session_id": "4f31dfcc-a0c2-45cb-a797-fab194098d40"}, "reason": "holder_gone"}, "holder": 
+1794288927215 granted {"dirty": {"at": 1794288856388, "previous_holder": {"kind": "agent_session", "session_id": "2a4bcb89-406d-4621-9748-8d6a62bba927"}, "reason": "admin_forced"}, "lease": "lse_01M71Z8GFFY266NBG5G8ZDJ64Z", "override_reason":
+1794288856388 admin_release {"lease": "lse_01M71Z6B99P7QKN42YZ99QWZVC"}
+1794288856388 lease_ended {"cause": "admin_forced", "cleanup_confirmed": false, "dirty": {"at": 1794288856388, "previous_holder": {"kind": "agent_session", "session_id": "2a4bcb89-406d-4621-9748-8d6a62bba927"}, "reason": "admin_forced"}, "holder"
+1794288856361 granted {"dirty": null, "lease": "lse_01M71Z6B99P7QKN42YZ99QWZVC", "override_reason": null, "purpose": "l1 pre-notice", "resource": "c6-boards", "unit": "c6-a"}
+1794288849499 unit_added {"resource": "c6-boards", "scope": "user", "unit": "c6-a"}
+1794288849490 resource_created {"id": "c6-boards", "scope": "user", "tags": ["esp32c6"], "type": "device"}

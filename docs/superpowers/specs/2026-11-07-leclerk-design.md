@@ -562,6 +562,12 @@ running and starts it if not. The roles:
   - My call: through an admin API alongside MCP, rather than by speaking MCP.
     Left to the builder.
 
+Trust model: the socket is reachable only by the user (its directory is
+`0700`), and inside that boundary there is no further authentication: any
+process running as the same user can call the daemon's RPCs and hooks with
+any session id or Claude PID, so the clerk guards agents against each
+other's mistakes, not against a hostile process of the same user.
+
 ### 7.2 Daemon lifecycle
 
 - **Starting:** several invocations may race to start the daemon. Exactly one
@@ -1227,3 +1233,47 @@ leclerk` (`install-isolated-config.log`).
 session with it; real boards; the desktop app and VS Code (no tasks, blocking
 `lease_wait`); subagents holding leases; the 20-minute `lease_wait` cap and
 30-minute stdio idle limit at default timings.
+
+#### Final fix wave re-check (2026-11-10, Claude Code 2.1.321, clerk 0.3.0)
+
+Isolated as above (release build first on `PATH`, temp `CLERK_HOME` with
+`reconnect_grace = 120`, `--plugin-dir`, `--setting-sources project`,
+`--model haiku`, the already-trusted scratch repo), driven by the
+parametrised Task 7 helpers with non-default `CLERK_HOME`, `T7_SCRATCH`,
+`T7_SUBJECT` and `T7_TMUX`. Evidence: `task7/fix-*`. The user's settings and
+plugin files were unchanged (checksums).
+
+- **L1: `next`, `summary` and `ack` reach the model: passed, with a
+  qualification for errors.** `claude -p` (`fix-l1-model-view.txt`): a
+  successful `lease_wait` reached the model as its JSON with `next`,
+  `summary` and `ack`, and the model quoted all three verbatim. A tool error
+  (`resource_get` of a missing id, `is_error: true`) reached the model as the
+  text block, not the JSON: `not_found: no such resource or unit (…). Call
+  lease_status or resource_list to see what exists for this session.` So
+  errors carry their summary line and next step in the text the model sees;
+  their structured `next`/`summary` serve other clients. Interactively,
+  `lease_acquire`'s result carried `next` (`fix-l2-A-1.txt`).
+- **L2: `CLAUDE_CODE_SESSION_ID` across `/clear` and `--continue`**
+  (`fix-l2-hook-ids.txt`, proxy environment read from `/proc`, screens
+  `fix-l2-A-*.txt`):
+  - start-up (`--session-id U`): the Bash tool, every hook (input
+    `session_id` and environment) and `clerk mcp` all see `U`;
+  - after `/clear`: SessionEnd (`reason: clear`) still names `U`; then
+    SessionStart (`source: clear`), later hooks and the Bash tool see a new
+    id `N`, while the same `clerk mcp` process keeps `U` (it is not
+    restarted). MCP `lease_status` still lists the lease (held by `U`), but
+    `clerk leases --mine` run as `N` lists nothing
+    (`fix-l2-cli-after-clear.json`);
+  - after `kill -9` and `claude --continue`: the continued conversation is
+    `N`, and this time the Bash tool, the hooks (SessionStart
+    `source: resume`, `session_id` `N`) and the new `clerk mcp` all see `N`.
+    Nothing links `N` to `U`: the SessionStart hook found nothing held by `N`,
+    and the lease held by `U` ended after the grace with cause `holder_gone`
+    (`fix-l2-audit-tail.txt`).
+  - Finding (not fixed in this wave): after `/clear`, the clerk keeps the
+    session's leases under the MCP server's start-up id, which the Bash tool
+    and a later `--continue` no longer use. A fix in the same spirit as the
+    resume alias would be for the SessionStart hook with `source: clear` to
+    alias the new id to the live proxy session of the same Claude PID; then
+    the CLI after `/clear` and a later `--continue` both resolve to it.
+

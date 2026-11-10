@@ -1,0 +1,13 @@
+Hook inputs (extra recording hooks via --settings): event, source/reason, input session_id,
+CLAUDE_CODE_SESSION_ID in the hook's environment, CLAUDE_PID.
+SessionStart startup session_id=4f31dfcc-a0c2-45cb-a797-fab194098d40 env=4f31dfcc-a0c2-45cb-a797-fab194098d40 claude_pid=2040351
+UserPromptSubmit  session_id=4f31dfcc-a0c2-45cb-a797-fab194098d40 env=4f31dfcc-a0c2-45cb-a797-fab194098d40 claude_pid=2040351
+PreToolUse Bash session_id=4f31dfcc-a0c2-45cb-a797-fab194098d40 env=4f31dfcc-a0c2-45cb-a797-fab194098d40 claude_pid=2040351
+SessionEnd clear session_id=4f31dfcc-a0c2-45cb-a797-fab194098d40 env=4f31dfcc-a0c2-45cb-a797-fab194098d40 claude_pid=2040351
+SessionStart clear session_id=63850d32-79ed-40d6-843e-5046aa0e62d8 env=63850d32-79ed-40d6-843e-5046aa0e62d8 claude_pid=2040351
+UserPromptSubmit  session_id=63850d32-79ed-40d6-843e-5046aa0e62d8 env=63850d32-79ed-40d6-843e-5046aa0e62d8 claude_pid=2040351
+PreToolUse Bash session_id=63850d32-79ed-40d6-843e-5046aa0e62d8 env=63850d32-79ed-40d6-843e-5046aa0e62d8 claude_pid=2040351
+SessionStart resume session_id=63850d32-79ed-40d6-843e-5046aa0e62d8 env=63850d32-79ed-40d6-843e-5046aa0e62d8 claude_pid=2047471
+UserPromptSubmit  session_id=63850d32-79ed-40d6-843e-5046aa0e62d8 env=63850d32-79ed-40d6-843e-5046aa0e62d8 claude_pid=2047471
+PreToolUse Bash session_id=63850d32-79ed-40d6-843e-5046aa0e62d8 env=63850d32-79ed-40d6-843e-5046aa0e62d8 claude_pid=2047471
+SessionEnd other session_id=63850d32-79ed-40d6-843e-5046aa0e62d8 env=63850d32-79ed-40d6-843e-5046aa0e62d8 claude_pid=2047471

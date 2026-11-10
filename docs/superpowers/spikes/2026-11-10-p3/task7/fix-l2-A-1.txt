@@ -1,0 +1,24 @@
+
+                                                   
+● Ran 1 stop hook                                                               
+  ⎿  Stop hook error: Le Clerk: this session has 1 live lease but no
+  lease_wait call is running, so offers, yield requests and expiry              
+  warnings would go unanswered. Call lease_wait (with ack=[the notice
+  ids of its previous result]) and keep calling it while you hold or
+  wait for anything; release leases you no longer need.             
+                                                                     
+  Called plugin:leclerk:clerk                                                   
+                                                                     
+● The lease wait is running in the background as task k51t8jghj, so the session
+  is no longer flagged. Lease lse_01M71Z8GFFY266NBG5G8ZDJ64Z on c6-boards (unit
+  c6-a) is still held and ends in about 10 minutes.                 
+
+  The lease came back marked dirty: it was handed over from another session    
+  without confirmed cleanup. Erase the flash before you use the board.         
+                                                                              
+✻ Sautéed for 13s · done 6:35 · 1 MCP task still running                   
+                                                                              
+────────────────────────────────────────────────────────────────────────────────
+❯                                                                            
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 MCP task · ← 1 agent · ↓ to manage                   

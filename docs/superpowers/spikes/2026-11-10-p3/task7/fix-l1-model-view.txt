@@ -1,0 +1,27 @@
+claude -p --model haiku (Claude Code 2.1.321): what the model received for each clerk call,
+from --output-format stream-json (tool_use inputs, tool_result content as given to the model),
+then the model's final answer quoting the fields.
+
+TOOL_USE mcp__plugin_leclerk_clerk__resource_get {"id": "nope"}
+TOOL_RESULT is_error=True not_found: no such resource or unit ({"id":"nope","kind":"resource"}). Call lease_status or resource_list to see what exists for this session.
+
+TOOL_USE mcp__plugin_leclerk_clerk__lease_wait {}
+TOOL_RESULT is_error=None {"ack":["ntc_01M71Z6BA572HJQE5N83FE6C45"],"acknowledged":0,"claim_errors":[],"grants":[],"next":"Call lease_wait again with ack=[\"ntc_01M71Z6BA572HJQE5N83FE6C45\"] while you hold or wait for anything.","notices":[{"action":"Lease lse_01M71Z6B99P7QKN42YZ99QWZVC ended without confirmed cleanup, so the unit is marked dirty; stop using it now.","cleanup_confirmed":null,"created_at":1794288856389,"deadline":null,"dirty":{"at":1794288856388,"previous_holder":{"kind":"agent_session","session_id":"2a4bcb89-406d-4621-9748-8d6a62bba927"},"reason":"admin_forced"},"holder":{"kind":"agent_session","session_id":"2a4bcb89-406d-4621-9748-8d6a62bba927"},"id":"ntc_01M71Z6BA572HJQE5N83FE6C45","kind":"lease_ended","lease_id":"lse_01M71Z6B99P7QKN42YZ99QWZVC","other_purpose":null,"position":null,"request_id":null,"resource":"c6-boards","unit":"c6-a"}],"summary":["1 notice(s):","[ntc_01M71Z6BA572HJQE5N83FE6C45] lease_ended: Lease lse_01M71Z6B99P7QKN42YZ99QWZVC ended without confirmed cleanup, so the unit is marked dirty; stop using it now."],"timed_out":false}
+
+FINAL ANSWER:
+```json
+{
+  "resource_get": {
+    "error": true,
+    "next": "(absent)",
+    "summary": "(absent)",
+    "ack": "(absent)"
+  },
+  "lease_wait": {
+    "error": false,
+    "next": "Call lease_wait again with ack=[\"ntc_01M71Z6BA572HJQE5N83FE6C45\"] while you hold or wait for anything.",
+    "summary": ["1 notice(s):", "[ntc_01M71Z6BA572HJQE5N83FE6C45] lease_ended: Lease lse_01M71Z6B99P7QKN42YZ99QWZVC ended without confirmed cleanup, so the unit is marked dirty; stop using it now."],
+    "ack": ["ntc_01M71Z6BA572HJQE5N83FE6C45"]
+  }
+}
+```

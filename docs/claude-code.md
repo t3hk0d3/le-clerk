@@ -38,6 +38,13 @@ Checked with Claude Code 2.1.321.
    You don't need to start the daemon: the MCP server starts it on first use.
    Hooks never start it.
 
+   **After installing or upgrading `clerk`, run `clerk daemon restart`.** A
+   daemon left running from an older build is refused by every client (each
+   checks the daemon's version and protocol): `clerk` commands exit 5 with
+   `version_mismatch`, and the plugin's MCP server answers every request with
+   an error saying to run `clerk daemon restart`. Restarting keeps leases and
+   queues: agent sessions get `reconnect_grace` to reconnect.
+
 3. **Add the marketplace** (the repository checkout), from a shell:
 
    ```sh
@@ -64,6 +71,7 @@ Checked with Claude Code 2.1.321.
 
 ### Verify
 
+- `clerk --version` and `clerk daemon status` show the same version.
 - `claude plugin list` shows `leclerk@leclerk`, its scope and `✔ enabled`.
 - In a session, `/mcp` shows `plugin:leclerk:clerk` as connected.
 - Ask the session to "list the clerk's resources": it calls `resource_list`.
@@ -93,7 +101,7 @@ the first three, 1.5 s for SessionEnd (Claude Code's limit).
 
 | Hook | What it does |
 |---|---|
-| `SessionStart` | On a resumed session (`--resume`, `--continue`), hands the session's leases and queued requests over to the new MCP connection, retrying until it connects. Otherwise nothing. |
+| `SessionStart` | On a resumed session (`--resume`, `--continue`), hands the session's leases and queued requests over to the new MCP connection, retrying until it connects (also while the MCP server is still starting the daemon). Otherwise nothing. |
 | `Stop` | When the session holds a lease or a queued request but has no `lease_wait` running, blocks the end of the turn once with a reminder to call `lease_wait`. Claude Code shows it as "Stop hook error: Le Clerk: …". |
 | `PreToolUse` | Before a tool call, adds notices no hook has shown yet (offers, expiry warnings, yield requests, cleanup windows) to the agent's context. They stay pending until a `lease_wait` acknowledges them. Skipped inside subagents. |
 | `SessionEnd` | Ends the session's leases and requests at once. On `/clear` or `/resume` (the Claude Code process lives on) it does nothing while the MCP connection is up. |
@@ -113,6 +121,12 @@ the first three, 1.5 s for SessionEnd (Claude Code's limit).
   (not checked further), so let the agent re-arm `lease_wait` when in doubt.
 - After a clean exit there is nothing left to resume: the leases already
   ended.
+- `clerk` run from the agent's shell (the Bash tool, where
+  `CLAUDE_CODE_SESSION_ID` is set) acts as the agent's session, following
+  resume aliases: after `--continue`, `clerk release <lease>` releases the
+  lease the resumed session took over, and a new `clerk acquire` lands on the
+  live session. `clerk wait` refuses to run there (exit 2): the MCP tool
+  `lease_wait` owns the session's notices.
 
 ### Trust model
 
@@ -126,43 +140,75 @@ your account.
 ### What the model sees
 
 Claude Code 2.1.321 hands the model a tool's structured content (the clerk's
-JSON) and not the short text block the clerk adds with the next step. The
-JSON carries what the agent needs (lease and request IDs, notice IDs for
-`ack`, each notice's `action`), and the skills say what to call next.
+JSON) and not the short text block beside it. So everything the text says is
+in the JSON too, on every result, task result and error:
+
+- `next`: the next step the clerk expects (the text block's last sentence),
+  e.g. "Call lease_confirm when the unit is clean.";
+- `summary`: the text block's other lines, including any "Tell the user …
+  `clerk approve <id>`" line about a similar unit in another project;
+- `ack` (on `lease_wait` results, and on a queued `lease_acquire` task's
+  final result): exactly the notice IDs to pass as `ack` to the next
+  `lease_wait`.
+
+For a tool error Claude Code shows the model the text block instead
+("`code`: message (details). Next step."), which states the same summary line
+and next step; the structured content of an error (`error` with `code`,
+`message`, `details`, beside `next` and `summary`) is for other MCP clients.
+The skills tell agents to follow the next step and pass `ack` on.
+
+`/clear` gives the conversation a new session ID (the Bash tool and the hooks
+see it) while the clerk's MCP server keeps the one it started with, so the
+leases stay with the MCP server's ID. Two consequences, as of this version:
+`clerk` run from the agent's shell after `/clear` acts as the new ID and does
+not see the session's leases (use the MCP tools), and after `/clear` followed
+by a crash and `claude --continue` the leases are not handed over and end
+after `reconnect_grace`.
 
 ## Manual checklist
 
 These checks drive real Claude Code sessions; they are not in CI. Run them in
 isolation so they never touch your real clerk state or Claude Code settings.
-The helper scripts are in
-`docs/superpowers/spikes/2026-11-10-p3/task7/`:
+The helper scripts are in `docs/superpowers/spikes/2026-11-10-p3/task7/`
+(`T7` below). They take every path from the environment (`env.sh` lists the
+variables and their defaults):
 
-- `run-claude.sh`: runs `claude` with the release `clerk` first on `PATH`, a
-  temp `CLERK_HOME` (keep it short: the socket path must stay under 107
-  bytes), the plugin loaded for that run only (`--plugin-dir
-  integrations/claude-code`) and user settings not read
-  (`--setting-sources project`). Nothing is installed.
-- `tm.sh`: starts and drives interactive sessions in a private tmux server
-  (`tmux -L t7`), with `--model haiku`, the clerk's tools allowed
-  (`--allowedTools=mcp__plugin_leclerk_clerk`) and a `--debug-file` each.
-- `clerk-user.sh`: runs `clerk` as the user against the temp `CLERK_HOME`.
+- `run-claude.sh`: runs `claude` with the release `clerk` (from
+  `CLERK_BIN_DIR`) first on `PATH`, the temp `CLERK_HOME`, the plugin loaded
+  for that run only (`--plugin-dir $LECLERK_REPO/integrations/claude-code`)
+  and user settings not read (`--setting-sources project`). Nothing is
+  installed.
+- `tm.sh`: `init` makes the subject project (`T7_SUBJECT`, a git repo) and
+  the tmux session; `start`, `send`, `cap` and `pid` drive interactive
+  sessions in a private tmux server (`tmux -L $T7_TMUX`), with `--model
+  haiku`, the clerk's tools allowed (`--allowedTools=mcp__plugin_leclerk_clerk`)
+  and a `--debug-file` each in `T7_SCRATCH`; `stop` kills the server.
+- `clerk-user.sh`: runs that `clerk` as the user against `CLERK_HOME`.
 
-Set-up, once:
+Set-up, once, in the shell you run the checks from:
 
 ```sh
-CLERK_HOME=/tmp/t7h; mkdir -p $CLERK_HOME/config
+cargo build --release
+export LECLERK_REPO=$PWD T7=$PWD/docs/superpowers/spikes/2026-11-10-p3/task7
+export CLERK_BIN_DIR=${CARGO_TARGET_DIR:-$PWD/target}/release
+export CLERK_HOME=/tmp/clerk-t7          # short: the socket path must stay under 107 bytes
+export T7_SCRATCH=/tmp/clerk-t7-scratch T7_TMUX=t7
+mkdir -p $CLERK_HOME/config $T7_SCRATCH
 echo 'reconnect_grace = 20' > $CLERK_HOME/config/config.toml   # shorter grace for item 3
-clerk daemon &                                                # or let `clerk mcp` start it
-clerk resource create c6-boards --type device --scope user \
+$T7/tm.sh init
+$T7/clerk-user.sh resource create c6-boards --type device --scope user \
   --description "ESP32-C6 dev boards on the test hub" \
   --usage 'Flash with `idf.py -p {unit.path} flash`. Clean = erase flash.' \
   --tag esp32c6 --tag devboard --health exists
-touch /tmp/board-a; clerk unit add c6-boards c6-a --path /tmp/board-a
+touch /tmp/board-a; $T7/clerk-user.sh unit add c6-boards c6-a --path /tmp/board-a
 ```
 
-Run every session from a directory Claude Code already trusts (an interactive
-start in a new folder asks to trust it). Afterwards: exit the sessions,
-`clerk daemon stop`, `tmux -L t7 kill-server`.
+`clerk-user.sh` starts the daemon on first use. Interactive sessions start in
+`T7_SUBJECT`; Claude Code asks once to trust a new folder there, which it
+records in your `~/.claude.json`. To avoid that, point `T7_SUBJECT` at a
+directory you already trust, or use `claude -p` (no trust prompt).
+Afterwards: exit the sessions, `$T7/clerk-user.sh daemon stop`,
+`$T7/tm.sh stop`.
 
 1. **Two sessions, one board: the second queues, then its `lease_wait` wakes
    it.** Start sessions A and B (`tm.sh start A`). Ask A to lease
