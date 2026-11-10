@@ -12,44 +12,48 @@ use serde_json::Value;
 const PLUGIN_DIR: &str = "integrations/claude-code";
 /// The marketplace entry's `source`.
 const PLUGIN_SOURCE: &str = "./integrations/claude-code";
-/// The skills, by directory name (equal to their frontmatter `name`).
-const SKILLS: [&str; 2] = ["leasing", "registering-resources"];
-/// The MCP tools the daemon serves (Global Constraints).
-const TOOLS: [&str; 21] = [
-    "type_list",
-    "resource_create",
-    "resource_update",
-    "resource_delete",
-    "resource_list",
-    "resource_get",
-    "unit_add",
-    "unit_update",
-    "unit_remove",
-    "unit_retire",
+/// The one skill (user decision: one skill keeps agents' context small).
+const SKILL: &str = "clerk";
+/// The skill's files: the entry point and the references it links.
+const SKILL_FILES: [&str; 3] = ["SKILL.md", "leasing.md", "registering.md"];
+/// The longest `SKILL.md` may be, in lines.
+const SKILL_MAX_LINES: usize = 120;
+/// The top-level `clerk` commands (`clerk --help`).
+const COMMANDS: [&str; 25] = [
+    "daemon",
+    "resource",
+    "unit",
+    "status",
+    "resources",
+    "leases",
+    "queue",
+    "log",
+    "promotions",
+    "acquire",
+    "attach",
+    "cancel",
+    "release",
+    "extend",
+    "run",
+    "wait",
+    "admin",
+    "hook",
+    "approve",
+    "types",
+    "confirm",
+    "interruptible",
+    "yield",
+    "reclaim",
+    "claim",
+];
+/// The removed MCP tools: no skill may name them.
+const MCP_TOOLS: [&str; 6] = [
+    "lease_wait",
     "lease_acquire",
     "lease_status",
-    "lease_extend",
-    "lease_release",
+    "resource_list",
+    "type_list",
     "lease_confirm",
-    "lease_set_interruptible",
-    "lease_yield_refuse",
-    "lease_reclaim",
-    "lease_cancel",
-    "lease_claim",
-    "lease_wait",
-];
-/// Argument, result and notice field names that share a tool prefix but
-/// are not tools; the skills may name them.
-const FIELDS: [&str; 9] = [
-    "lease_id",
-    "request_id",
-    "unit_description",
-    "resource_description",
-    "resource_tags",
-    "unit_links",
-    "lease_ended",
-    "unit_returned",
-    "resource_removed",
 ];
 /// Each hook event with its `clerk hook` subcommand and the longest
 /// `timeout` (seconds) it may set.
@@ -87,8 +91,8 @@ fn hooks() -> Value {
     read_json(&plugin_path("hooks/hooks.json"))
 }
 
-fn skill_text(name: &str) -> String {
-    let path = plugin_path(&format!("skills/{name}/SKILL.md"));
+fn skill_file(file: &str) -> String {
+    let path = plugin_path(&format!("skills/{SKILL}/{file}"));
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
@@ -115,17 +119,26 @@ fn is_kebab(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Every word in `text` that looks like a clerk tool name but is neither a
-/// tool nor a known field name.
-fn unknown_tool_names(text: &str) -> Vec<String> {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|w| {
-            ["lease_", "resource_", "unit_", "type_"]
-                .iter()
-                .any(|p| w.starts_with(p))
+/// Every `clerk <word>` in command position in `text` (after a backtick,
+/// or starting a line of a code block) whose word is not a clerk command.
+fn unknown_commands(text: &str) -> Vec<String> {
+    text.match_indices("clerk ")
+        .filter(|(at, _)| {
+            let before = &text[..*at];
+            before.ends_with('`')
+                || before
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|l| l.trim().is_empty())
         })
-        .filter(|w| !TOOLS.contains(w) && !FIELDS.contains(w))
-        .map(str::to_owned)
+        .filter_map(|(at, m)| {
+            let word: String = text[at + m.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                .collect();
+            (!word.is_empty() && !word.starts_with('-') && !COMMANDS.contains(&word.as_str()))
+                .then_some(word)
+        })
         .collect()
 }
 
@@ -228,45 +241,77 @@ mod plugin {
                 }
             }
         }
-
-        #[test]
-        fn skills_have_frontmatter_with_their_name_and_a_description() {
-            for skill in SKILLS {
-                let (fm, body) = frontmatter(&skill_text(skill));
-                assert_eq!(fm["name"], skill, "{skill} frontmatter name");
-                let d = fm["description"].as_str().expect("description is a string");
-                assert!(!d.trim().is_empty(), "{skill} description is not empty");
-                assert!(d.len() <= 1536, "{skill} description fits the listing cap");
-                assert!(!body.trim().is_empty(), "{skill} has a body");
-            }
-        }
-
-        #[test]
-        fn skills_mention_only_tool_names_the_clerk_serves() {
-            for skill in SKILLS {
-                let unknown = unknown_tool_names(&skill_text(skill));
-                assert!(
-                    unknown.is_empty(),
-                    "{skill} names unknown tools {unknown:?}"
-                );
-            }
-        }
     }
 
-    mod tool_name_check {
+    mod the_clerk_skill {
         use super::*;
 
         #[test]
-        fn flags_a_misspelled_tool() {
-            let text = "Call `lease_aquire`, then `lease_wait` and `type_lists`.";
-            assert_eq!(unknown_tool_names(text), ["lease_aquire", "type_lists"]);
+        fn has_frontmatter_with_its_name_and_one_description() {
+            let (fm, body) = frontmatter(&skill_file("SKILL.md"));
+            assert_eq!(fm["name"], SKILL);
+            let d = fm["description"].as_str().expect("description is a string");
+            assert!(!d.trim().is_empty() && d.len() <= 1536, "{d}");
+            for word in ["lease", "register", "notice"] {
+                assert!(d.contains(word), "description covers {word}: {d}");
+            }
+            assert_ne!(body.trim(), "");
         }
 
         #[test]
-        fn accepts_tools_and_field_names() {
-            let text =
-                "lease_extend {\"lease_id\": \"x\"}; lease_cancel with request_id; type_list";
-            assert_eq!(unknown_tool_names(text), Vec::<String>::new());
+        fn skill_md_stays_short_and_links_its_references() {
+            let text = skill_file("SKILL.md");
+            assert!(
+                text.lines().count() <= SKILL_MAX_LINES,
+                "{} lines",
+                text.lines().count()
+            );
+            assert!(text.contains("leasing.md") && text.contains("registering.md"));
+        }
+
+        #[test]
+        fn names_only_real_clerk_commands_and_no_mcp_tool() {
+            for file in SKILL_FILES {
+                let text = skill_file(file);
+                assert_eq!(unknown_commands(&text), Vec::<String>::new(), "{file}");
+                for tool in MCP_TOOLS {
+                    assert!(!text.contains(tool), "{file} names {tool}");
+                }
+            }
+        }
+
+        #[test]
+        fn teaches_monitor_on_clerk_wait_follow_with_the_background_fallback() {
+            let text = skill_file("SKILL.md");
+            for needle in [
+                "Monitor",
+                "clerk wait --follow",
+                "1800000",
+                "run_in_background",
+            ] {
+                assert!(text.contains(needle), "SKILL.md mentions {needle}");
+            }
+        }
+
+        #[test]
+        fn is_the_only_skill_and_there_is_no_mcp_server() {
+            let dirs: Vec<String> = fs::read_dir(plugin_path("skills"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(dirs, [SKILL]);
+            assert!(!plugin_path(".mcp.json").exists());
+        }
+    }
+
+    mod command_check {
+        use super::*;
+
+        #[test]
+        fn flags_a_misspelled_command() {
+            let text = "Run `clerk aquire board` and `clerk wait --follow`; the clerk hands.\n\
+                        clerk relase x";
+            assert_eq!(unknown_commands(text), ["aquire", "relase"]);
         }
     }
 

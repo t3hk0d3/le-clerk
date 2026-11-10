@@ -20,7 +20,7 @@ init)
 start) name=$1; id=$2; shift 2
   sid=; [ "$id" = - ] || sid="--session-id $id"
   tm new-window -d -t "$T7_TMUX:" -n "$name" -c "$T7_SUBJECT" \
-    "$T7/run-claude.sh $sid --model haiku --allowedTools=mcp__plugin_leclerk_clerk --debug-file $T7_SCRATCH/t7-$name-debug.log $*"
+    "$T7/run-claude.sh $sid --model haiku --allowedTools=Bash,Monitor --debug-file $T7_SCRATCH/t7-$name-debug.log $*"
   tm set-option -w -t "$T7_TMUX:$name" remain-on-exit on ;;
 send) name=$1; shift
   tm send-keys -t "$T7_TMUX:$name" -l "$*"; sleep 0.5; tm send-keys -t "$T7_TMUX:$name" Enter ;;
