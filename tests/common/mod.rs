@@ -1,6 +1,7 @@
 // Shared by every test crate; each one uses only a subset.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,8 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use leclerk::client::{ApiError, Client};
 use leclerk::config::Paths;
-use leclerk::model::{Caller, Resource, Unit};
+use leclerk::model::{Caller, HolderRef, Host, Resource, Unit};
+use leclerk::scheduler::liveness;
 use leclerk::store::Tx;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -100,15 +102,49 @@ pub const CTRL_BRACKET: &[u8] = b"\x1d";
 // Harness
 // ---------------------------------------------------------------------------
 
+/// A process standing for Claude Code for each agent session that calls
+/// the daemon directly, as a call must say which process runs its session.
+/// Dropping it kills them.
+#[derive(Default)]
+pub struct AgentHosts(Mutex<HashMap<String, (Child, Host)>>);
+
+impl AgentHosts {
+    /// The process running `caller`, when it is an agent session.
+    pub fn of(&self, caller: &Caller) -> Option<Host> {
+        let HolderRef::AgentSession { session_id } = &caller.holder else {
+            return None;
+        };
+        let mut hosts = self.0.lock().unwrap();
+        let (_, host) = hosts.entry(session_id.clone()).or_insert_with(|| {
+            let child = StdCommand::new("sleep").arg("300").spawn().unwrap();
+            let pid = child.id();
+            let start_time = liveness::start_time(pid).expect("a running child has a start time");
+            (child, Host { pid, start_time })
+        });
+        Some(*host)
+    }
+}
+
+impl Drop for AgentHosts {
+    fn drop(&mut self) {
+        for (child, _) in self.0.lock().unwrap().values_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// A private clerk home. Dropping it stops the daemon its commands started.
 pub struct Env {
     env: TestEnv,
+    hosts: AgentHosts,
 }
 
 impl Env {
     pub fn new() -> Self {
         Self {
             env: TestEnv::new(),
+            hosts: AgentHosts::default(),
         }
     }
 
@@ -152,7 +188,10 @@ impl Env {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let client = Client::connect(&self.paths()).await.expect("daemon runs");
+            let client = Client::connect(&self.paths())
+                .await
+                .expect("daemon runs")
+                .with_host(self.hosts.of(caller));
             client.call(method, caller, args).await
         })
     }

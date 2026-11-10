@@ -69,6 +69,9 @@ pub fn after_error(code: &str) -> &'static str {
             "Tell the user the clerk daemon must be restarted (`clerk daemon restart`)."
         }
         "agent_unidentified" => "Tell the user Claude Code needs updating.",
+        "session_not_hosted" => {
+            "Tell the user the hooks are not reaching the clerk (plugin installed? daemon up?)."
+        }
         "daemon_stopping" => "Tell the user the clerk daemon is stopped.",
         "not_found" => "Run `clerk leases --mine` or `clerk resources` to see where you stand.",
         _ => "Run `clerk leases --mine` to see where you stand.",

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use leclerk::clock::ManualClock;
 use leclerk::config::Config;
-use leclerk::engine::{Engine, EngineHandle, EngineOptions};
+use leclerk::engine::{ApiError, Command as EngineCommand, Engine, EngineHandle, EngineOptions};
 use leclerk::health::HealthResult;
 use leclerk::inventory::{Inventory, NewResource, NewUnit};
 use leclerk::model::{
@@ -16,7 +16,7 @@ use leclerk::model::{
     Scope, UnitId, UnitSettings,
 };
 use leclerk::scheduler::liveness;
-use leclerk::scheduler::session::{Reported, Sessions};
+use leclerk::scheduler::session::{Hosting, Reported, Sessions};
 use leclerk::scheduler::{AcquireOutcome, AcquireRequest, HealthProbe, Scheduler, Target};
 use leclerk::store::audit::{self, AuditEntry};
 use leclerk::store::notices::{self, NoticeKind};
@@ -238,11 +238,19 @@ impl Fixture {
             .unwrap()
     }
 
-    fn touch(&mut self, session: &str, host: Host) -> bool {
+    fn touch(&mut self, session: &str, host: Option<Host>) -> Hosting {
         let now = self.now();
         let sessions = &mut self.sessions;
         self.store
             .tx(|tx| sessions.touch(tx, session, host, now))
+            .unwrap()
+    }
+
+    fn sweep(&mut self) -> Vec<String> {
+        let now = self.now();
+        let sessions = &mut self.sessions;
+        self.store
+            .tx(|tx| sessions.sweep_hostless(tx, now))
             .unwrap()
     }
 
@@ -413,8 +421,55 @@ mod scheduler {
                 fn records_its_host() {
                     let mut f = fixture();
                     let p = Proc::spawn();
-                    assert!(f.touch("s1", p.host));
+                    assert_eq!(f.touch("s1", Some(p.host)), Hosting::Hosted);
                     assert!(f.sessions.is_alive("s1"));
+                }
+            }
+
+            mod on_a_host_listed_under_this_session {
+                use super::*;
+
+                #[test]
+                fn returns_hosted() {
+                    let mut f = fixture();
+                    let p = Proc::spawn();
+                    f.report("s1", p.host);
+                    assert_eq!(f.touch("s1", Some(p.host)), Hosting::Hosted);
+                }
+            }
+
+            mod on_a_host_listed_under_another_session {
+                use super::*;
+
+                #[test]
+                fn returns_host_runs_other_naming_that_session() {
+                    let mut f = fixture();
+                    let p = Proc::spawn();
+                    f.report("s1", p.host);
+                    assert_eq!(
+                        f.touch("s2", Some(p.host)),
+                        Hosting::HostRunsOther("s1".into())
+                    );
+                }
+
+                #[test]
+                fn records_nothing() {
+                    let mut f = fixture();
+                    let p = Proc::spawn();
+                    f.report("s1", p.host);
+                    f.touch("s2", Some(p.host));
+                    assert_eq!(f.sessions.hosts_of("s2"), Vec::<Host>::new());
+                    assert_eq!(f.sessions.hosts_of("s1"), vec![p.host]);
+                }
+            }
+
+            mod on_no_host_given {
+                use super::*;
+
+                #[test]
+                fn returns_not_hosted() {
+                    let mut f = fixture();
+                    assert_eq!(f.touch("s1", None), Hosting::NotHosted);
                 }
             }
 
@@ -429,7 +484,10 @@ mod scheduler {
                     let p = Proc::spawn();
                     f.held_by_s1(&p);
                     f.report("s2", p.host);
-                    assert!(!f.touch("s1", p.host));
+                    assert_eq!(
+                        f.touch("s1", Some(p.host)),
+                        Hosting::HostRunsOther("s2".into())
+                    );
                     assert!(!f.sessions.is_alive("s1"));
                     assert_eq!(f.sessions.grace_ends("s1"), Some(T0 + GRACE_MS));
                     assert!(f.sessions.is_alive("s2"));
@@ -510,6 +568,76 @@ mod scheduler {
                     assert!(!f.sessions.is_alive("s1"));
                     assert_eq!(f.sessions.grace_ends("s1"), Some(T0 + GRACE_MS));
                     assert_eq!(f.lease(&lease).0, "held");
+                }
+            }
+        }
+
+        mod sweep_hostless {
+            use super::*;
+
+            mod on_an_agent_holder_with_live_leases_and_no_known_host {
+                use super::*;
+
+                #[test]
+                fn starts_the_reconnect_grace() {
+                    let mut f = fixture();
+                    f.grant(agent("ghost"));
+                    assert_eq!(f.sweep(), vec!["ghost".to_owned()]);
+                    assert_eq!(f.sessions.grace_ends("ghost"), Some(T0 + GRACE_MS));
+                }
+
+                #[test]
+                fn ends_its_leases_when_the_grace_runs_out() {
+                    let mut f = fixture();
+                    let lease = f.grant(agent("ghost"));
+                    f.sweep();
+                    f.at(T0 + GRACE_MS);
+                    assert_eq!(f.expire(), vec!["ghost".to_owned()]);
+                    let (state, cause, _) = f.lease(&lease);
+                    assert_eq!(state, "ended");
+                    assert_eq!(cause.as_deref(), Some("holder_gone"));
+                }
+
+                #[test]
+                fn a_later_sweep_does_not_extend_the_grace() {
+                    let mut f = fixture();
+                    f.grant(agent("ghost"));
+                    f.sweep();
+                    f.at(T0 + 1_000);
+                    assert_eq!(f.sweep(), Vec::<String>::new());
+                    assert_eq!(f.sessions.grace_ends("ghost"), Some(T0 + GRACE_MS));
+                }
+            }
+
+            mod on_such_a_holder_that_reports_a_host_within_the_grace {
+                use super::*;
+
+                #[test]
+                fn keeps_its_leases() {
+                    let mut f = fixture();
+                    let p = Proc::spawn();
+                    let lease = f.grant(agent("ghost"));
+                    f.sweep();
+                    f.at(T0 + GRACE_MS - 1);
+                    f.report("ghost", p.host);
+                    f.at(T0 + GRACE_MS);
+                    assert_eq!(f.expire(), Vec::<String>::new());
+                    assert_eq!(f.sweep(), Vec::<String>::new());
+                    assert_eq!(f.lease(&lease).0, "held");
+                }
+            }
+
+            mod on_a_hosted_holder_or_another_kind_of_holder {
+                use super::*;
+
+                #[test]
+                fn starts_no_grace() {
+                    let mut f = fixture();
+                    let p = Proc::spawn();
+                    f.report("s1", p.host);
+                    f.grant(agent("s1"));
+                    assert_eq!(f.sweep(), Vec::<String>::new());
+                    assert_eq!(f.sessions.grace_ends("s1"), None);
                 }
             }
         }
@@ -722,14 +850,74 @@ fn seeded() -> (Store, Arc<ManualClock>) {
     (store, clock)
 }
 
-async fn acquire(engine: &EngineHandle, holder: HolderRef) -> serde_json::Value {
-    let args = serde_json::json!({
+/// Run `method` as `holder`, reporting `host`.
+async fn rpc(
+    engine: &EngineHandle,
+    method: &str,
+    holder: HolderRef,
+    host: Option<Host>,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let command = EngineCommand::parse(method, as_caller(holder), args)?;
+    engine.call_from(command, host).await
+}
+
+fn acquire_args() -> serde_json::Value {
+    serde_json::json!({
         "target": {"resource": "board"}, "duration_ms": 3_600_000, "purpose": "test"
-    });
-    engine
-        .call(leclerk::engine::Command::parse("acquire", as_caller(holder), args).unwrap())
+    })
+}
+
+async fn acquire(
+    engine: &EngineHandle,
+    holder: HolderRef,
+    host: Option<Host>,
+) -> Result<serde_json::Value, ApiError> {
+    rpc(engine, "acquire", holder, host, acquire_args()).await
+}
+
+/// How many live leases and queued requests `session` has.
+async fn holdings(engine: &EngineHandle, session: &str) -> usize {
+    let mine = rpc(
+        engine,
+        "list_my_leases",
+        agent(session),
+        None,
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    mine["leases"].as_array().unwrap().len() + mine["requests"].as_array().unwrap().len()
+}
+
+/// `board/u1` held by a user; the lease id.
+async fn user_holds(engine: &EngineHandle) -> String {
+    let lease = acquire(engine, user("x"), None).await.unwrap();
+    lease["lease_id"].as_str().unwrap().to_owned()
+}
+
+/// `session`, on `host`, is offered `board/u1`; the lease id.
+async fn offered(engine: &EngineHandle, session: &str, host: Host) -> String {
+    let held = user_holds(engine).await;
+    let queued = acquire(engine, agent(session), Some(host)).await.unwrap();
+    assert_eq!(queued["outcome"], "queued", "{queued}");
+    let lease = serde_json::json!({ "lease_id": held });
+    rpc(engine, "release", user("x"), None, lease.clone())
         .await
-        .unwrap()
+        .unwrap();
+    rpc(engine, "confirm", user("x"), None, lease)
+        .await
+        .unwrap();
+    let got = engine
+        .wait_notices(agent(session), Duration::from_secs(30))
+        .await
+        .unwrap();
+    got[0].lease_id.as_ref().unwrap().as_str().to_owned()
+}
+
+fn assert_not_hosted<T: std::fmt::Debug>(result: Result<T, ApiError>) {
+    let error = result.unwrap_err();
+    assert_eq!(error.code, "session_not_hosted", "{error:?}");
 }
 
 async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
@@ -810,6 +998,211 @@ mod engine {
         }
     }
 
+    /// AR-H1: the daemon, not only the CLI, ties an agent's lease to a
+    /// running process.
+    mod command_validation {
+        use super::*;
+
+        mod acquire_command {
+            use super::*;
+
+            mod on_an_agent_session_that_is_not_hosted {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn refuses_with_session_not_hosted() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    assert_not_hosted(acquire(&engine, agent("s1"), None).await);
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn refuses_a_host_running_another_session() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    engine.report_host("s1".into(), p.host).await.unwrap();
+                    assert_not_hosted(acquire(&engine, agent("s2"), Some(p.host)).await);
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn refuses_a_call_with_no_host_though_the_session_has_one() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    engine.report_host("s1".into(), p.host).await.unwrap();
+                    assert_not_hosted(acquire(&engine, agent("s1"), None).await);
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn grants_nothing() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let _ = acquire(&engine, agent("s1"), None).await;
+                    assert_eq!(holdings(&engine, "s1").await, 0);
+                }
+            }
+
+            mod on_a_hosted_agent_session {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn proceeds_as_before() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    let got = acquire(&engine, agent("s1"), Some(p.host)).await.unwrap();
+                    assert_eq!(got["outcome"], "granted", "{got}");
+                    assert!(engine.session_alive("s1".into()).await.unwrap());
+                }
+            }
+
+            mod on_a_caller_that_is_not_an_agent_session {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn needs_no_host() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let got = acquire(&engine, user("x"), None).await.unwrap();
+                    assert_eq!(got["outcome"], "granted", "{got}");
+                }
+            }
+        }
+
+        mod claim_command {
+            use super::*;
+
+            mod on_an_agent_session_that_is_not_hosted {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn refuses_with_session_not_hosted_and_claims_nothing() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    let lease = offered(&engine, "s1", p.host).await;
+                    let args = serde_json::json!({ "lease_id": lease });
+                    assert_not_hosted(rpc(&engine, "claim", agent("s1"), None, args.clone()).await);
+                    let view = rpc(&engine, "get_lease", agent("s1"), None, args)
+                        .await
+                        .unwrap();
+                    assert_eq!(view["state"], "offered", "{view}");
+                }
+            }
+
+            mod on_a_hosted_agent_session {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn proceeds_as_before() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    let lease = offered(&engine, "s1", p.host).await;
+                    let args = serde_json::json!({ "lease_id": lease });
+                    let view = rpc(&engine, "claim", agent("s1"), Some(p.host), args)
+                        .await
+                        .unwrap();
+                    assert_eq!(view["state"], "held", "{view}");
+                }
+            }
+        }
+
+        mod rehome_holder {
+            use super::*;
+
+            fn to(lease: &str, session: &str) -> serde_json::Value {
+                serde_json::json!({ "lease_id": lease, "new_holder": agent(session) })
+            }
+
+            mod on_a_target_agent_session_that_is_not_hosted {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn refuses_with_session_not_hosted_and_moves_nothing() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let lease = user_holds(&engine).await;
+                    let args = to(&lease, "ghost");
+                    assert_not_hosted(rpc(&engine, "rehome_holder", user("x"), None, args).await);
+                    assert_eq!(holdings(&engine, "ghost").await, 0);
+                }
+            }
+
+            mod on_a_hosted_target_agent_session {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn moves_the_lease() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    engine.report_host("s1".into(), p.host).await.unwrap();
+                    let lease = user_holds(&engine).await;
+                    rpc(&engine, "rehome_holder", user("x"), None, to(&lease, "s1"))
+                        .await
+                        .unwrap();
+                    assert_eq!(holdings(&engine, "s1").await, 1);
+                }
+            }
+
+            mod on_a_caller_agent_session_that_is_not_hosted {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn refuses_with_session_not_hosted() {
+                    let (store, clock) = seeded();
+                    let engine = engine_on(store, clock);
+                    let p = Proc::spawn();
+                    let lease = acquire(&engine, agent("s1"), Some(p.host)).await.unwrap();
+                    let args = serde_json::json!({
+                        "lease_id": lease["lease_id"], "new_holder": user("y"),
+                    });
+                    assert_not_hosted(rpc(&engine, "rehome_holder", agent("s1"), None, args).await);
+                }
+            }
+        }
+    }
+
+    mod sweep_on_the_probe_tick {
+        use super::*;
+
+        /// A lease that appears after boot with no host on record: only the
+        /// probe's sweep can see it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_hostless_holder_first_seen_after_boot_gets_the_grace_and_its_lease_ends() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("clerk.db");
+            let clock = Arc::new(ManualClock::new(T0));
+            let mut store = Store::open(&path).unwrap();
+            seed(&mut store, &Inventory::new(clock.clone()));
+            let engine = engine_on(store, clock.clone());
+            let mut outside = Store::open(&path).unwrap();
+            let sched = Scheduler::new(clock.clone(), Config::default(), Arc::new(Healthy));
+            let who = as_caller(agent("ghost"));
+            let lease = match outside.tx(|tx| sched.acquire(tx, &who, req())).unwrap() {
+                AcquireOutcome::Granted(g) => g.lease_id,
+                other => panic!("expected grant, got {other:?}"),
+            };
+            let row = |store: &mut Store| {
+                store
+                    .tx(|tx| -> Result<_, StoreError> { Ok(lease_row(tx, &lease)) })
+                    .unwrap()
+            };
+            // The sweep may not have run yet when the clock moves, so it
+            // moves in steps of one grace, far short of the lease's end.
+            eventually("the lease ends", async || {
+                clock.advance(GRACE);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                row(&mut outside).0 == "ended"
+            })
+            .await;
+            assert_eq!(row(&mut outside).1.as_deref(), Some("holder_gone"));
+            drop(engine);
+        }
+    }
+
     mod report_host {
         use super::*;
 
@@ -832,7 +1225,7 @@ mod engine {
             let engine = engine_on(store, clock.clone());
             let mut p = Proc::spawn();
             engine.report_host("s1".into(), p.host).await.unwrap();
-            acquire(&engine, agent("s1")).await;
+            acquire(&engine, agent("s1"), Some(p.host)).await.unwrap();
             p.kill();
             eventually("the probe notices the dead host", async || {
                 !engine.session_alive("s1".into()).await.unwrap()

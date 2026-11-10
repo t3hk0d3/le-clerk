@@ -16,7 +16,7 @@ use leclerk::model::{Caller, HolderRef};
 use leclerk::scope::ProjectResolver;
 use serde_json::{Value, json};
 
-use common::TestEnv;
+use common::{AgentHosts, TestEnv};
 
 /// Upper bound for one command; generous so a loaded machine never flakes.
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -31,12 +31,14 @@ const CLAUDE_PID: &str = "CLAUDE_PID";
 /// A private clerk home. Dropping it stops the daemon its commands started.
 struct Env {
     env: TestEnv,
+    hosts: AgentHosts,
 }
 
 impl Env {
     fn new() -> Self {
         Self {
             env: TestEnv::new(),
+            hosts: AgentHosts::default(),
         }
     }
 
@@ -87,6 +89,12 @@ impl Env {
         cmd
     }
 
+    /// The pid of a process of its own running agent session `session`,
+    /// for a test in which this test process runs another session.
+    fn own_host(&self, session: &str, cwd: &Path) -> u32 {
+        self.hosts.of(&agent_caller(session, cwd)).unwrap().pid
+    }
+
     /// Run `args` as the user; assert success and parse stdout as JSON.
     fn ok(&self, args: &[&str]) -> Value {
         json_of(self.cmd().args(args))
@@ -127,7 +135,10 @@ impl Env {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let client = Client::connect(&self.paths()).await.expect("daemon runs");
+            let client = Client::connect(&self.paths())
+                .await
+                .expect("daemon runs")
+                .with_host(self.hosts.of(caller));
             client.call(method, caller, args).await
         })
     }
@@ -1434,6 +1445,115 @@ mod cli {
                     assert!(Instant::now() < until, "the lease never ended");
                     std::thread::sleep(Duration::from_millis(200));
                 }
+            }
+        }
+
+        /// SK-H2: `/clear` while the daemon was down, so no hook said so.
+        mod on_a_lost_clear {
+            use super::*;
+
+            /// A process standing for Claude Code; killed when dropped.
+            struct Host(std::process::Child);
+
+            impl Host {
+                fn spawn() -> Self {
+                    Self(
+                        std::process::Command::new("sleep")
+                            .arg("300")
+                            .spawn()
+                            .unwrap(),
+                    )
+                }
+
+                fn pid(&self) -> String {
+                    self.0.id().to_string()
+                }
+
+                fn kill(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+
+            impl Drop for Host {
+                fn drop(&mut self) {
+                    self.kill();
+                }
+            }
+
+            fn hosted(env: &Env, session: &str, host: &Host, dir: &Path) -> Command {
+                let mut cmd = env.agent_without_pid(session, dir);
+                cmd.env(CLAUDE_PID, host.pid());
+                cmd
+            }
+
+            /// `old` on `host` holds `board/u1`, and `board` has a free
+            /// `u2`.
+            fn old_holds(env: &Env, host: &Host, dir: &Path) {
+                let config = env.home().join("config");
+                fs::create_dir_all(&config).unwrap();
+                fs::write(config.join("config.toml"), "reconnect_grace = 3\n").unwrap();
+                seed(env, "board", "k1");
+                env.ok(&["unit", "add", "board", "u2", "--key", "k2"]);
+                json_of(hosted(env, "old", host, dir).args(["acquire", "board", "--for", "1h"]));
+            }
+
+            fn pre_tool_use(env: &Env, session: &str, host: &Host) {
+                let input = json!({
+                    "session_id": session,
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "ls"},
+                    "tool_use_id": "toolu_1",
+                });
+                env.cmd()
+                    .args(["hook", "pre-tool-use"])
+                    .env(CLAUDE_PID, host.pid())
+                    .write_stdin(input.to_string())
+                    .assert()
+                    .success();
+            }
+
+            #[test]
+            fn the_new_sessions_lease_ends_within_grace_after_its_process_dies() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let mut host = Host::spawn();
+                old_holds(&env, &host, &dir);
+                env.ok(&["daemon", "stop"]);
+                env.ok(&["daemon", "restart"]);
+                pre_tool_use(&env, "new", &host);
+                let lease = json_of(
+                    hosted(&env, "new", &host, &dir).args(["acquire", "board", "--for", "1h"]),
+                );
+                assert_eq!(lease["outcome"], "granted", "{lease}");
+                host.kill();
+                let until = Instant::now() + PATIENCE;
+                while env.ok(&["leases"]).as_array().map(Vec::len) != Some(0) {
+                    assert!(Instant::now() < until, "a lease never ended");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+
+            #[test]
+            fn without_any_hook_the_new_session_is_refused_session_not_hosted() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let host = Host::spawn();
+                old_holds(&env, &host, &dir);
+                let error = error_of(
+                    hosted(&env, "new", &host, &dir).args(["acquire", "board", "--for", "1h"]),
+                    4,
+                );
+                assert_eq!(error["code"], "session_not_hosted", "{error}");
+                let message = error["message"].as_str().unwrap();
+                assert!(
+                    message.contains("hooks are not reaching the clerk"),
+                    "{error}"
+                );
+                assert!(message.contains("plugin installed"), "{error}");
+                assert!(message.contains("daemon up"), "{error}");
+                assert_eq!(env.ok(&["leases"]).as_array().map(Vec::len), Some(1));
             }
         }
 
@@ -5966,7 +6086,7 @@ mod cli {
                         "{PLAIN} cd '{}' && {SESSION_VAR}=sess-b {CLAUDE_PID}={} \"$CLERK\" \
                          acquire shared --for 1m < /dev/null",
                         beta.display(),
-                        std::process::id()
+                        env.own_host("sess-b", &beta)
                     ));
                     assert!(
                         shown.contains(
@@ -5986,6 +6106,7 @@ mod cli {
                     let beta = linked_elsewhere(&env);
                     let error = error_of(
                         env.agent("sess-b", &beta)
+                            .env(CLAUDE_PID, env.own_host("sess-b", &beta).to_string())
                             .args(["acquire", "a-board/u", "--for", "1m"]),
                         3,
                     );

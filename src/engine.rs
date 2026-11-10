@@ -35,7 +35,7 @@ use crate::config::Config;
 use crate::error::ErrorCode;
 use crate::inventory::{Inventory, InventoryError, PromotionError, Promotions};
 use crate::model::{HolderRef, Host, NoticeId};
-use crate::scheduler::session::Sessions;
+use crate::scheduler::session::{Hosting, Sessions};
 use crate::scheduler::{HealthProbe, Scheduler, SchedulerError, liveness};
 use crate::store::notices::{self, Notice, NoticeFilter};
 use crate::store::{Store, StoreError};
@@ -122,6 +122,26 @@ impl ApiError {
     #[must_use]
     pub fn invalid_argument(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Invalid, "invalid_argument", message)
+    }
+
+    /// `session_not_hosted`: `session` may not hold anything, because no
+    /// running process is known to run it, or (`hosting`) the calling
+    /// process runs another session.
+    #[must_use]
+    pub fn session_not_hosted(session: &str, hosting: &Hosting) -> Self {
+        let why = match hosting {
+            Hosting::HostRunsOther(other) => {
+                format!("the calling process runs agent session {other} now")
+            }
+            Hosting::Hosted | Hosting::NotHosted => {
+                "the clerk knows no running process for it".to_owned()
+            }
+        };
+        Self::new(
+            ErrorKind::Conflict,
+            "session_not_hosted",
+            format!("agent session {session} cannot hold leases: {why}"),
+        )
     }
 
     /// `scope_not_allowed`: an agent session asked for scopes beyond its
@@ -255,7 +275,7 @@ type Reply<T> = oneshot::Sender<Result<T, ApiError>>;
 /// Work for the engine thread.
 enum Job {
     /// An RPC command.
-    Command(Box<Command>, Reply<Value>),
+    Command(Box<Command>, Option<Host>, Reply<Value>),
     /// Deliver up to [`NOTICE_BATCH`] pending notices of a holder (with a
     /// filter, only those it matches).
     TakeNotices(HolderRef, Option<NoticeFilter>, Reply<Vec<Notice>>),
@@ -269,8 +289,8 @@ enum Job {
     PendingNotices(HolderRef, Reply<Vec<Notice>>),
     /// An agent call or hook reported the process running a session.
     ReportHost(String, Host, Reply<()>),
-    /// May a notice wait of a session from a host run? (See
-    /// [`Sessions::admit_wait`].)
+    /// May a notice wait of a session from a host run? Only while the host
+    /// does not run another session ([`Sessions::touch`]).
     AdmitWait(String, Host, Reply<bool>),
     /// Whether an agent session has a running host.
     SessionAlive(String, Reply<bool>),
@@ -494,7 +514,18 @@ const GOING_STOP: u8 = 1;
 const GOING_RESTART: u8 = 2;
 
 impl EngineHandle {
-    /// Run `command` on the engine thread.
+    /// Run `command` on the engine thread, from no known process: see
+    /// [`EngineHandle::call_from`].
+    ///
+    /// # Errors
+    /// As [`EngineHandle::call_from`].
+    pub async fn call(&self, command: Command) -> Result<Value, ApiError> {
+        self.call_from(command, None).await
+    }
+
+    /// Run `command` on the engine thread; `host` is the process running
+    /// the calling agent session, if it is one and said so
+    /// ([`Sessions::touch`]).
     ///
     /// A mutating command replies as soon as its own transaction commits;
     /// the follow-up tick and dispatch run after the reply. The engine is
@@ -502,9 +533,10 @@ impl EngineHandle {
     /// their effects.
     ///
     /// # Errors
-    /// The command's [`ApiError`], or `engine_unavailable` when the engine
-    /// has stopped.
-    pub async fn call(&self, command: Command) -> Result<Value, ApiError> {
+    /// The command's [`ApiError`] (`session_not_hosted` for an agent session
+    /// that may not hold what it asks for), or `engine_unavailable` when the
+    /// engine has stopped.
+    pub async fn call_from(&self, command: Command, host: Option<Host>) -> Result<Value, ApiError> {
         // The first stop says how; a later one (the shutdown's own) does
         // not change it.
         let marked = match &command {
@@ -513,7 +545,7 @@ impl EngineHandle {
         };
         let (reply, answer) = oneshot::channel();
         self.jobs
-            .send(Job::Command(Box::new(command), reply))
+            .send(Job::Command(Box::new(command), host, reply))
             .map_err(|_| ApiError::unavailable())?;
         let result = answer.await.map_err(|_| ApiError::unavailable())?;
         if marked && result.is_err() {
@@ -1054,7 +1086,7 @@ impl Engine {
 
     fn handle(&mut self, job: Job) {
         match job {
-            Job::Command(command, reply) => self.handle_command(*command, reply),
+            Job::Command(command, host, reply) => self.handle_command(*command, host, reply),
             Job::TakeNotices(holder, filter, reply) => {
                 let result = self.guarded("take_notices", |engine| {
                     let now = engine.clock.now_ms();
@@ -1092,7 +1124,9 @@ impl Engine {
                     Ok(engine
                         .sessions
                         .transact(&mut engine.store, |tx, sessions| {
-                            sessions.admit_wait(tx, &session_id, host, now)
+                            sessions
+                                .touch(tx, &session_id, Some(host), now)
+                                .map(|hosting| hosting == Hosting::Hosted)
                         })?)
                 });
                 let _ = reply.send(result);
@@ -1103,7 +1137,7 @@ impl Engine {
                     engine
                         .sessions
                         .transact(&mut engine.store, |tx, sessions| {
-                            sessions.touch(tx, &session_id, host, now)
+                            sessions.touch(tx, &session_id, Some(host), now)
                         })?;
                     Ok(())
                 });
@@ -1130,7 +1164,7 @@ impl Engine {
     }
 
     /// Run an RPC command for its caller and answer `reply`.
-    fn handle_command(&mut self, command: Command, reply: Reply<Value>) {
+    fn handle_command(&mut self, command: Command, host: Option<Host>, reply: Reply<Value>) {
         // Reads see overdue deadlines processed.
         if self.deadline_due() {
             self.maintain();
@@ -1138,7 +1172,7 @@ impl Engine {
         let method = command.method();
         let mutating = !command.read_only();
         let stop = matches!(command, Command::DaemonStop(..));
-        let result = self.guarded(method, |engine| engine.execute(command));
+        let result = self.guarded(method, |engine| engine.execute(command, host));
         if stop && result.is_ok() {
             self.stopping = true;
         }
@@ -1162,7 +1196,9 @@ impl Engine {
         })
     }
 
-    fn execute(&mut self, command: Command) -> Result<Value, ApiError> {
+    fn execute(&mut self, command: Command, host: Option<Host>) -> Result<Value, ApiError> {
+        let hosting = self.touch_caller(&command, host)?;
+        command.validate_hosting(hosting.as_ref(), &self.sessions)?;
         let services = Services {
             inventory: &self.inventory,
             promotions: &self.promotions,
@@ -1170,6 +1206,24 @@ impl Engine {
             now_ms: self.clock.now_ms(),
         };
         self.store.tx(|tx| command.run(tx, &services))
+    }
+
+    /// Record that `command`'s caller, when an agent session, called from
+    /// `host`, in its own transaction: a call counts even when the command
+    /// then fails. `None` for any other caller.
+    fn touch_caller(
+        &mut self,
+        command: &Command,
+        host: Option<Host>,
+    ) -> Result<Option<Hosting>, ApiError> {
+        let HolderRef::AgentSession { session_id } = &command.caller().holder else {
+            return Ok(None);
+        };
+        let now = self.clock.now_ms();
+        let hosting = self.sessions.transact(&mut self.store, |tx, sessions| {
+            sessions.touch(tx, session_id, host, now)
+        })?;
+        Ok(Some(hosting))
     }
 
     /// Process due deadlines and dispatch, in one transaction, and remember
@@ -1195,13 +1249,18 @@ impl Engine {
     }
 
     /// End the leases and requests of CLI-process holders that are gone,
-    /// and start the grace of agent sessions whose host process is gone.
+    /// and start the grace of agent sessions whose host process is gone
+    /// and of agent holders with leases and no host at all.
     fn probe(&mut self) {
         let hosts = self.guarded("host probe", |engine| {
             let now = engine.clock.now_ms();
             Ok(engine
                 .sessions
-                .transact(&mut engine.store, |tx, sessions| sessions.probe(tx, now))?)
+                .transact(&mut engine.store, |tx, sessions| {
+                    let mut gone = sessions.probe(tx, now)?;
+                    gone.extend(sessions.sweep_hostless(tx, now)?);
+                    Ok::<_, StoreError>(gone)
+                })?)
         });
         match hosts {
             Ok(gone) if gone.is_empty() => {}

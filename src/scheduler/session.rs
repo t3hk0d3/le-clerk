@@ -22,9 +22,12 @@
 //! on report(s, h):  (hooks) for t != s with h in hosts[t]: remove h;
 //!                   if hosts[t] empty: grace[t] = now + grace
 //!                   add h to hosts[s]; cancel grace[s]
-//! on touch(s, h):   (calls) if h in hosts[t] for some t != s and not in
-//!                   hosts[s]: nothing; else as report without the removal
-//! on probe:         remove dead hosts; a session left empty: grace starts
+//! on touch(s, h):   (calls) no h: not hosted; if h in hosts[t] for some
+//!                   t != s and not in hosts[s]: nothing, h runs t; else as
+//!                   report without the removal
+//! on probe:         remove dead hosts; a session left empty: grace starts;
+//!                   every AgentSession with live leases, no host and no
+//!                   grace: grace starts (sweep_hostless)
 //! on end(s, h):     remove h; if hosts[s] empty: end now (no grace)
 //! on tick(now):     for s with grace[s] <= now: end_holder(AgentSession(s)); forget s
 //! on daemon start:  hosts loaded from the store; every AgentSession with live
@@ -55,6 +58,18 @@ pub struct Reported {
     /// The sessions the reporting process ran before and left, which have
     /// no host left and whose grace started.
     pub unhosted: Vec<String>,
+}
+
+/// Whether the process behind a call runs the calling session
+/// ([`Sessions::touch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hosting {
+    /// The process is one of the session's hosts.
+    Hosted,
+    /// The call named no process.
+    NotHosted,
+    /// The process runs this other session now.
+    HostRunsOther(String),
 }
 
 /// One agent session as the liveness record knows it.
@@ -139,11 +154,13 @@ impl Sessions {
     }
 
     /// A call of `session_id` (a CLI command, a notice wait) came from
-    /// `host` at `now_ms`. It never takes a process back from the session
-    /// it runs now (a call left over from before `/clear` must not undo
-    /// it): `false`, changing nothing, when `host` runs another session and
-    /// not this one. Otherwise `host` is recorded as one of the session's
-    /// hosts (a call may be the first of a resumed session) and `true`.
+    /// `host` at `now_ms`; what that says about its hosting. It never takes
+    /// a process back from the session it runs now (a call left over from
+    /// before `/clear` must not undo it): [`Hosting::HostRunsOther`],
+    /// changing nothing, when `host` runs another session and not this
+    /// one. Otherwise `host` is recorded as one of the session's hosts (a
+    /// call may be the first of a resumed session). A call that names no
+    /// process is [`Hosting::NotHosted`], whatever hosts the session has.
     ///
     /// # Errors
     /// [`StoreError`] on storage failure.
@@ -151,36 +168,26 @@ impl Sessions {
         &mut self,
         tx: &Tx,
         session_id: &str,
-        host: Host,
+        host: Option<Host>,
         now_ms: i64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Hosting, StoreError> {
+        let Some(host) = host else {
+            return Ok(Hosting::NotHosted);
+        };
         if self.hosts_of(session_id).contains(&host) {
-            return Ok(true);
+            return Ok(Hosting::Hosted);
         }
-        let elsewhere = self
+        let other = self
             .known
             .iter()
-            .any(|(id, s)| id.as_str() != session_id && s.hosts.contains(&host));
-        if elsewhere {
-            return Ok(false);
+            .filter(|(id, s)| id.as_str() != session_id && s.hosts.contains(&host))
+            .map(|(id, _)| id)
+            .min();
+        if let Some(other) = other {
+            return Ok(Hosting::HostRunsOther(other.clone()));
         }
         self.add(tx, session_id, host, now_ms)?;
-        Ok(true)
-    }
-
-    /// Whether a notice wait of `session_id` from `host` may run: as
-    /// [`Sessions::touch`].
-    ///
-    /// # Errors
-    /// [`StoreError`] on storage failure.
-    pub fn admit_wait(
-        &mut self,
-        tx: &Tx,
-        session_id: &str,
-        host: Host,
-        now_ms: i64,
-    ) -> Result<bool, StoreError> {
-        self.touch(tx, session_id, host, now_ms)
+        Ok(Hosting::Hosted)
     }
 
     /// Add `host` to `session_id`'s hosts and cancel its grace.
@@ -240,6 +247,28 @@ impl Sessions {
             }
         }
         Ok(gone)
+    }
+
+    /// Every `AgentSession` holder with a live lease and neither a host nor
+    /// a running grace gets the grace from `now_ms`, so no lease outlives
+    /// its holder unnoticed. Returns the sessions graced.
+    ///
+    /// # Errors
+    /// [`StoreError`] on storage failure.
+    pub fn sweep_hostless(&mut self, tx: &Tx, now_ms: i64) -> Result<Vec<String>, StoreError> {
+        let until = now_ms.saturating_add(self.grace_ms);
+        let mut graced = Vec::new();
+        for lease in leases::live_leases(tx)? {
+            let HolderRef::AgentSession { session_id } = lease.holder else {
+                continue;
+            };
+            let session = self.known.entry(session_id.clone()).or_default();
+            if session.hosts.is_empty() && session.grace_until.is_none() {
+                session.grace_until = Some(until);
+                graced.push(session_id);
+            }
+        }
+        Ok(graced)
     }
 
     /// True while `session_id` has a host (whose process ran at the last

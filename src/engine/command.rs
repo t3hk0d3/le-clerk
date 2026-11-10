@@ -23,7 +23,7 @@ use crate::model::{
     Caller, HealthSpec, HolderRef, Host, LeaseId, NoticeId, Priority, ProjectKey, PromotionId,
     RequestId, ResourceId, ResourceType, Scope, UnitId, UnitSettings,
 };
-use crate::scheduler::session::Sessions;
+use crate::scheduler::session::{Hosting, Sessions};
 use crate::scheduler::{AcquireRequest, Confirm, LeaseEdit, Scheduler, Target};
 use crate::store::inventory::{self as inventory_sql, ScopeFilter};
 use crate::store::leases as leases_sql;
@@ -608,6 +608,39 @@ impl Command {
             && let Some(what) = self.beyond_own_scopes()
         {
             return Err(ApiError::scope_not_allowed(what));
+        }
+        Ok(())
+    }
+
+    /// Checks that need the liveness record: an agent session may hold or
+    /// be handed a lease only while a running process is known to run it,
+    /// so that its leases end when that process does. `hosting` is what the
+    /// call said about the caller, when it is an agent session.
+    pub(crate) fn validate_hosting(
+        &self,
+        hosting: Option<&Hosting>,
+        sessions: &Sessions,
+    ) -> Result<(), ApiError> {
+        if !matches!(
+            self,
+            Self::Acquire(..) | Self::Claim(..) | Self::RehomeHolder(..)
+        ) {
+            return Ok(());
+        }
+        if let (HolderRef::AgentSession { session_id }, Some(hosting)) =
+            (&self.caller().holder, hosting)
+            && *hosting != Hosting::Hosted
+        {
+            return Err(ApiError::session_not_hosted(session_id, hosting));
+        }
+        if let Self::RehomeHolder(_, args) = self
+            && let HolderRef::AgentSession { session_id } = &args.new_holder
+            && !sessions.is_alive(session_id)
+        {
+            return Err(ApiError::session_not_hosted(
+                session_id,
+                &Hosting::NotHosted,
+            ));
         }
         Ok(())
     }

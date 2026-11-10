@@ -338,6 +338,63 @@ mod cli {
             }
         }
 
+        /// A missed `/clear` is healed by the next hook, whichever it is.
+        mod any_session_rpc {
+            use super::*;
+
+            const REPORTING: [&str; 3] = ["pre-tool-use", "stop", "session-start"];
+
+            mod on_a_session_whose_process_was_listed_under_the_pre_clear_session {
+                use super::*;
+
+                /// A clerk home with a short grace and `board/u1`.
+                fn graced() -> Env {
+                    let env = Env::new();
+                    let config = env.home().join("config");
+                    fs::create_dir_all(&config).unwrap();
+                    fs::write(config.join("config.toml"), "reconnect_grace = 1\n").unwrap();
+                    seed(&env);
+                    env
+                }
+
+                fn until_no_leases(env: &Env, what: &str) {
+                    let until = Instant::now() + PATIENCE;
+                    while live_leases(env) != 0 {
+                        assert!(Instant::now() < until, "{what}: a lease never ended");
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+
+                #[test]
+                fn moves_the_host_to_the_reported_session() {
+                    for event in REPORTING {
+                        let env = graced();
+                        let host = Host::spawn();
+                        holds(&env, "old", &host);
+                        run_hook(env.home(), event, &typical(event, "new"), Some(host.pid()));
+                        // The old session lost its only host, though the
+                        // process still runs: its grace runs out.
+                        until_no_leases(&env, event);
+                    }
+                }
+
+                #[test]
+                fn the_next_acquire_is_granted_and_hosted() {
+                    for event in REPORTING {
+                        let env = graced();
+                        let host = Host::spawn();
+                        let (body, code) = agent(&env, "old", &host, &["leases", "--mine"]);
+                        assert_eq!(code, Some(0), "{body}");
+                        run_hook(env.home(), event, &typical(event, "new"), Some(host.pid()));
+                        holds(&env, "new", &host);
+                        assert_eq!(live_leases(&env), 1, "{event}");
+                        drop(host);
+                        until_no_leases(&env, event);
+                    }
+                }
+            }
+        }
+
         mod session_start {
             use super::*;
 

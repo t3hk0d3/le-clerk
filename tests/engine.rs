@@ -9,9 +9,10 @@ use leclerk::daemon::server as http;
 use leclerk::engine::{ApiError, Command, Engine, EngineHandle, EngineOptions, MAX_WAIT};
 use leclerk::health::HealthResult;
 use leclerk::model::{
-    Caller, HealthSpec, HolderRef, LeaseId, NoticeId, ProjectKey, ResourceId, UnitId, UnitSettings,
+    Caller, HealthSpec, HolderRef, Host, LeaseId, NoticeId, ProjectKey, ResourceId, UnitId,
+    UnitSettings,
 };
-use leclerk::scheduler::HealthProbe;
+use leclerk::scheduler::{HealthProbe, liveness};
 use leclerk::store::Store;
 use leclerk::store::notices::{Notice, NoticeFilter, NoticeKind};
 use serde_json::{Value, json};
@@ -88,13 +89,22 @@ fn in_project(tag: &str, project: &str) -> Caller {
     }
 }
 
+/// This test process, standing for the Claude Code process of the agent
+/// sessions a test calls as.
+fn me() -> Host {
+    let pid = std::process::id();
+    let start_time = liveness::start_time(pid).expect("this process is running");
+    Host { pid, start_time }
+}
+
 async fn rpc(
     h: &EngineHandle,
     method: &str,
     caller: &Caller,
     args: Value,
 ) -> Result<Value, ApiError> {
-    h.call(Command::parse(method, caller.clone(), args)?).await
+    h.call_from(Command::parse(method, caller.clone(), args)?, Some(me()))
+        .await
 }
 
 async fn ok(h: &EngineHandle, method: &str, caller: &Caller, args: Value) -> Value {

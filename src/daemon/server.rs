@@ -150,14 +150,11 @@ async fn rpc(
             Err(e) => e.into_response(),
         };
     }
-    if let Err(e) = report(&engine, &request.caller.holder, request.host).await {
-        return e.into_response();
-    }
     let command = match Command::parse(&method, request.caller, request.args) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
-    match engine.call(command).await {
+    match engine.call_from(command, request.host).await {
         Ok(result) => ok(result),
         Err(e) => e.into_response(),
     }

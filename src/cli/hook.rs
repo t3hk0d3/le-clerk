@@ -11,9 +11,13 @@
 //!   1.5 s for session-end (whose RPC gets at most [`END_RPC_LIMIT`]).
 //! - stdout carries only the documented hook output, or nothing.
 //!
+//! Every session RPC reports the session's host (the Claude Code process),
+//! which unhosts the session that process ran before (`/clear`), so the
+//! next hook heals a `/clear` whose own hooks never reached the daemon.
+//!
 //! Per event:
-//! - session-start: reports the session's host (the Claude Code process),
-//!   which unhosts the session that process ran before (`/clear`).
+//! - session-start: only the report, and a brief after `/clear`, a compact
+//!   or a resume.
 //! - stop: a block decision telling the agent to start `clerk wait`, when
 //!   the session holds a live lease or a queued request, has no open wait,
 //!   and `stop_hook_active` is false.

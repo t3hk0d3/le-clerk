@@ -8,8 +8,10 @@ use leclerk::clock::ManualClock;
 use leclerk::config::Config;
 use leclerk::engine::{ApiError, Command, Engine, EngineHandle, EngineOptions};
 use leclerk::health::HealthResult;
-use leclerk::model::{Caller, HealthSpec, HolderRef, ProjectKey, ResourceId, UnitId, UnitSettings};
-use leclerk::scheduler::HealthProbe;
+use leclerk::model::{
+    Caller, HealthSpec, HolderRef, Host, ProjectKey, ResourceId, UnitId, UnitSettings,
+};
+use leclerk::scheduler::{HealthProbe, liveness};
 use leclerk::store::Store;
 use leclerk::store::notices::{Notice, NoticeKind};
 use serde_json::{Value, json};
@@ -103,13 +105,22 @@ fn admin() -> Caller {
     }
 }
 
+/// This test process, standing for the Claude Code process of the agent
+/// sessions a test calls as.
+fn me() -> Host {
+    let pid = std::process::id();
+    let start_time = liveness::start_time(pid).expect("this process is running");
+    Host { pid, start_time }
+}
+
 async fn rpc(
     h: &EngineHandle,
     method: &str,
     caller: &Caller,
     args: Value,
 ) -> Result<Value, ApiError> {
-    h.call(Command::parse(method, caller.clone(), args)?).await
+    h.call_from(Command::parse(method, caller.clone(), args)?, Some(me()))
+        .await
 }
 
 async fn ok(h: &EngineHandle, method: &str, caller: &Caller, args: Value) -> Value {
@@ -2172,6 +2183,7 @@ mod rehome_holder {
             // Past the warning lead: an expiry warning waits for `a`.
             clock.set(T0 + 500_000);
             ok(&h, "status", &user("a"), json!({})).await;
+            h.report_host("s9".into(), me()).await.unwrap();
             ok(
                 &h,
                 "rehome_holder",
@@ -2222,6 +2234,7 @@ mod rehome_holder {
             })
             .await
             .unwrap();
+            h.report_host("s9".into(), me()).await.unwrap();
             ok(
                 &h,
                 "rehome_holder",

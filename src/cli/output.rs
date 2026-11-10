@@ -549,6 +549,7 @@ mod tests {
                     "no_units",
                     "retiring",
                     "scope_not_allowed",
+                    "session_not_hosted",
                 ],
             ),
         ];
