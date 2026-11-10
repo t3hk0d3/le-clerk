@@ -220,6 +220,17 @@ pub struct AcquireArgs {
     pub skip_checks: bool,
 }
 
+/// `daemon_stop`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStopArgs {
+    /// A restart: clients waiting on the daemon reconnect to the next one
+    /// instead of giving up. Sent only when true, so a daemon that predates
+    /// it still stops.
+    #[serde(default)]
+    pub restart: bool,
+}
+
 /// `claim`, `release`, `refuse_yield`, `reclaim`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -515,7 +526,7 @@ commands! {
     /// Audit log entries, newest first.
     ListAudit(AuditArgs) = "list_audit", read_only: true;
     /// Stop the engine after answering (used by `clerk daemon stop`).
-    DaemonStop(NoArgs) = "daemon_stop", read_only: false;
+    DaemonStop(DaemonStopArgs) = "daemon_stop", read_only: false;
     /// End a lease now, unit dirty (`admin_forced`).
     AdminRelease(LeaseArgs) = "admin_release", read_only: false;
     /// End every lease and request of a holder.
@@ -869,8 +880,14 @@ impl Command {
                         .collect::<Vec<_>>(),
                 )
             }
-            Self::DaemonStop(who, NoArgs {}) => {
-                audit::record(tx, s.now_ms, &who, "daemon_stop", &json!({}))?;
+            Self::DaemonStop(who, a) => {
+                audit::record(
+                    tx,
+                    s.now_ms,
+                    &who,
+                    "daemon_stop",
+                    &json!({ "restart": a.restart }),
+                )?;
                 Ok(json!({ "stopping": true }))
             }
             Self::RehomeHolder(who, a) => encode(LeaseView::from(sched.rehome_holder(

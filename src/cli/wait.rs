@@ -82,7 +82,13 @@ async fn steps(
             return finish(md, args, &empty(&["No notices arrived before --timeout."]));
         }
         let step = tokio::select! {
-            got = client.agent_wait(session_id, host, STEP.as_secs(), first, arm) => got?,
+            got = client.agent_wait(session_id, host, STEP.as_secs(), first, arm) => match got {
+                Ok(step) => step,
+                Err(e) => return match daemon_gone(&e) {
+                    Some(why) => finish(md, args, &why),
+                    None => Err(e.into()),
+                },
+            },
             _ = term.recv() => return finish(md, args, &stopped()),
             _ = int.recv() => return finish(md, args, &stopped()),
         };
@@ -245,6 +251,33 @@ fn ended(why: &str) -> Value {
         "claimed": [],
         "summary": [format!("The wait ended: {why}.")],
         "next": "Nothing for this session; a new session arms its own wait.",
+    })
+}
+
+/// What a wait prints when the daemon went away for good: stopped, or
+/// replaced by one speaking another protocol (a restart is ridden out inside
+/// the client). `None` for any other error.
+fn daemon_gone(e: &leclerk::client::ApiError) -> Option<Value> {
+    match e.code.as_str() {
+        "daemon_stopping" => Some(gone(
+            "the clerk daemon was stopped",
+            "Tell the user the clerk daemon is stopped; arm a wait again once it runs.",
+        )),
+        "protocol_mismatch" => Some(gone(
+            "the clerk was upgraded to a version this wait cannot talk to",
+            "Start the wait again (the new `clerk` on PATH speaks the new protocol).",
+        )),
+        _ => None,
+    }
+}
+
+/// The daemon went away for good (`why`); `next` says what to do.
+fn gone(why: &str, next: &str) -> Value {
+    json!({
+        "notices": [],
+        "claimed": [],
+        "summary": [format!("The wait ended: {why}.")],
+        "next": next,
     })
 }
 

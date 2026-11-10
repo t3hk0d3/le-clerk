@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 use crate::clock::{Clock, SystemClock};
 use crate::config::{Config, Paths, SocketPathTooLong, check_socket_path};
 use crate::daemon::server::{self, ServerInfo};
-use crate::engine::{Command, Engine, EngineHandle, NoArgs};
+use crate::engine::{Command, DaemonStopArgs, Engine, EngineHandle};
 use crate::health::HealthChecker;
 use crate::model::{Caller, HolderRef};
 use crate::scheduler::{Scheduler, SchedulerError};
@@ -221,7 +221,10 @@ async fn serve(
 /// Stop the engine (a no-op once it has stopped) and wait for its thread.
 async fn stop_engine(engine: &EngineHandle) {
     let _ = engine
-        .call(Command::DaemonStop(daemon_caller(), NoArgs {}))
+        .call(Command::DaemonStop(
+            daemon_caller(),
+            DaemonStopArgs::default(),
+        ))
         .await;
     engine.stopped().await;
 }

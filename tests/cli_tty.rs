@@ -244,18 +244,20 @@ mod cli {
                     assert_eq!(occupancy["holder"]["kind"], "cli_process", "{occupancy}");
                 }
 
+                /// The restart is announced and ridden out inside the
+                /// client: no "Cannot reach" message.
                 #[test]
-                fn says_it_lost_contact() {
+                fn rides_it_out_without_losing_contact() {
                     let env = Env::new();
                     let (tty, _) = restarted(&env);
-                    tty.expect("Cannot reach the clerk daemon");
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    assert!(!tty.shown().contains("Cannot reach"), "{}", tty.shown());
                 }
 
                 #[test]
                 fn still_shows_notices() {
                     let env = Env::new();
                     let (tty, _) = restarted(&env);
-                    tty.expect("Cannot reach the clerk daemon");
                     override_board(&env);
                     tty.expect("overridden");
                 }

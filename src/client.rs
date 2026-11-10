@@ -45,6 +45,12 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SPAWNS: u32 = 2;
 /// First and longest pause between connection attempts.
 const BACKOFF_MIN: Duration = Duration::from_millis(10);
+/// How long a waiting client keeps trying to reach the daemon again after
+/// it went away (see [`Client::reconnect`]).
+pub const RECONNECT_FOR: Duration = Duration::from_secs(30);
+/// How long a reconnecting client waits for the daemon to come back by
+/// itself before it starts one.
+pub const RECONNECT_START_AFTER: Duration = Duration::from_secs(3);
 const BACKOFF_MAX: Duration = Duration::from_millis(200);
 
 /// Why no usable daemon could be reached.
@@ -276,6 +282,8 @@ pub fn cli_caller() -> Caller {
 /// A connection to a running daemon of this client's version.
 #[derive(Debug, Clone)]
 pub struct Client {
+    /// Where the daemon lives, to reconnect to it (see [`Client::reconnect`]).
+    paths: Paths,
     socket: PathBuf,
     daemon: DaemonInfo,
     /// The agent session's host, sent with every request (see
@@ -302,6 +310,7 @@ impl Client {
         let daemon = Self::probe_within(paths, limit).await?;
         daemon.check()?;
         Ok(Self {
+            paths: paths.clone(),
             socket: paths.socket.clone(),
             daemon,
             host: None,
@@ -421,25 +430,42 @@ impl Client {
     /// [`DaemonError::Unresponsive`] when a daemon holds the lock but does
     /// not answer. Only a free lock with nothing answering is "not running".
     pub async fn stop(paths: &Paths, caller: &Caller) -> Result<Option<DaemonInfo>, DaemonError> {
+        Self::stop_for(paths, caller, false).await
+    }
+
+    /// [`Client::stop`]; with `restart`, the daemon announces a restart to
+    /// the clients waiting on it, so they reconnect instead of giving up.
+    async fn stop_for(
+        paths: &Paths,
+        caller: &Caller,
+        restart: bool,
+    ) -> Result<Option<DaemonInfo>, DaemonError> {
         let daemon = match Self::probe(paths).await {
             Ok(d) => d,
             Err(DaemonError::Unavailable) => return Ok(None),
             Err(e) => return Err(e),
         };
         let client = Self {
+            paths: paths.clone(),
             socket: paths.socket.clone(),
             daemon,
             host: None,
         };
         let deadline = Instant::now() + STOP_TIMEOUT;
-        let asked = client
-            .request(
-                "daemon_stop",
-                caller,
-                json!({}),
-                deadline.saturating_duration_since(Instant::now()),
-            )
-            .await;
+        let left = || deadline.saturating_duration_since(Instant::now());
+        // `restart` is sent only when set; a daemon that predates it refuses
+        // the field, and is then asked to stop plainly.
+        let args = if restart {
+            json!({ "restart": true })
+        } else {
+            json!({})
+        };
+        let mut asked = client.request("daemon_stop", caller, args, left()).await;
+        if restart && asked.as_ref().is_err_and(|e| e.code == "invalid_request") {
+            asked = client
+                .request("daemon_stop", caller, json!({}), left())
+                .await;
+        }
         if let Err(e) = asked {
             tracing::warn!(error = %e, "daemon_stop failed");
             return Err(DaemonError::Unavailable);
@@ -460,8 +486,46 @@ impl Client {
     /// # Errors
     /// As [`Client::stop`] and [`Client::ensure_running`].
     pub async fn restart(paths: &Paths, caller: &Caller) -> Result<Self, DaemonError> {
-        Self::stop(paths, caller).await?;
+        Self::stop_for(paths, caller, true).await?;
         Self::ensure_running(paths).await
+    }
+
+    /// After the daemon went away (a restart it announced, or a lost
+    /// connection): wait until a daemon answers again, then check it speaks
+    /// this client's protocol. A daemon is started when none is back after
+    /// [`RECONNECT_START_AFTER`] (it crashed, or the restart's own start
+    /// failed); gives up after [`RECONNECT_FOR`].
+    ///
+    /// # Errors
+    /// `protocol_mismatch` when the daemon that answers speaks another
+    /// protocol; `daemon_unavailable` when none answers in time.
+    pub async fn reconnect(&self) -> Result<(), ApiError> {
+        let started_at = Instant::now();
+        let mut pause = BACKOFF_MIN;
+        let mut started = false;
+        loop {
+            let found = match Self::probe_within(&self.paths, PROBE_TIMEOUT).await {
+                Ok(d) => Some(d),
+                Err(_) if !started && started_at.elapsed() >= RECONNECT_START_AFTER => {
+                    started = true;
+                    Self::ensure_running(&self.paths)
+                        .await
+                        .ok()
+                        .map(|c| c.daemon)
+                }
+                Err(_) => None,
+            };
+            if let Some(d) = found {
+                return d
+                    .check()
+                    .map_err(|e| ApiError::new(e.code(), e.to_string()));
+            }
+            if started_at.elapsed() >= RECONNECT_FOR {
+                return Err(ApiError::unavailable(&"the clerk daemon did not come back"));
+            }
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(BACKOFF_MAX);
+        }
     }
 
     /// The daemon this client talks to.
@@ -554,6 +618,21 @@ impl Client {
         filter: Option<&NoticeFilter>,
         secs: u64,
     ) -> Result<Vec<Notice>, ApiError> {
+        loop {
+            match self.wait_notices_once(holder, filter, secs).await {
+                Err(e) if reconnects(&e.code) => self.reconnect().await?,
+                other => return other,
+            }
+        }
+    }
+
+    /// One [`Client::wait_notices_matching`] request.
+    async fn wait_notices_once(
+        &self,
+        holder: &HolderRef,
+        filter: Option<&NoticeFilter>,
+        secs: u64,
+    ) -> Result<Vec<Notice>, ApiError> {
         let holder = serde_json::to_string(holder)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let mut params = vec![("holder", holder), ("wait", secs.to_string())];
@@ -595,6 +674,23 @@ impl Client {
     /// # Errors
     /// As [`Client::call`].
     pub async fn agent_wait(
+        &self,
+        session: &str,
+        host: Host,
+        secs: u64,
+        first: bool,
+        arm: &str,
+    ) -> Result<Value, ApiError> {
+        loop {
+            match self.agent_wait_once(session, host, secs, first, arm).await {
+                Err(e) if reconnects(&e.code) => self.reconnect().await?,
+                other => return other,
+            }
+        }
+    }
+
+    /// One [`Client::agent_wait`] request.
+    async fn agent_wait_once(
         &self,
         session: &str,
         host: Host,
@@ -663,6 +759,15 @@ impl Client {
         .map_err(|e| ApiError::unavailable(&e))?;
         decode(status, &body)
     }
+}
+
+/// Whether a waiting client meeting error `code` reconnects (the daemon
+/// announced a restart, or went away without a word) rather than giving up.
+fn reconnects(code: &str) -> bool {
+    matches!(
+        code,
+        "daemon_restarting" | "daemon_unavailable" | "engine_unavailable"
+    )
 }
 
 /// Why a daemon did not answer: [`DaemonError::Unavailable`] when nothing

@@ -483,7 +483,15 @@ pub struct EngineHandle {
     open_waits: Arc<OpenWaits>,
     config: Arc<Config>,
     clock: Arc<dyn Clock>,
+    /// How the daemon is going away, once `daemon_stop` was called:
+    /// [`GOING_STOP`] or [`GOING_RESTART`] (0 while it runs).
+    going: Arc<std::sync::atomic::AtomicU8>,
 }
+
+/// [`EngineHandle`]'s `going` for a stop.
+const GOING_STOP: u8 = 1;
+/// [`EngineHandle`]'s `going` for a restart.
+const GOING_RESTART: u8 = 2;
 
 impl EngineHandle {
     /// Run `command` on the engine thread.
@@ -497,6 +505,17 @@ impl EngineHandle {
     /// The command's [`ApiError`], or `engine_unavailable` when the engine
     /// has stopped.
     pub async fn call(&self, command: Command) -> Result<Value, ApiError> {
+        if let Command::DaemonStop(_, a) = &command {
+            let going = if a.restart { GOING_RESTART } else { GOING_STOP };
+            // The first stop says how; a later one (the shutdown's own)
+            // does not change it.
+            let _ = self.going.compare_exchange(
+                0,
+                going,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
         let (reply, answer) = oneshot::channel();
         self.jobs
             .send(Job::Command(Box::new(command), reply))
@@ -535,8 +554,28 @@ impl EngineHandle {
                 let got = self.take(holder.clone(), filter.clone()).await?;
                 Ok((!got.is_empty()).then_some(got))
             })
-            .await?;
+            .await
+            .map_err(|e| self.announced(e))?;
         Ok(got.unwrap_or_default())
+    }
+
+    /// `e`, or once the daemon is going away, what it announces to waiting
+    /// clients instead: `daemon_restarting` (reconnect) or
+    /// `daemon_stopping` (give up).
+    fn announced(&self, e: ApiError) -> ApiError {
+        match self.going.load(std::sync::atomic::Ordering::SeqCst) {
+            GOING_RESTART => ApiError::new(
+                ErrorKind::Unavailable,
+                "daemon_restarting",
+                "the clerk daemon is restarting; reconnect in a moment",
+            ),
+            GOING_STOP => ApiError::new(
+                ErrorKind::Unavailable,
+                "daemon_stopping",
+                "the clerk daemon was stopped",
+            ),
+            _ => e,
+        }
     }
 
     /// Run `check` now and again whenever `holder` gets a notice, until it
@@ -681,7 +720,9 @@ impl EngineHandle {
             .await;
         self.open_waits
             .hold(&key, &arm, tokio::time::Instant::now() + ARM_HOLD);
-        Ok(got?.map_or(AgentWait::Timeout, AgentWait::Notices))
+        Ok(got
+            .map_err(|e| self.announced(e))?
+            .map_or(AgentWait::Timeout, AgentWait::Notices))
     }
 
     /// The wait with token `arm` of agent session `session_id` ended: it
@@ -862,6 +903,7 @@ impl Engine {
             waiters,
             stopped,
             open_waits: Arc::new(OpenWaits::default()),
+            going: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             config: handle_config,
             clock: handle_clock,
         })

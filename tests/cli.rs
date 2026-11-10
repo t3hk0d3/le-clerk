@@ -4175,6 +4175,102 @@ mod cli {
         }
     }
 
+    /// Graceful restarts: a restart is announced and waiting clients
+    /// reconnect; a stop ends them cleanly.
+    mod daemon_restart_under_waiting_clients {
+        use super::*;
+
+        #[test]
+        fn an_agents_wait_survives_a_restart_and_gets_the_offer() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let theirs = hold(&env, "x");
+            let dir = env.dir("alpha");
+            env.agent("sess-1", &dir)
+                .args(["acquire", "board", "--for", "10m"])
+                .assert()
+                .code(6);
+            let mut wait = spawn(&env, &["wait"], Some("sess-1"));
+            std::thread::sleep(Duration::from_millis(800));
+            env.ok(&["daemon", "restart"]);
+            std::thread::sleep(Duration::from_millis(800));
+            assert!(
+                wait.try_wait().unwrap().is_none(),
+                "the wait died on the restart"
+            );
+            free(&env, "x", &theirs);
+            assert_eq!(code_of(&mut wait), 0);
+            let mut out = String::new();
+            std::io::Read::read_to_string(&mut wait.0.stdout.take().unwrap(), &mut out).unwrap();
+            let body: Value = serde_json::from_str(out.trim()).unwrap();
+            assert_eq!(body["notices"][0]["kind"], "offered", "{body}");
+        }
+
+        #[test]
+        fn an_agents_wait_ends_cleanly_on_a_stop() {
+            let env = Env::new();
+            let dir = env.dir("alpha");
+            env.agent("sess-1", &dir)
+                .args(["leases", "--mine"])
+                .assert()
+                .success();
+            let mut wait = spawn(&env, &["wait"], Some("sess-1"));
+            std::thread::sleep(Duration::from_millis(800));
+            env.ok(&["daemon", "stop"]);
+            assert_eq!(code_of(&mut wait), 0);
+            let mut out = String::new();
+            std::io::Read::read_to_string(&mut wait.0.stdout.take().unwrap(), &mut out).unwrap();
+            let body: Value = serde_json::from_str(out.trim()).unwrap();
+            assert!(
+                body["summary"][0].as_str().unwrap().contains("stopped"),
+                "{body}"
+            );
+        }
+
+        #[test]
+        fn an_agents_wait_ends_cleanly_when_the_new_daemon_speaks_another_protocol() {
+            let env = Env::new();
+            let dir = env.dir("alpha");
+            env.agent("sess-1", &dir)
+                .args(["leases", "--mine"])
+                .assert()
+                .success();
+            let mut wait = spawn(&env, &["wait"], Some("sess-1"));
+            std::thread::sleep(Duration::from_millis(800));
+            let _ = env
+                .cmd()
+                .env("CLERK_TEST_DAEMON_PROTOCOL", "1")
+                .args(["daemon", "restart"])
+                .output()
+                .unwrap();
+            assert_eq!(code_of(&mut wait), 0);
+            let mut out = String::new();
+            std::io::Read::read_to_string(&mut wait.0.stdout.take().unwrap(), &mut out).unwrap();
+            let body: Value = serde_json::from_str(out.trim()).unwrap();
+            assert!(
+                body["summary"][0].as_str().unwrap().contains("upgraded"),
+                "{body}"
+            );
+        }
+
+        #[test]
+        fn acquire_wait_survives_a_restart_and_gets_the_grant() {
+            let env = Env::new();
+            seed(&env, "board", "k1");
+            let theirs = hold(&env, "x");
+            let mut child = spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
+            std::thread::sleep(Duration::from_millis(800));
+            env.ok(&["daemon", "restart"]);
+            std::thread::sleep(Duration::from_millis(800));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "acquire --wait died on the restart"
+            );
+            free(&env, "x", &theirs);
+            assert_eq!(code_of(&mut child), 0);
+        }
+    }
+
     mod agent_md {
         use super::*;
 

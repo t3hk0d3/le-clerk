@@ -129,6 +129,13 @@ Code's limit).
   the background (Claude Code wakes the agent when it completes). Either
   claims offers for the agent and ends when the session's process exits or
   moves to another session. Only one wait per session.
+- **Daemon restarts are ridden out.** `clerk daemon restart` tells the
+  clients waiting on the daemon that it is restarting; they reconnect to the
+  new daemon (starting one themselves if it is not back within a few
+  seconds) and carry on, so agents' waits, `acquire --wait` and the live
+  view keep going. `clerk daemon stop` tells them it stopped: an agent's
+  wait ends cleanly saying so. A client keeps working with a daemon of
+  another version as long as both speak the same protocol.
 
 ### Trust model
 

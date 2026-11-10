@@ -910,7 +910,12 @@ mod daemon {
                 match outcome {
                     Ok(notices) => assert_eq!(notices, Vec::new()),
                     Err(e) => assert!(
-                        ["engine_unavailable", "daemon_unavailable"].contains(&e.code.as_str()),
+                        [
+                            "daemon_stopping",
+                            "engine_unavailable",
+                            "daemon_unavailable"
+                        ]
+                        .contains(&e.code.as_str()),
                         "{e:?}"
                     ),
                 }

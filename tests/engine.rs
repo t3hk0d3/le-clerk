@@ -529,8 +529,9 @@ mod engine {
         mod on_parked_long_poll {
             use super::*;
 
+            /// The daemon announces a stop to the clients waiting on it.
             #[tokio::test]
-            async fn returns_engine_unavailable_at_once() {
+            async fn answers_daemon_stopping_at_once() {
                 let (h, _clock) = spawn();
                 let waiter = {
                     let h = h.clone();
@@ -542,7 +543,24 @@ mod engine {
                     .await
                     .expect("parked long-poll outlived the engine")
                     .unwrap();
-                assert_eq!(got.unwrap_err().code, "engine_unavailable");
+                assert_eq!(got.unwrap_err().code, "daemon_stopping");
+            }
+
+            /// ... and a restart, so they reconnect instead of giving up.
+            #[tokio::test]
+            async fn answers_daemon_restarting_on_a_restart() {
+                let (h, _clock) = spawn();
+                let waiter = {
+                    let h = h.clone();
+                    tokio::spawn(async move { h.wait_notices(holder("b"), MAX_WAIT).await })
+                };
+                until_parked(&h, &holder("b")).await;
+                ok(&h, "daemon_stop", &user("admin"), json!({"restart": true})).await;
+                let got = tokio::time::timeout(PATIENCE, waiter)
+                    .await
+                    .expect("parked long-poll outlived the engine")
+                    .unwrap();
+                assert_eq!(got.unwrap_err().code, "daemon_restarting");
             }
         }
 

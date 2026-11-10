@@ -212,6 +212,8 @@ fn exit_for(code: &str) -> u8 {
         "daemon_unavailable"
         | "daemon_unresponsive"
         | "protocol_mismatch"
+        | "daemon_restarting"
+        | "daemon_stopping"
         | "engine_unavailable" => EXIT_DAEMON,
         "invalid_request"
         | "invalid_argument"
