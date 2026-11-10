@@ -523,9 +523,9 @@ agents works in layers:
      call: `clerk wait` has no limit of its own; the skill asks for the 2 h
      `timeout`, and a wait killed by a limit ends like any other wait, so the
      agent re-arms it.
-   - `clerk wait` watches the Claude Code process (`CLAUDE_PID`) and exits
-     when it is gone; Claude Code does not kill background commands when it
-     is killed itself (Appendix C).
+   - `clerk wait` exits when its session is no longer alive (§7.3: the
+     process is gone or has moved to another session); Claude Code does not
+     kill background commands when it is killed itself (Appendix C).
    - One armed wait per agent (my call): a second `clerk wait` while one runs
      exits at once, saying one is already armed, so notices are never split
      between two outputs.
@@ -538,11 +538,13 @@ agents works in layers:
 3. **Mid-turn backup.** A **PreToolUse hook** attaches pending notices to the
    context on the next tool call. These are documented `additionalContext`
    hooks.
-4. **New conversations in the same process.** After `/clear` or compaction the
-   conversation has no memory of its leases, yet a wait started before still
-   wakes it (Appendix C). A **SessionStart hook** for `clear`, `compact` and
-   `resume` adds a short brief: what the agent holds or waits for, whether a
-   wait is armed, and to use the clerk skill.
+4. **Briefs at session start.** After compaction or a resume the
+   conversation has lost track of its leases; after `/clear` the previous
+   session's leases are ending (§7.3), yet a wait started before still wakes
+   the new conversation (Appendix C). A **SessionStart hook** for `clear`,
+   `compact` and `resume` adds a short brief: what the session holds or waits
+   for, whether a wait is armed, the previous session's leases that are
+   ending and how to keep them, and to use the clerk skill.
 5. **Optional extra wake-up: `asyncRewake`.** A hook that runs in the
    background and exits with code 2 when a notice arrives. Hook timeouts are
    enforced, as the spike confirmed, so it must be bounded and re-armed on each
@@ -601,42 +603,48 @@ other's mistakes, not against a hostile process of the same user.
 
 ### 7.3 Agent identity and liveness
 
-- **Identity: the Claude Code process** (my call, 2026-11-10). Claude Code sets
-  `CLAUDE_PID` to its own process ID for Bash tool commands and hook commands
-  (documented, Claude Code 2.1.214 or later). The holder is that process,
-  identified by PID and start time so a reused PID is never mistaken for it.
-  The project comes from the command's working directory (§4.2).
-  - The clerk also records which conversation (`CLAUDE_CODE_SESSION_ID`, set
-    for Bash and hooks and updated on `/clear`) each call came from, for the
-    audit log, for `clerk status`, and to find the holder again on resume.
-- **What follows from it:**
-  - Subagents run their Bash in the same process, so they share their parent's
-    leases. That is deliberate, as in Simlock.
-  - **`/clear` and compaction keep leases** (my call; the user has not said
-    otherwise): the process lives on, so its leases do too. The SessionStart
-    brief (§6, layer 4) tells the new conversation what it holds.
-  - `/resume` inside a running Claude Code keeps leases with the process for
-    the same reason.
-- **Agent detection.** A caller is an agent when `CLAUDE_PID` is set. With
-  `CLAUDE_CODE_SESSION_ID` set but no `CLAUDE_PID` (Claude Code older than
-  2.1.214) the CLI refuses to take leases for the agent, naming the version
-  it needs (my call): such a lease could not be tied to anything alive.
-  `clerk hook` with neither variable exits 0 at once, without contacting the
-  daemon, so the plugin is harmless in other tools.
+- **Identity: the Claude Code session** (user decision, 2026-11-10). The
+  holder is `CLAUDE_CODE_SESSION_ID`, which Claude Code sets for Bash tool
+  commands and hook commands (documented; it changes on `/clear`). The
+  project comes from the command's working directory (§4.2).
+  - Subagents run with their parent's session ID, so they share its leases.
+    That is deliberate, as in Simlock.
+- **Host process.** Every agent call and hook also sends `CLAUDE_PID`, the
+  Claude Code process (documented for Bash and hooks, Claude Code 2.1.214 or
+  later). The daemon records it, with its start time so a reused PID is never
+  mistaken for it, as the session's **host**; the latest report wins. A
+  process runs one session at a time: when it reports another session, the
+  sessions it hosted before lose their host.
+- **Agent detection.** A caller is an agent when `CLAUDE_CODE_SESSION_ID` is
+  set. Without `CLAUDE_PID` (Claude Code older than 2.1.214) the CLI refuses
+  to take leases for the agent, naming the version it needs (my call): the
+  lease could not be tied to anything alive. `clerk hook` with neither
+  variable exits 0 at once, without contacting the daemon, so the plugin is
+  harmless in other tools.
 - **Liveness:**
-  - The agent is alive while its Claude Code process runs. The daemon watches
-    the process, as it does for `clerk run`.
-  - When the process is gone, a short grace period (my call: 60 s) allows a
-    `--continue` or `--resume` to take the leases over.
-  - After that, the agent is dead (§5.7).
-  - A `SessionEnd` hook may additionally tell the daemon at once, except with
-    reason `clear`, where the process lives on.
-- **Resumed sessions** (`--continue`, `--resume`, a new process): the
-  SessionStart hook with source `resume` reports the new process and the
-  conversation it resumed. If an earlier process recorded that conversation
-  and is gone, or within its grace, its leases and queued requests move to the
-  new process in one transaction, audited as `holder_resumed`. A process that
-  is still alive keeps its leases; source `fork` never takes leases over.
+  - A session is alive while its host process runs and has not moved to
+    another session.
+  - When it stops being alive, a grace period (my call: 60 s) starts. A call
+    or hook from the same session in any process within it (e.g.
+    `--continue`, `--resume`, `/resume`) makes that process the host and
+    cancels the grace: resuming needs nothing else, since the session ID stays
+    the same.
+  - After the grace, the session is dead (§5.7).
+  - A `SessionEnd` hook ends the host at once (the grace still applies).
+- **What follows from it:**
+  - **`/clear` releases** (user decision, "use the session ID as is"): the new
+    conversation is a new session, so the old one loses its host and its
+    leases end after the grace, unless it is resumed within it. The
+    SessionStart brief (§6, layer 4) tells the new conversation which leases
+    are ending and how to keep them (`/resume`).
+  - `/resume` of another conversation inside a running Claude Code does the
+    same to the session it leaves.
+  - Compaction keeps the session ID, so it keeps the leases; the brief
+    reminds the agent what it holds.
+  - Two processes running the same session (e.g. `--resume` in a second
+    terminal) share its leases; the latest to report is the host.
+  - Without the plugin's hooks, a session left by `/clear` is noticed when
+    the new session first calls `clerk`, or when the process exits.
 - **Other kinds of holder (user decision): the CLI without an agent.** The
   user, scripts and smoke tests can hold and wait for leases through the CLI
   (§8.4). My calls on how:
@@ -874,7 +882,7 @@ promotion. It is kept in SQLite and shown by `clerk log`.
 
 My call: shipped as a **Claude Code plugin**, with an install command as an
 alternative (e.g. `clerk install claude-code`). It contains:
-- the hooks from §6 (SessionStart brief and resume takeover, Stop reminder,
+- the hooks from §6 (SessionStart brief and host report, Stop reminder,
   PreToolUse notice injection, optional asyncRewake) and a SessionEnd
   notification;
 - the `clerk` skill (§8.3).
@@ -911,10 +919,10 @@ settled or moot; Appendix B has them. For the CLI-only interface (§6, §7.3):
 3. **A background command killed by its time limit** in an unattended session
    (`-p`): whether its end wakes the agent like a normal completion.
 4. **`--continue` and `--resume` while a wait runs:** the old process's wait
-   exits with it; the new process's SessionStart (`resume`) hook sees the
-   resumed conversation's ID and a new `CLAUDE_PID`.
-5. **`SessionEnd` on `/clear`:** its `reason` is `clear` and the process lives
-   on.
+   exits with it; the new process's SessionStart (`resume`) hook and Bash see
+   the resumed session's ID and a new `CLAUDE_PID`.
+5. **`SessionEnd` on `/clear`:** it fires for the old session with `reason`
+   `clear`, before SessionStart for the new one.
 6. **`CLAUDE_PID` in the desktop app and the VS Code extension**, for Bash and
    hooks.
 
@@ -924,8 +932,8 @@ stops the MVP):
   notices after `d`, telling the agent to start it again; the skill sets it
   below the limit.
 - **Mid-turn (2):** the PreToolUse hook (§6, layer 3) is the mid-turn path.
-- **Resume (4):** the resumed conversation's leases are lost after the grace;
-  the SessionStart brief says so.
+- **Resume (4):** a resumed session that gets a new ID loses its leases after
+  the grace; the SessionStart brief says so.
 - **No `CLAUDE_PID` (6):** that surface is unsupported for agents in the MVP;
   the CLI refuses agent leases there, as for old Claude Code (§7.3).
 
@@ -942,6 +950,8 @@ stops the MVP):
 - local only;
 - Claude Code only for the MVP;
 - documented mechanisms only;
+- the session ID as the agent holder, with `/clear` releasing after the
+  grace (2026-11-10);
 - no MCP: agents use the CLI, one skill and the plugin's hooks (2026-11-10;
   phase 3's MCP Tasks design is superseded);
 - one `clerk` skill, to keep agents' context small (2026-11-10);
@@ -984,8 +994,8 @@ stops the MVP):
   another project" for holders a waiter can't see;
 - an "offered" state with a claim window for grants made while the agent waits;
 - the forms of CLI holder: `run` and `acquire`, non-interruptible;
-- the Claude Code process as the agent holder, leases kept on `/clear`, and
-  refusing agent leases without `CLAUDE_PID`;
+- the host process for liveness, and refusing agent leases without
+  `CLAUDE_PID`;
 - one armed `clerk wait` per agent, with no time limit of its own;
 - the description and usage limits, the placeholder syntax and keys, and
   write-time placeholder checks;

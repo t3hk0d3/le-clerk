@@ -780,7 +780,8 @@ cli JSON output
 The user dropped MCP after the CLI-only spike (spec §6, Appendix C): agents use
 the `clerk` CLI from Bash, one `clerk` skill and the plugin's hooks. Tasks 2–4's
 MCP code is removed (Task 9) and the old Task 8 (`/clear` link) is superseded:
-with the Claude Code process as the holder, `/clear` needs no link. Tasks 0–7
+with the session ID as holder and the process only as its host, `/clear`
+releases after the grace (user decision) and needs no link. Tasks 0–7
 stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, §8.3,
 §9, §11, Appendix C.
 
@@ -790,34 +791,34 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
 
 - **No MCP anywhere:** no `src/mcp`, no `clerk mcp`, no `rmcp`, `schemars` or
   MCP-only crates, no `/mcp` route, no `.mcp.json`. Protocol bumps to 4.
-- **Agent detection:** a CLI or hook caller is an agent when `CLAUDE_PID` is
-  set and non-empty. The agent holder is `HolderRef::ClaudeCode { pid,
-  start_time }`, with `start_time` read from `/proc/<pid>/stat` (as for
-  `CliProcess`). The call also carries `conversation`
-  (`CLAUDE_CODE_SESSION_ID`, if set).
-  - `CLAUDE_CODE_SESSION_ID` set but no `CLAUDE_PID`, or a `CLAUDE_PID` whose
-    start time cannot be read: commands that would hold or queue for the
-    agent fail with code `agent_unidentified`, naming Claude Code 2.1.214 as
-    the minimum; read-only commands still work, as the user.
+- **Agent detection and holder** (user decision: the session ID as is): a
+  CLI or hook caller is an agent when `CLAUDE_CODE_SESSION_ID` is set and
+  non-empty. The holder stays `HolderRef::AgentSession { session_id }`. Every
+  agent call also carries `host: { pid, start_time }` from `CLAUDE_PID`, with
+  `start_time` read from `/proc/<pid>/stat` (as for `CliProcess`).
+  - No `CLAUDE_PID`, or one whose start time cannot be read: commands that
+    would hold or queue for the agent fail with code `agent_unidentified`,
+    naming Claude Code 2.1.214 as the minimum; read-only commands still run
+    as the agent.
   - `clerk hook` with neither variable set: exit 0, no output, no daemon
     contact.
-- **Legacy holders:** stored `AgentSession` rows still deserialize (audit,
-  old leases); no new ones are made. After a daemon start they get the
-  restart grace (`reconnect_grace`, 60 s) and then end as `holder_gone`.
-  The `session_aliases` table is dropped by a migration.
-- **Conversations:** the daemon records every (Claude process, conversation)
-  pair it sees from CLI calls and hooks (`agent_conversations`: pid,
-  start_time, conversation, first_seen, last_seen).
-- **Liveness:** a `ClaudeCode` holder is alive while its process (pid and
-  start time) runs. When it is gone, `reconnect_grace` starts; at its end the
-  holder's leases end with cause `holder_gone` and its requests drop (§5.7).
-  The existing process watch for `CliProcess` covers it.
-- **Resume takeover:** `session_start { source: "resume", conversation }`
-  from process P′: if another `ClaudeCode` holder P recorded that
-  conversation and P is not running, every live lease, queued request and
-  pending notice of P moves to P′ in one transaction, audited
-  `holder_resumed { from, to, conversation }`. P running, or source `fork`:
-  nothing moves.
+- **Hosts:** the daemon records each session's host (`agent_hosts`:
+  session_id, pid, start_time, last_seen), replacing `session_aliases`
+  (dropped by a migration). Every agent call and hook reports (session, host);
+  the latest report wins. A report of session N from a host makes every
+  other session hosted by that same process (pid and start time) **unhosted**.
+  SessionEnd unhosts its session at once.
+- **Liveness:** a session is alive while it has a host whose process runs.
+  When it stops being alive, `reconnect_grace` (60 s) starts; a report of the
+  same session from any process within it re-hosts the session and cancels
+  the grace (this is all `--continue`/`--resume`/`/resume` need). At the end
+  of the grace its leases end with cause `holder_gone` and its requests drop
+  (§5.7). After a daemon start every session with live leases or requests
+  gets the grace from boot (sessions from the MCP era have no host and end
+  then).
+- **`/clear` releases** (user decision): the old session is unhosted by the
+  new session's first report, so its leases end after the grace unless it is
+  resumed.
 - **`clerk wait` for agents:**
   - returns one batch: blocks until the agent has pending notices, claims any
     `offered` lease in the batch (the result carries the grant brief), prints
@@ -825,8 +826,8 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
   - notices are marked delivered only after the batch is written and flushed
     (the CLI acks with the existing ack mechanism); a wait killed before that
     leaves them pending;
-  - exits 0 with an empty batch when the Claude Code process is gone (checked
-    at least every 2 s);
+  - exits 0 with an empty batch, `summary` saying why, when its session is no
+    longer alive (host gone or unhosted; checked at least every 2 s);
   - one armed wait per agent: while one is open, another exits 0 at once with
     `summary` "a clerk wait is already armed for this agent" and `next` none;
   - **armed** means a wait long-poll from the holder is open (the CLI
@@ -847,19 +848,21 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
   `wait`. `acquire` by an agent never blocks (`--wait` refused for agents,
   pointing to `clerk wait`); queued exit code stays 6.
 - **Hooks** (budgets unchanged: 2 s; SessionEnd 1.5 s; fail open):
-  - session-start: records the conversation; `resume` runs the takeover;
-    for `clear`, `compact` and `resume`, when the agent holds or waits for
-    anything, prints a brief as `additionalContext`: its leases and requests
-    (IDs, resource, unit, ends), whether a wait is armed, "use the clerk
-    skill", and, when no wait is armed, the exact `clerk wait` command to run
-    in the background. Nothing for `startup` or `fork`, or when it holds
-    nothing.
+  - session-start: reports the host; for `clear`, `compact` and `resume`,
+    when the session holds or waits for anything, or (for `clear`) the
+    previous session of the same process has leases in its grace, prints a
+    brief as `additionalContext`: its leases and requests (IDs, resource,
+    unit, ends), whether a wait is armed, the previous session's ending leases
+    with "`/resume` it within 60 s to keep them", "use the clerk skill", and,
+    when no wait is armed but something is held, the exact `clerk wait`
+    command to run in the background. Nothing for `startup` or `fork`, or
+    when there is nothing to say.
   - stop: reminder (block decision) when the agent holds or queues anything,
     no wait is armed and `stop_hook_active` is false; the reason names the
     background `clerk wait` command.
   - pre-tool-use: unchanged (pending notices not yet shown by a hook).
-  - session-end: ends the holder's liveness now (no grace), except with
-    `reason` `clear` or `resume`, or while the Claude Code process still runs.
+  - session-end: unhosts the session now; the grace still applies (so
+    `/clear` and a quick `--continue` behave the same).
 - **Plugin:** `integrations/claude-code/` holds `.claude-plugin/plugin.json`,
   `hooks/hooks.json` and `skills/clerk/{SKILL.md,leasing.md,registering.md}`;
   the `leasing` and `registering-resources` skills and `.mcp.json` are
@@ -871,14 +874,15 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
 1. **A killed Claude Code keeps its boards:** `kill -9` of the agent's process
    (its background `clerk wait` keeps running, Appendix C). The wait must
    exit and the leases end after the grace. → Tasks 10, 11.
-2. **`--continue` loses its boards:** the new process must take over the old
-   one's leases inside the grace, and never a still-running process's. →
-   Tasks 10, 12.
+2. **`/clear` keeps boards forever, or `--continue` loses them:** after
+   `/clear` the old session's leases end after the grace even though the
+   process lives on; a `--continue` within the grace keeps them. → Tasks
+   10, 12.
 3. **Notices lost between two waits:** a wait killed mid-print, two waits
    racing, a wait woken by an offer it fails to claim. Nothing is lost or
    delivered twice. → Task 11.
 4. **PID reuse:** a new process with the old `CLAUDE_PID` but another start
-   time never inherits leases or counts as alive. → Task 10.
+   time never counts as the host or unhosts anything. → Task 10.
 5. **A hook or wait blocks a non-agent shell:** the plugin installed while
    running `clerk` outside Claude Code; `clerk wait` run by a person. People
    keep today's behaviour. → Tasks 11, 12.
@@ -888,45 +892,37 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
 ```
 cli::caller
     current
-        On CLAUDE_PID set with a readable start time
-            - holder is ClaudeCode { pid, start_time }; conversation from CLAUDE_CODE_SESSION_ID
-        On CLAUDE_CODE_SESSION_ID without CLAUDE_PID
+        On CLAUDE_CODE_SESSION_ID and CLAUDE_PID with a readable start time
+            - holder is AgentSession(session id); host is { pid, start_time }
+        On CLAUDE_CODE_SESSION_ID without CLAUDE_PID, or its process gone
             - holding/queueing commands fail with agent_unidentified naming 2.1.214
-            - read-only commands run as the user
-        On CLAUDE_PID whose process is gone
-            - holding/queueing commands fail with agent_unidentified
+            - read-only commands run as the agent
         On neither variable
             - unchanged (CliProcess / User per kind)
 
-scheduler::liveness (ClaudeCode holders)
+engine host reports (every agent call and hook)
+    On a session's first report
+        - records its host
+    On session N reported by a process that hosted U
+        - U becomes unhosted; its grace starts; its leases stay held during it
+    On U reported again within its grace (any process)
+        - U is re-hosted by that process; the grace is cancelled; nothing ends
+    On a report from a reused pid with another start time
+        - counts as a different process; unhosts nothing of the old one
+
+scheduler::liveness (AgentSession holders)
     sweep
-        On the process running with the same start time
-            - holder stays alive
-        On the process gone
-            - grace starts; leases stay held during it
+        On the host process running
+            - session stays alive
+        On the host process gone, or the session unhosted
+            - grace starts
         On the grace ending
             - leases end holder_gone, units go through §5.4, requests drop
-        On a reused pid with another start time
-            - counts as gone
     daemon start
-        On stored AgentSession holders
-            - end holder_gone after reconnect_grace from boot
-        On ClaudeCode holders whose process is gone
-            - grace from boot, then end
-
-engine::session_start (hook RPC)
-    On any source
-        - records (holder, conversation) in agent_conversations
-    On resume with an earlier gone holder that recorded the conversation
-        - moves its leases, requests and pending notices to the new holder in one transaction
-        - audits holder_resumed { from, to, conversation }
-        - the earlier holder's grace no longer ends anything
-    On resume while the earlier holder still runs
-        - moves nothing
-    On fork
-        - moves nothing
-    On resume with no earlier holder
-        - moves nothing; returns the brief
+        On sessions with live leases or requests
+            - grace from boot; a session re-reported within it keeps its leases
+        On a session with no recorded host (MCP era)
+            - ends after the grace
 
 cli wait (agent)
     On pending notices
@@ -976,20 +972,18 @@ cli::hook
     session-start
         On clear | compact | resume while holding or queued
             - prints the brief; with no armed wait it includes the background clerk wait command
-        On startup | fork, or holding nothing
+        On clear with the previous session's leases in their grace
+            - the brief names them and says /resume within 60 s keeps them
+        On startup | fork, or nothing to say
             - prints nothing
-        On resume after a crash
-            - the takeover happened before the brief; the brief lists the taken-over leases
     stop
         On holding, no armed wait, stop_hook_active false
             - block decision naming the background clerk wait
         On a wait armed, or stop_hook_active true, or holding nothing
             - no output
     session-end
-        On reason clear | resume, or the process still running
-            - nothing changes
-        On other reasons with the process gone
-            - leases end at once (no grace)
+        On any reason
+            - unhosts the session; its leases end only after the grace
 
 plugin
     files
@@ -1051,36 +1045,36 @@ plugin
   removed code removed with it, nothing else changed).
 - [ ] **Step 4:** Commit: `refactor!: remove the MCP server and clerk mcp`
 
-### Task 10: The Claude Code process as the agent holder
+### Task 10: Session hosts and liveness
 
 **Files:**
-- Modify: `src/model/types.rs` (`HolderRef::ClaudeCode`; `AgentSession`
-  legacy), `src/cli/caller.rs` (detection, `agent_unidentified`),
-  `src/scheduler/liveness.rs` (watch `ClaudeCode` like `CliProcess`),
-  `src/scheduler/session.rs` (replaced: `agent.rs` with conversations and
-  resume takeover), `src/store/` (migration: `agent_conversations`, drop
-  `session_aliases`), `src/engine/command.rs` (`session_start` takeover;
-  every agent call records its conversation), `src/model/types.rs` `Caller`
-  (`conversation: Option<String>`)
-- Test: `tests/liveness.rs`, `tests/agent.rs` (new, replaces
+- Modify: `src/cli/caller.rs` (host from `CLAUDE_PID`, `agent_unidentified`),
+  `src/model/types.rs` (`Caller.host: Option<Host>`, `Host { pid: u32,
+  start_time: u64 }`), `src/scheduler/session.rs` (replaced by
+  `src/scheduler/host.rs`: host reports, unhosting, grace),
+  `src/scheduler/liveness.rs` (sweep `AgentSession` hosts like
+  `CliProcess`), `src/store/` (migration: `agent_hosts`, drop
+  `session_aliases`), `src/engine/command.rs` (every agent call and hook
+  reports its host; `session_start`/`session_end` RPCs)
+- Test: `tests/liveness.rs`, `tests/host.rs` (new, replaces
   `tests/session.rs`), `tests/engine.rs`, unit tests in `caller.rs`
 
 **Interfaces:**
 - Consumes: `liveness::start_time_of(pid)` (add if only `self_start_time`
   exists), the holder-gone path.
-- Produces: `HolderRef::ClaudeCode { pid: u32, start_time: u64 }`;
-  `Caller.conversation`; `scheduler::agent::Agents::takeover(&mut self, tx:
-  &Tx, sched: &Scheduler, to: &HolderRef, conversation: &str) ->
-  Result<Option<HolderRef>, SchedulerError>` (the holder taken over, if any);
-  error code `agent_unidentified`.
+- Produces: `model::Host`; `Caller.host`; `scheduler::host::Hosts::report(&mut
+  self, tx: &Tx, session_id: &str, host: Host) -> Result<Reported,
+  SchedulerError>` (`Reported { unhosted: Vec<String> }`, the sessions this
+  report left); `Hosts::unhost(&mut self, session_id: &str)`; error code
+  `agent_unidentified`.
 
 - [ ] **Step 1:** Write the failing tests for `cli::caller`,
-  `scheduler::liveness (ClaudeCode holders)` and `engine::session_start`,
+  `engine host reports` and `scheduler::liveness (AgentSession holders)`,
   including Review Focus 1, 2 and 4.
 - [ ] **Step 2:** Run them; expected FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run fmt, clippy and the full suite; expected PASS.
-- [ ] **Step 5:** Commit: `feat: the Claude Code process holds agent leases`
+- [ ] **Step 5:** Commit: `feat: agent sessions live while their Claude Code process hosts them`
 
 ### Task 11: Agent commands and `clerk wait`
 
@@ -1092,7 +1086,7 @@ plugin
 - Test: `tests/cli.rs`, `tests/notices.rs`
 
 **Interfaces:**
-- Consumes: Task 10's holder; the engine's existing confirm, set
+- Consumes: Task 10's host reports; the engine's existing confirm, set
   interruptible, refuse yield, reclaim, claim, cancel and ack commands.
 - Produces: the commands in Part 2 Global Constraints; RPC `wait_notices`
   gains `armed` tracking and an `already_armed` answer; `status --mine`
@@ -1115,9 +1109,9 @@ plugin
 - Test: `tests/hook.rs`
 
 **Interfaces:**
-- Consumes: Tasks 10–11 (`takeover`, armed tracking, conversations).
+- Consumes: Tasks 10–11 (host reports, armed tracking).
 - Produces: the hook behaviour in Part 2 Global Constraints. Tests set
-  `CLAUDE_PID` to a live child process they own.
+  `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` (a live child process they own).
 
 - [ ] **Step 1:** Write the failing tests for `cli::hook`, including Review
   Focus 5 (no agent variables: no daemon started, no output).
@@ -1141,8 +1135,9 @@ plugin
 - Produces: the plugin per Part 2 Global Constraints; `docs/claude-code.md`
   install steps without MCP and a checklist: two agents on one pool (the
   second woken by its background wait), an idle agent woken by an expiry
-  warning, `/clear` keeps leases and shows the brief, `kill -9` frees the
-  board after the grace, `--continue` keeps it, the Stop reminder fires once,
+  warning, `/clear` releases the old session's leases after the grace and
+  the brief says so, `/clear` then `/resume` within the grace keeps them,
+  `kill -9` frees the board after the grace, `--continue` keeps it, the Stop reminder fires once,
   "register the boards on my hub" follows `registering.md`.
 
 - [ ] **Step 1:** Write the failing `tests/plugin.rs` for the BDD subtree
@@ -1167,4 +1162,4 @@ plugin
 - **Deferred:** `asyncRewake`; `clerk install claude-code`; phase 2 deferred
   minors (SIGKILL escalation in `clerk run`, `clerk wait` and lent leases,
   unit update read-modify-write, splitting `src/cli/lease.rs`).
-- **Part 2 coverage (2026-11-10):** §6 layers 1–4 (Tasks 11, 12), §7.1 (Task 9), §7.3 holder, liveness, resume, detection (Tasks 10, 12), §8.1 (Task 11), §8.3 one skill (Task 13), §9 (Tasks 9, 13), §11 (Task 8). Deferred: `asyncRewake`, `clerk install claude-code`.
+- **Part 2 coverage (2026-11-10):** §6 layers 1–4 (Tasks 11, 12), §7.1 (Task 9), §7.3 holder, hosts, liveness, detection (Tasks 10, 12), §8.1 (Task 11), §8.3 one skill (Task 13), §9 (Tasks 9, 13), §11 (Task 8). Deferred: `asyncRewake`, `clerk install claude-code`.
