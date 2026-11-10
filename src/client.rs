@@ -618,6 +618,7 @@ impl Client {
         host: Host,
         secs: u64,
         first: bool,
+        arm: &str,
     ) -> Result<Value, ApiError> {
         let host = serde_json::to_string(&host)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
@@ -626,6 +627,7 @@ impl Client {
             ("host", host),
             ("wait", secs.to_string()),
             ("first", first.to_string()),
+            ("arm", arm.to_owned()),
         ])
         .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let path = format!("/v1/agent/wait?{query}");

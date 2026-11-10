@@ -3508,6 +3508,25 @@ mod cli {
                     assert_eq!(mine["leases"][0]["state"], "held", "{mine}");
                 }
 
+                /// Review finding 3: an offer this session already holds
+                /// (claimed by hand, or by a wait that died before acking)
+                /// counts as claimed, not as a failed claim.
+                #[test]
+                fn an_offer_already_claimed_counts_as_claimed() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let theirs = agent_queued(&env, &dir);
+                    free(&env, "x", &theirs);
+                    let lease = lease_of(&unit_status(&env)["occupancy"]);
+                    json_of(env.agent("sess-1", &dir).args(["claim", &lease]));
+                    let body = json_of(env.agent("sess-1", &dir).args(["wait"]));
+                    assert_eq!(body["claimed"][0]["state"], "held", "{body}");
+                    assert!(
+                        !body["summary"].to_string().contains("Could not claim"),
+                        "{body}"
+                    );
+                }
+
                 #[test]
                 fn marks_them_delivered_once_printed() {
                     let env = Env::new();
@@ -3574,7 +3593,15 @@ mod cli {
                     agent_queued(&env, &dir);
                     let mut old = spawn(&env, &["wait"], Some("sess-1"));
                     std::thread::sleep(Duration::from_millis(800));
-                    json_of(env.agent("sess-2", &dir).args(["leases", "--mine"]));
+                    // The SessionStart hook of the new session moves the process.
+                    let input = json!({"session_id": "sess-2", "hook_event_name": "SessionStart",
+                                       "source": "clear"});
+                    env.cmd()
+                        .args(["hook", "session-start"])
+                        .env(CLAUDE_PID, std::process::id().to_string())
+                        .write_stdin(input.to_string())
+                        .assert()
+                        .success();
                     assert_eq!(code_of(&mut old), 0);
                 }
             }

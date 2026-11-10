@@ -49,6 +49,8 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
     let mut int = signal(SignalKind::interrupt())?;
     let deadline = args.timeout.map(|t| Instant::now() + t);
     let mut first = true;
+    // This wait's arm token: its steps hold the session's one armed wait.
+    let arm = ulid::Ulid::new().to_string();
     loop {
         if !process_alive(host.pid, host.start_time) {
             return finish(
@@ -60,7 +62,7 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
             return finish(args, &empty(&["No notices arrived before --timeout."]));
         }
         let step = tokio::select! {
-            got = client.agent_wait(session_id, host, STEP.as_secs(), first) => got?,
+            got = client.agent_wait(session_id, host, STEP.as_secs(), first, &arm) => got?,
             _ = term.recv() => return finish(args, &stopped()),
             _ = int.recv() => return finish(args, &stopped()),
         };
@@ -138,9 +140,10 @@ async fn claim_if_offered(
         return None;
     }
     let lease = notice["lease_id"].as_str()?;
+    // Already held by this session (claimed by an earlier wait that died
+    // before acknowledging, or by hand) counts as claimed.
     Some(
-        client
-            .call("claim", caller, json!({ "lease_id": lease }))
+        super::lease::claim(client, caller, lease)
             .await
             .map_err(|e| e.message),
     )

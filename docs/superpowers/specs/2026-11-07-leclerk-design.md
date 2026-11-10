@@ -614,9 +614,12 @@ other's mistakes, not against a hostile process of the same user.
 - **Host process.** Every agent call and hook also sends `CLAUDE_PID`, the
   Claude Code process (documented for Bash and hooks, Claude Code 2.1.214 or
   later). The daemon records it, with its start time so a reused PID is never
-  mistaken for it, as the session's **host**; the latest report wins. A
-  process runs one session at a time: when it reports another session, the
-  sessions it hosted before lose their host.
+  mistaken for it, as one of the session's **hosts** (two when the session
+  is resumed in a second terminal). A process runs one session at a time:
+  when a **hook** reports another session from it, the sessions it ran
+  before lose it as a host. Other calls never move a process to another
+  session, so a call left over from before `/clear` (a background command)
+  cannot take it back.
 - **Agent detection.** A caller is an agent when `CLAUDE_CODE_SESSION_ID` is
   set. Without `CLAUDE_PID` (Claude Code older than 2.1.214) the CLI refuses
   to take leases for the agent, naming the version it needs (my call): the
@@ -624,8 +627,7 @@ other's mistakes, not against a hostile process of the same user.
   variable exits 0 at once, without contacting the daemon, so the plugin is
   harmless in other tools.
 - **Liveness:**
-  - A session is alive while its host process runs and has not moved to
-    another session.
+  - A session is alive while one of its host processes runs it.
   - When it stops being alive, a grace period (my call: 60 s) starts. A call
     or hook from the same session in any process within it (e.g.
     `--continue`, `--resume`, `/resume`) makes that process the host and
@@ -636,8 +638,8 @@ other's mistakes, not against a hostile process of the same user.
     session ends on purpose (`/clear`, quitting, `/resume` of another
     conversation, logout), the hook ends it with no grace: its leases go
     through §5.4 as "not confirmed: session ended" and its requests drop.
-    Only the session's current host can do this, so a second process running
-    the same session keeps it. A crash or `kill -9` runs no hook, so the
+    It removes only the calling process from the session's hosts, so a
+    second process running the same session keeps it. A crash or `kill -9` runs no hook, so the
     grace still covers `--continue` after a crash; `--continue` after a
     normal quit starts with nothing held.
 - **What follows from it:**
@@ -650,10 +652,10 @@ other's mistakes, not against a hostile process of the same user.
   - Compaction keeps the session ID, so it keeps the leases; the brief
     reminds the agent what it holds.
   - Two processes running the same session (e.g. `--resume` in a second
-    terminal) share its leases; the latest to report is the host.
-  - Without the plugin's hooks, a session left by `/clear` is noticed when
-    the new session first calls `clerk`, or when the process exits, and
-    released after the grace.
+    terminal) share its leases; it lives while either runs it.
+  - Without the plugin's hooks, a session left by `/clear` keeps its leases
+    until the process exits (then the grace); the hooks are what make
+    `/clear` release.
 - **Other kinds of holder (user decision): the CLI without an agent.** The
   user, scripts and smoke tests can hold and wait for leases through the CLI
   (§8.4). My calls on how:

@@ -401,11 +401,14 @@ impl Drop for Parked<'_> {
     }
 }
 
-/// Open waits (blocking `lease_wait` calls and open MCP tasks), by holder
-/// key: what the Stop hook asks through `session_brief`.
+/// Open waits (blocking notice waits), by holder key, and each agent
+/// session's armed wait: what the Stop hook asks through `session_brief`.
 #[derive(Default)]
 struct OpenWaits {
     counts: Mutex<HashMap<String, usize>>,
+    /// The armed `clerk wait` of each holder: its arm token, and until when
+    /// it counts as armed (through the gaps between its steps).
+    arms: Mutex<HashMap<String, (String, tokio::time::Instant)>>,
 }
 
 impl OpenWaits {
@@ -413,7 +416,35 @@ impl OpenWaits {
         // Counters only; a panic while locked leaves nothing to repair.
         self.counts.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn arms(&self) -> MutexGuard<'_, HashMap<String, (String, tokio::time::Instant)>> {
+        // Tokens and deadlines only; nothing to repair after a panic.
+        self.arms.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `key` has a wait armed by another token than `arm` now.
+    fn armed_by_other(&self, key: &str, arm: &str) -> bool {
+        let now = tokio::time::Instant::now();
+        self.arms()
+            .get(key)
+            .is_some_and(|(owner, until)| owner != arm && *until > now)
+    }
+
+    /// `arm` holds `key`'s wait until `until`.
+    fn hold(&self, key: &str, arm: &str, until: tokio::time::Instant) {
+        self.arms().insert(key.to_owned(), (arm.to_owned(), until));
+    }
+
+    /// Whether `key` has a wait armed now (by any token).
+    fn armed(&self, key: &str) -> bool {
+        let now = tokio::time::Instant::now();
+        self.arms().get(key).is_some_and(|(_, until)| *until > now)
+    }
 }
+
+/// How long an agent's wait stays armed after one of its steps returns:
+/// longer than the gap before its next step (a claim, a print, an ack).
+pub const ARM_HOLD: Duration = Duration::from_secs(3);
 
 /// One open wait of a holder, counted while alive (see
 /// [`EngineHandle::open_wait`]); dropping it, also on cancellation, closes
@@ -591,19 +622,19 @@ impl EngineHandle {
     /// [`EngineHandle::open_wait`]).
     #[must_use]
     pub fn open_waits(&self, holder: &HolderRef) -> usize {
-        self.open_waits
-            .lock()
-            .get(&holder_key(holder))
-            .copied()
-            .unwrap_or(0)
+        let key = holder_key(holder);
+        let open = self.open_waits.lock().get(&key).copied().unwrap_or(0);
+        // An armed agent wait counts between its steps too.
+        open.max(usize::from(self.open_waits.armed(&key)))
     }
 
     /// One step of an agent session's notice wait (`clerk wait`) from
     /// `host`: up to `timeout` (capped at [`MAX_WAIT`]) for pending notices,
     /// returned without delivering them (the CLI acknowledges them once
-    /// printed, [`EngineHandle::ack_notices`]). `first` marks a wait's
-    /// first step, which refuses to run while another wait of the session
-    /// is open. The wait counts as open (armed) while it blocks.
+    /// printed, [`EngineHandle::ack_notices`]). `arm` is the wait's
+    /// token: while another token holds the session's wait (blocking, or
+    /// within [`ARM_HOLD`] of its last step) the step answers `Armed`.
+    /// `first` marks a wait's first step.
     ///
     /// # Errors
     /// A storage failure, or `engine_unavailable`.
@@ -613,6 +644,7 @@ impl EngineHandle {
         host: Host,
         timeout: Duration,
         first: bool,
+        arm: String,
     ) -> Result<AgentWait, ApiError> {
         let holder = HolderRef::AgentSession {
             session_id: session_id.clone(),
@@ -623,17 +655,25 @@ impl EngineHandle {
         {
             return Ok(AgentWait::Ended);
         }
-        if first && self.open_waits(&holder) > 0 {
+        let key = holder_key(&holder);
+        let timeout = timeout.min(MAX_WAIT);
+        if self.open_waits.armed_by_other(&key, &arm)
+            || (first && self.open_waits(&holder) > 0 && !self.open_waits.armed(&key))
+        {
             return Ok(AgentWait::Armed);
         }
+        self.open_waits
+            .hold(&key, &arm, tokio::time::Instant::now() + timeout + ARM_HOLD);
         let _open = self.open_wait(&holder);
         let got = self
-            .wait_until(&holder, timeout.min(MAX_WAIT), || async {
+            .wait_until(&holder, timeout, || async {
                 let got = self.return_notices(holder.clone(), None).await?;
                 Ok((!got.is_empty()).then_some(got))
             })
-            .await?;
-        Ok(got.map_or(AgentWait::Timeout, AgentWait::Notices))
+            .await;
+        self.open_waits
+            .hold(&key, &arm, tokio::time::Instant::now() + ARM_HOLD);
+        Ok(got?.map_or(AgentWait::Timeout, AgentWait::Notices))
     }
 
     /// Agent session `session_id` is run by `host` (an agent call or hook
@@ -962,7 +1002,7 @@ impl Engine {
                     engine
                         .sessions
                         .transact(&mut engine.store, |tx, sessions| {
-                            sessions.report(tx, &session_id, host, now)
+                            sessions.touch(tx, &session_id, host, now)
                         })?;
                     Ok(())
                 });

@@ -237,6 +237,14 @@ impl Fixture {
             .unwrap()
     }
 
+    fn touch(&mut self, session: &str, host: Host) -> bool {
+        let now = self.now();
+        let sessions = &mut self.sessions;
+        self.store
+            .tx(|tx| sessions.touch(tx, session, host, now))
+            .unwrap()
+    }
+
     fn probe(&mut self) -> Vec<String> {
         let now = self.now();
         let sessions = &mut self.sessions;
@@ -391,6 +399,83 @@ mod scheduler {
                     assert_eq!(f.sessions.host_of("s1"), Some(p.host));
                     assert!(f.sessions.is_alive("s1"));
                 }
+            }
+        }
+
+        mod touch {
+            use super::*;
+
+            mod on_a_new_session {
+                use super::*;
+
+                #[test]
+                fn records_its_host() {
+                    let mut f = fixture();
+                    let p = Proc::spawn();
+                    assert!(f.touch("s1", p.host));
+                    assert!(f.sessions.is_alive("s1"));
+                }
+            }
+
+            /// Review finding 2: a leftover call of the old session after
+            /// `/clear` must not take the process back.
+            mod on_a_process_that_runs_another_session_now {
+                use super::*;
+
+                #[test]
+                fn changes_nothing() {
+                    let mut f = fixture();
+                    let p = Proc::spawn();
+                    f.held_by_s1(&p);
+                    f.report("s2", p.host);
+                    assert!(!f.touch("s1", p.host));
+                    assert!(!f.sessions.is_alive("s1"));
+                    assert_eq!(f.sessions.grace_ends("s1"), Some(T0 + GRACE_MS));
+                    assert!(f.sessions.is_alive("s2"));
+                }
+            }
+        }
+
+        /// Review finding 1: two processes running one session.
+        mod two_hosts {
+            use super::*;
+
+            #[test]
+            fn a_session_end_from_one_keeps_the_session_for_the_other() {
+                let mut f = fixture();
+                let p = Proc::spawn();
+                let q = Proc::spawn();
+                let lease = f.held_by_s1(&p);
+                f.report("s1", q.host);
+                f.report("s1", p.host);
+                assert!(!f.end("s1", Some(p.host), "prompt_input_exit"));
+                assert_eq!(f.lease(&lease).0, "held");
+                assert!(f.sessions.is_alive("s1"));
+            }
+
+            #[test]
+            fn one_dying_keeps_the_session_alive_for_the_other() {
+                let mut f = fixture();
+                let mut p = Proc::spawn();
+                let q = Proc::spawn();
+                f.held_by_s1(&p);
+                f.report("s1", q.host);
+                p.kill();
+                assert_eq!(f.probe(), Vec::<String>::new());
+                assert!(f.sessions.is_alive("s1"));
+                assert_eq!(f.sessions.grace_ends("s1"), None);
+            }
+
+            #[test]
+            fn the_last_one_ending_the_session_ends_it() {
+                let mut f = fixture();
+                let p = Proc::spawn();
+                let q = Proc::spawn();
+                let lease = f.held_by_s1(&p);
+                f.report("s1", q.host);
+                assert!(!f.end("s1", Some(p.host), "prompt_input_exit"));
+                assert!(f.end("s1", Some(q.host), "prompt_input_exit"));
+                assert_eq!(f.lease(&lease).0, "ended");
             }
         }
 
@@ -656,6 +741,35 @@ async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
 
 mod engine {
     use super::*;
+
+    /// Review finding 4: one armed wait per session, also between steps.
+    mod agent_wait {
+        use super::*;
+        use leclerk::engine::AgentWait;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_second_wait_starting_between_the_first_waits_steps_is_refused() {
+            let (store, clock) = seeded();
+            let engine = engine_on(store, clock);
+            let p = Proc::spawn();
+            let step = Duration::from_millis(100);
+            let first = engine
+                .agent_wait("s1".into(), p.host, step, true, "arm-a".into())
+                .await
+                .unwrap();
+            assert_eq!(first, AgentWait::Timeout);
+            let second = engine
+                .agent_wait("s1".into(), p.host, step, true, "arm-b".into())
+                .await
+                .unwrap();
+            assert_eq!(second, AgentWait::Armed);
+            let again = engine
+                .agent_wait("s1".into(), p.host, step, false, "arm-a".into())
+                .await
+                .unwrap();
+            assert_eq!(again, AgentWait::Timeout);
+        }
+    }
 
     mod report_host {
         use super::*;

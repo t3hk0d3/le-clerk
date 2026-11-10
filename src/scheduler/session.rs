@@ -3,10 +3,11 @@
 //! An `AgentSession` holder is the Claude Code session
 //! (`CLAUDE_CODE_SESSION_ID`). Every agent call and hook also reports its
 //! **host**, the Claude Code process (`CLAUDE_PID`, with its start time so
-//! a reused pid is never mistaken for it); the latest report wins. A process
-//! runs one session at a time, so a report of another session from the same
-//! process leaves the sessions it hosted before **unhosted** (`/clear`,
-//! `/resume` of another conversation).
+//! a reused pid is never mistaken for it). A session may have several hosts
+//! (resumed in a second terminal). A process runs one session at a time:
+//! when a hook reports another session from it ([`Sessions::report`]), it
+//! leaves the sessions it ran before (`/clear`, `/resume` of another
+//! conversation); other calls never switch it ([`Sessions::touch`]).
 //!
 //! A session is alive while it has a host whose process runs. When it stops
 //! being alive (unhosted, or its process gone as [`Sessions::probe`] finds),
@@ -18,9 +19,13 @@
 //! only from its current host ([`Sessions::end`]).
 //!
 //! ```text
-//! on report(s, h):  for t != s hosted by h: unhost t; grace[t] = now + grace
-//!                   host[s] = h; cancel grace[s]
-//! on probe:         for s hosted by a dead process: unhost s; grace[s] = now + grace
+//! on report(s, h):  (hooks) for t != s with h in hosts[t]: remove h;
+//!                   if hosts[t] empty: grace[t] = now + grace
+//!                   add h to hosts[s]; cancel grace[s]
+//! on touch(s, h):   (calls) if h in hosts[t] for some t != s and not in
+//!                   hosts[s]: nothing; else as report without the removal
+//! on probe:         remove dead hosts; a session left empty: grace starts
+//! on end(s, h):     remove h; if hosts[s] empty: end now (no grace)
 //! on tick(now):     for s with grace[s] <= now: end_holder(AgentSession(s)); forget s
 //! on daemon start:  hosts loaded from the store; every AgentSession with live
 //!                   leases or requests and no running host: grace[s] = boot + grace
@@ -47,16 +52,17 @@ use crate::store::{Store, StoreError, Tx, audit, leases, sessions as host_store}
 /// What [`Sessions::report`] did besides recording the host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reported {
-    /// The sessions the reporting process hosted before and left, whose
-    /// grace started.
+    /// The sessions the reporting process ran before and left, which have
+    /// no host left and whose grace started.
     pub unhosted: Vec<String>,
 }
 
 /// One agent session as the liveness record knows it.
 #[derive(Debug, Clone, Default)]
 struct Session {
-    /// The process running it; `None` once it left or died.
-    host: Option<Host>,
+    /// The processes running it (usually one; two when it is resumed in a
+    /// second terminal).
+    hosts: Vec<Host>,
     /// When the grace runs out, unix ms; set only while it has no host.
     grace_until: Option<i64>,
 }
@@ -99,9 +105,12 @@ impl Sessions {
         Ok(value)
     }
 
-    /// `session_id` was reported by `host` at `now_ms`: `host` runs it now
-    /// (any grace is cancelled), and every other session `host` ran before
-    /// is unhosted and gets the grace.
+    /// A hook reported that `host` runs `session_id` now, at `now_ms`:
+    /// `host` is one of its hosts (any grace is cancelled), and `host` no
+    /// longer runs any other session (a process runs one session at a
+    /// time: `/clear`, `/resume`). Only hooks report this way; every other
+    /// call goes through [`Sessions::touch`], which never switches a
+    /// process to another session.
     ///
     /// # Errors
     /// [`StoreError`] on storage failure.
@@ -112,32 +121,55 @@ impl Sessions {
         host: Host,
         now_ms: i64,
     ) -> Result<Reported, StoreError> {
-        let mut unhosted: Vec<String> = self
+        let mut left: Vec<String> = self
             .known
             .iter()
-            .filter(|(id, s)| id.as_str() != session_id && s.host == Some(host))
+            .filter(|(id, s)| id.as_str() != session_id && s.hosts.contains(&host))
             .map(|(id, _)| id.clone())
             .collect();
-        unhosted.sort();
-        for id in &unhosted {
-            self.unhost(tx, id, now_ms)?;
+        left.sort();
+        let mut unhosted = Vec::new();
+        for id in left {
+            if self.drop_host(tx, &id, host, now_ms)? {
+                unhosted.push(id);
+            }
         }
-        let session = self.known.entry(session_id.to_owned()).or_default();
-        let changed = session.host != Some(host) || session.grace_until.is_some();
-        session.host = Some(host);
-        session.grace_until = None;
-        if changed {
-            host_store::set_host(tx, session_id, host, now_ms)?;
-        }
+        self.add(tx, session_id, host, now_ms)?;
         Ok(Reported { unhosted })
     }
 
-    /// Whether a notice wait of `session_id` from `host` may run, at
-    /// `now_ms`. A wait never takes a session back from the session its
-    /// process runs now (a wait started before `/clear` must not undo it):
-    /// refused when `host` runs another session and not this one.
-    /// Otherwise `host` is reported as the session's host (a wait may be
-    /// the first call of a resumed session) and the wait may run.
+    /// A call of `session_id` (a CLI command, a notice wait) came from
+    /// `host` at `now_ms`. It never takes a process back from the session
+    /// it runs now (a call left over from before `/clear` must not undo
+    /// it): `false`, changing nothing, when `host` runs another session and
+    /// not this one. Otherwise `host` is recorded as one of the session's
+    /// hosts (a call may be the first of a resumed session) and `true`.
+    ///
+    /// # Errors
+    /// [`StoreError`] on storage failure.
+    pub fn touch(
+        &mut self,
+        tx: &Tx,
+        session_id: &str,
+        host: Host,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        if self.hosts_of(session_id).contains(&host) {
+            return Ok(true);
+        }
+        let elsewhere = self
+            .known
+            .iter()
+            .any(|(id, s)| id.as_str() != session_id && s.hosts.contains(&host));
+        if elsewhere {
+            return Ok(false);
+        }
+        self.add(tx, session_id, host, now_ms)?;
+        Ok(true)
+    }
+
+    /// Whether a notice wait of `session_id` from `host` may run: as
+    /// [`Sessions::touch`].
     ///
     /// # Errors
     /// [`StoreError`] on storage failure.
@@ -148,59 +180,90 @@ impl Sessions {
         host: Host,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        if self.host_of(session_id) == Some(host) {
-            return Ok(true);
-        }
-        let elsewhere = self
-            .known
-            .iter()
-            .any(|(id, s)| id.as_str() != session_id && s.host == Some(host));
-        if elsewhere {
-            return Ok(false);
-        }
-        self.report(tx, session_id, host, now_ms)?;
-        Ok(true)
+        self.touch(tx, session_id, host, now_ms)
     }
 
-    /// Unhost every session whose host process is gone at `now_ms`; their
-    /// grace starts. Returns those sessions.
+    /// Add `host` to `session_id`'s hosts and cancel its grace.
+    fn add(
+        &mut self,
+        tx: &Tx,
+        session_id: &str,
+        host: Host,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let session = self.known.entry(session_id.to_owned()).or_default();
+        session.grace_until = None;
+        if !session.hosts.contains(&host) {
+            session.hosts.push(host);
+            host_store::add_host(tx, session_id, host, now_ms)?;
+        }
+        Ok(())
+    }
+
+    /// Remove `host` from `session_id`'s hosts; when none is left the grace
+    /// starts at `now_ms` and `true` is returned.
+    fn drop_host(
+        &mut self,
+        tx: &Tx,
+        session_id: &str,
+        host: Host,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let session = self.known.entry(session_id.to_owned()).or_default();
+        session.hosts.retain(|h| *h != host);
+        host_store::remove_host(tx, session_id, host)?;
+        if session.hosts.is_empty() && session.grace_until.is_none() {
+            session.grace_until = Some(now_ms.saturating_add(self.grace_ms));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Drop every host whose process is gone at `now_ms`. Returns the
+    /// sessions left with no host, whose grace started.
     ///
     /// # Errors
     /// [`StoreError`] on storage failure.
     pub fn probe(&mut self, tx: &Tx, now_ms: i64) -> Result<Vec<String>, StoreError> {
-        let mut gone: Vec<String> = self
+        let mut dead: Vec<(String, Host)> = self
             .known
             .iter()
-            .filter(|(_, s)| s.host.is_some_and(|h| !process_alive(h.pid, h.start_time)))
-            .map(|(id, _)| id.clone())
+            .flat_map(|(id, s)| s.hosts.iter().map(move |h| (id.clone(), *h)))
+            .filter(|(_, h)| !process_alive(h.pid, h.start_time))
             .collect();
-        gone.sort();
-        for id in &gone {
-            tracing::info!(session = %id, "agent session's host process is gone");
-            self.unhost(tx, id, now_ms)?;
+        dead.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut gone = Vec::new();
+        for (id, host) in dead {
+            if self.drop_host(tx, &id, host, now_ms)? {
+                tracing::info!(session = %id, "agent session's host processes are gone");
+                gone.push(id);
+            }
         }
         Ok(gone)
-    }
-
-    /// `session_id` has no host from `now_ms`; its grace starts.
-    fn unhost(&mut self, tx: &Tx, session_id: &str, now_ms: i64) -> Result<(), StoreError> {
-        let session = self.known.entry(session_id.to_owned()).or_default();
-        session.host = None;
-        session.grace_until = Some(now_ms.saturating_add(self.grace_ms));
-        host_store::clear_host(tx, session_id, now_ms)
     }
 
     /// True while `session_id` has a host (whose process ran at the last
     /// report or probe).
     #[must_use]
     pub fn is_alive(&self, session_id: &str) -> bool {
-        self.host_of(session_id).is_some()
+        !self.hosts_of(session_id).is_empty()
     }
 
-    /// The process running `session_id`, if any.
+    /// The processes running `session_id`.
+    #[must_use]
+    pub fn hosts_of(&self, session_id: &str) -> Vec<Host> {
+        self.known
+            .get(session_id)
+            .map(|s| s.hosts.clone())
+            .unwrap_or_default()
+    }
+
+    /// The process that most recently started running `session_id`, if any.
     #[must_use]
     pub fn host_of(&self, session_id: &str) -> Option<Host> {
-        self.known.get(session_id).and_then(|s| s.host)
+        self.known
+            .get(session_id)
+            .and_then(|s| s.hosts.last().copied())
     }
 
     /// When `session_id`'s grace runs out, if one is running.
@@ -215,23 +278,26 @@ impl Sessions {
         self.known.values().filter_map(|s| s.grace_until).min()
     }
 
-    /// Daemon start at `now_ms`: hosts are loaded from the store, and every
-    /// `AgentSession` holder with a live lease or a queued request and no
-    /// running host gets the grace from now. Returns the sessions graced.
+    /// Daemon start at `now_ms`: hosts still running are loaded from the
+    /// store (the others forgotten), and every `AgentSession` holder with a
+    /// live lease or a queued request and no running host gets the grace
+    /// from now. Returns the sessions graced.
     ///
     /// # Errors
     /// [`StoreError`] on storage failure.
     pub fn boot(&mut self, tx: &Tx, now_ms: i64) -> Result<Vec<String>, StoreError> {
         for (id, host) in host_store::hosts(tx)? {
             if process_alive(host.pid, host.start_time) {
-                self.known.entry(id).or_default().host = Some(host);
+                self.known.entry(id).or_default().hosts.push(host);
+            } else {
+                host_store::remove_host(tx, &id, host)?;
             }
         }
         let until = now_ms.saturating_add(self.grace_ms);
         let mut graced = Vec::new();
         for id in agent_holders(tx)? {
             let session = self.known.entry(id.clone()).or_default();
-            if session.host.is_none() && session.grace_until.is_none() {
+            if session.hosts.is_empty() && session.grace_until.is_none() {
                 session.grace_until = Some(until);
                 graced.push(id);
             }
@@ -267,10 +333,11 @@ impl Sessions {
         Ok(due)
     }
 
-    /// `SessionEnd` of `session_id` with `reason`, from `host`: end its
-    /// leases and requests now, without grace, and forget it. Refused
-    /// (`None`, nothing changes) when another process runs the session
-    /// now: a second Claude Code on the same session keeps it.
+    /// `SessionEnd` of `session_id` with `reason`, from `host`. `host`
+    /// stops running the session; when no other process runs it, its leases
+    /// and requests end now, without grace, and it is forgotten. `None`
+    /// (nothing ended) when another process still runs it, or `host` is not
+    /// one of its hosts while it has some.
     ///
     /// # Errors
     /// [`SchedulerError::Store`] on storage failure.
@@ -282,10 +349,18 @@ impl Sessions {
         host: Option<Host>,
         reason: &str,
     ) -> Result<Option<HolderEnded>, SchedulerError> {
-        if let Some(current) = self.host_of(session_id)
-            && host != Some(current)
-        {
-            return Ok(None);
+        let hosts = self.hosts_of(session_id);
+        if !hosts.is_empty() {
+            let Some(host) = host.filter(|h| hosts.contains(h)) else {
+                return Ok(None);
+            };
+            if hosts.len() > 1 {
+                if let Some(session) = self.known.get_mut(session_id) {
+                    session.hosts.retain(|h| *h != host);
+                }
+                host_store::remove_host(tx, session_id, host)?;
+                return Ok(None);
+            }
         }
         let ended = end_session(
             tx,

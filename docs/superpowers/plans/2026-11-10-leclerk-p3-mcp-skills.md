@@ -804,10 +804,12 @@ stay as the record of what was built. Spec sections: §6, §7.1, §7.3, §8.1, �
     contact.
 - **Hosts:** the daemon records each session's host (`agent_hosts`:
   session_id, pid, start_time, last_seen), replacing `session_aliases`
-  (dropped by a migration). Every agent call and hook reports (session, host);
-  the latest report wins. A report of session N from a host makes every
-  other session hosted by that same process (pid and start time) **unhosted**.
-  SessionEnd ends its session at once (below).
+  (dropped by a migration). A session has a set of hosts. Hooks report
+  (session, host) and move the process: every other session it ran loses
+  it. Every other agent call and notice wait only touches: it adds the host
+  unless that process runs another session now, and never moves it (final
+  review). SessionEnd removes its host and ends the session when none is
+  left (below).
 - **Liveness:** a session is alive while it has a host whose process runs.
   When it stops being alive, `reconnect_grace` (60 s) starts; a report of the
   same session from any process within it re-hosts the session and cancels

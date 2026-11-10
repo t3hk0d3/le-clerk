@@ -12,7 +12,7 @@
 //!   one of those; the holder's other notices stay pending.
 //!
 //! - `GET /v1/agent/wait?session=<id>&host=<Host JSON>&wait=<secs, max
-//!   60>&first=<bool>` → `200 {"result": {"status": "notices", "notices":
+//!   60>&first=<bool>&arm=<token>` → `200 {"result": {"status": "notices", "notices":
 //!   [...]} | {"status": "timeout" | "armed" | "ended"}}`: one step of an
 //!   agent session's `clerk wait` (see [`EngineHandle::agent_wait`]); the
 //!   notices stay pending until acknowledged.
@@ -263,6 +263,9 @@ struct AgentWaitQuery {
     wait: u64,
     #[serde(default)]
     first: bool,
+    /// The wait's arm token.
+    #[serde(default)]
+    arm: String,
 }
 
 async fn agent_wait(
@@ -282,7 +285,7 @@ async fn agent_wait(
     };
     let wait = Duration::from_secs(query.wait);
     match engine
-        .agent_wait(query.session, host, wait, query.first)
+        .agent_wait(query.session, host, wait, query.first, query.arm)
         .await
     {
         Ok(answer) => ok(answer),
