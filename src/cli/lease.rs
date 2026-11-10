@@ -186,7 +186,11 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
         "held from the command line".to_owned(),
         &caller,
     );
-    body["skip_checks"] = json!(args.skip_checks);
+    if args.skip_checks {
+        // Sent only when set, so a daemon that predates it still serves
+        // every other acquire.
+        body["skip_checks"] = json!(true);
+    }
     let client = ctx.client().await?;
     if interactive {
         let _raw = RawMode::enable()?;
