@@ -171,14 +171,14 @@ pub enum AcquireView {
     },
     /// A paused holder's override of its own borrower: the unit comes back.
     Reclaiming { lease_id: LeaseId },
-    /// Between the engine and its handle only: ask again when the check of
-    /// a target unit is back. Never reaches a client.
-    Checking,
 }
 
-impl From<AcquireOutcome> for AcquireView {
-    fn from(o: AcquireOutcome) -> Self {
-        match o {
+impl AcquireView {
+    /// The answer for `o`. `None` for [`AcquireOutcome::Checking`], which is
+    /// between the engine and its handle and has no wire form.
+    #[must_use]
+    pub fn from_outcome(o: AcquireOutcome) -> Option<Self> {
+        Some(match o {
             AcquireOutcome::Granted(g) => Self::Granted(g),
             AcquireOutcome::Queued {
                 request_id,
@@ -194,8 +194,8 @@ impl From<AcquireOutcome> for AcquireView {
                 displaced,
             },
             AcquireOutcome::Reclaiming { lease_id } => Self::Reclaiming { lease_id },
-            AcquireOutcome::Checking => Self::Checking,
-        }
+            AcquireOutcome::Checking => return None,
+        })
     }
 }
 

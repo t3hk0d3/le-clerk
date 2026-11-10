@@ -1014,7 +1014,7 @@ mod scheduler {
             }
 
             #[test]
-            fn orders_by_clock_time_not_by_id() {
+            fn orders_by_insertion_not_by_clock_time() {
                 let mut f = fixture();
                 f.seed("board", &["u1"]);
                 let g = f.grant(&caller("a"), req(on("board"), MIN, Priority::Normal, "x"));
@@ -1037,10 +1037,7 @@ mod scheduler {
                 });
                 f.end(&g.lease_id);
                 f.dispatch();
-                assert_eq!(
-                    f.notices_of(&holder("second"), NoticeKind::Offered).len(),
-                    1
-                );
+                assert_eq!(f.notices_of(&holder("first"), NoticeKind::Offered).len(), 1);
             }
 
             #[test]

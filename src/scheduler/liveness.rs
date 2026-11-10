@@ -1,8 +1,9 @@
 //! Holder liveness: ending everything a holder that went away still has.
 //!
-//! A `CliProcess` holder is identified by pid and start time (field 22 of
-//! `/proc/<pid>/stat`), so a pid the kernel reused for another process does
-//! not keep a dead holder's leases alive. [`probe_all`] checks every such
+//! A `CliProcess` holder is identified by pid, start time (field 22 of
+//! `/proc/<pid>/stat`) and boot id, so neither a pid the kernel reused for
+//! another process nor a (pid, start tick) pair that came up again after a
+//! reboot keeps a dead holder's leases alive. [`probe_all`] checks every such
 //! holder that has a live lease or a queued request; the engine calls it
 //! periodically. `AgentSession` holders end through their liveness streams
 //! and the reconnect grace instead ([`crate::scheduler::session`], which
@@ -11,10 +12,11 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::sync::OnceLock;
 
 use serde_json::json;
 
-use crate::model::{EndCause, HolderRef, LeaseId, LeaseState, RequestId};
+use crate::model::{EndCause, HolderRef, Host, LeaseId, LeaseState, RequestId};
 use crate::scheduler::dispatch::QueueSnapshot;
 use crate::scheduler::{Scheduler, SchedulerError, clerk_actor};
 use crate::store::notices::NoticeKind;
@@ -73,6 +75,55 @@ pub fn process_alive(pid: u32, start_time: u64) -> bool {
     }
 }
 
+/// This boot's id (`/proc/sys/kernel/random/boot_id`); `None` when it cannot
+/// be read.
+#[must_use]
+pub fn boot_id() -> Option<String> {
+    static BOOT_ID: OnceLock<Option<String>> = OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            let text = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+            Some(text.trim().to_owned()).filter(|id| !id.is_empty())
+        })
+        .clone()
+}
+
+/// False only when `recorded` is a boot other than this one. A missing boot
+/// id proves nothing: rows from before boot ids survive on pid and start
+/// time alone.
+fn on_this_boot(recorded: Option<&str>) -> bool {
+    match (recorded, boot_id()) {
+        (Some(recorded), Some(current)) => recorded == current,
+        _ => true,
+    }
+}
+
+/// [`process_alive`], and not recorded on another boot.
+#[must_use]
+pub fn alive_on_boot(pid: u32, start_time: u64, boot: Option<&str>) -> bool {
+    on_this_boot(boot) && process_alive(pid, start_time)
+}
+
+/// True while `host`'s process runs, as for [`alive_on_boot`].
+#[must_use]
+pub fn host_alive(host: &Host) -> bool {
+    alive_on_boot(host.pid, host.start_time, host.boot_id.as_deref())
+}
+
+/// True when `holder` is a `CliProcess` whose process is gone. Other kinds
+/// of holder end some other way.
+#[must_use]
+pub fn process_holder_gone(holder: &HolderRef) -> bool {
+    match holder {
+        HolderRef::CliProcess {
+            pid,
+            start_time,
+            boot_id,
+        } => !alive_on_boot(*pid, *start_time, boot_id.as_deref()),
+        _ => false,
+    }
+}
+
 /// Check every `CliProcess` holder that has a live lease or a queued
 /// request, and call [`Scheduler::holder_gone`] for each one whose process
 /// is no longer alive. Returns the holders found gone, in the order first
@@ -92,13 +143,10 @@ pub fn probe_all(tx: &Tx, sched: &Scheduler) -> Result<Vec<HolderRef>, Scheduler
     }
     let mut gone = Vec::new();
     for holder in holders {
-        let HolderRef::CliProcess { pid, start_time } = holder else {
-            continue;
-        };
-        if process_alive(pid, start_time) {
+        if !process_holder_gone(&holder) {
             continue;
         }
-        tracing::info!(pid, start_time, "holder process is gone; ending its leases");
+        tracing::info!(?holder, "holder process is gone; ending its leases");
         sched.holder_gone(tx, &holder)?;
         gone.push(holder);
     }

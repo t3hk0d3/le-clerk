@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::Context;
 use leclerk::client::{ApiError, Client, DaemonError};
 use leclerk::model::{Caller, HolderRef};
-use leclerk::scheduler::liveness::process_alive;
+use leclerk::scheduler::liveness::host_alive;
 use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::Instant;
@@ -80,7 +80,7 @@ async fn steps(
     let started = Instant::now();
     let mut first = true;
     loop {
-        if !process_alive(host.pid, host.start_time) {
+        if !host_alive(&host) {
             return finish(
                 md,
                 args,
@@ -91,7 +91,7 @@ async fn steps(
             return finish(md, args, &empty(&["No notices arrived before --timeout."]));
         }
         let step = tokio::select! {
-            got = client.agent_wait(session_id, host, STEP.as_secs(), first, arm) => match got {
+            got = client.agent_wait(session_id, &host, STEP.as_secs(), first, arm) => match got {
                 Ok(step) => step,
                 Err(e) => return daemon_gone(md, args, e),
             },

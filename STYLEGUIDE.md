@@ -63,3 +63,11 @@ The single styleguide for this project. Every task and plan follows it.
   optional answer field, a new route, or a new optional request field that
   the client sends only when it is used (an old daemon refuses unknown
   fields, so it must never see one by default).
+- A new answer enum variant or field is additive *because* clients parse
+  leniently: unknown notice kinds read as `Unknown`, unknown fields are
+  ignored, and a holder or dirty record stays a JSON value (`src/client/wire.rs`).
+  Every new answer type must keep that: `deny_unknown_fields` belongs on
+  requests only (`UnitSettingsInput`, not `UnitSettings`).
+- A store vocabulary change (a new enum text or JSON shape in a row, migration
+  or not) bumps `VOCABULARY_VERSION` (`src/store/mod.rs`): a binary older than
+  its data refuses the database with `store_too_new`.

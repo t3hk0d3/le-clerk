@@ -67,10 +67,11 @@ pub enum ServiceMode {
     Listen,
 }
 
-/// Per-unit settings handed to the holder. Unknown keys are refused (the
-/// `type` tag excepted), so a misspelt field is an error, not a silent drop.
+/// Per-unit settings handed to the holder. Parsing tolerates unknown keys,
+/// so an answer or stored row from a newer binary still reads; what a person
+/// or client asks for comes in as [`UnitSettingsInput`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum UnitSettings {
     /// A device node.
     Device {
@@ -95,6 +96,58 @@ pub enum UnitSettings {
         /// Identity key.
         identity_key: String,
     },
+}
+
+/// [`UnitSettings`] as a request gives them. Unknown keys are refused (the
+/// `type` tag excepted), so a misspelt field is an error, not a silent drop.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UnitSettingsInput {
+    /// See [`UnitSettings::Device`].
+    Device { path: PathBuf },
+    /// See [`UnitSettings::Service`].
+    Service {
+        mode: ServiceMode,
+        scheme: Option<String>,
+        host: String,
+        port: u16,
+        service_id: Option<String>,
+    },
+    /// See [`UnitSettings::Generic`].
+    Generic { identity_key: String },
+}
+
+impl From<UnitSettingsInput> for UnitSettings {
+    fn from(input: UnitSettingsInput) -> Self {
+        match input {
+            UnitSettingsInput::Device { path } => Self::Device { path },
+            UnitSettingsInput::Service {
+                mode,
+                scheme,
+                host,
+                port,
+                service_id,
+            } => Self::Service {
+                mode,
+                scheme,
+                host,
+                port,
+                service_id,
+            },
+            UnitSettingsInput::Generic { identity_key } => Self::Generic { identity_key },
+        }
+    }
+}
+
+impl UnitSettingsInput {
+    /// Read a request's settings strictly, for `deserialize_with` on a field
+    /// that holds [`UnitSettings`].
+    ///
+    /// # Errors
+    /// As deserializing [`UnitSettingsInput`].
+    pub fn strict<'de, D: serde::Deserializer<'de>>(d: D) -> Result<UnitSettings, D::Error> {
+        Self::deserialize(d).map(UnitSettings::from)
+    }
 }
 
 /// Why unit settings were rejected.
@@ -203,6 +256,10 @@ pub enum HolderRef {
         pid: u32,
         /// Process start time.
         start_time: u64,
+        /// The boot it runs in; absent when unknown, and from holders
+        /// recorded before boot ids (the encoding then stays as it was).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot_id: Option<String>,
     },
     /// A human, by tag.
     User {
@@ -225,13 +282,17 @@ impl HolderRef {
 
 /// The Claude Code process hosting an agent session, identified by pid and
 /// start time (field 22 of `/proc/<pid>/stat`) so a reused pid is never
-/// mistaken for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// mistaken for it, and by boot, since start times restart with one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Host {
     /// Process id (`CLAUDE_PID`).
     pub pid: u32,
     /// Process start time.
     pub start_time: u64,
+    /// The boot it runs in; absent when unknown, and from hosts recorded
+    /// before boot ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 
 /// Who is calling the API.

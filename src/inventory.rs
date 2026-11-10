@@ -267,10 +267,9 @@ fn check_join(
     let mut leased = 0;
     let mut ids = Vec::new();
     for group in groups {
-        let live = leases::live_leases_on(tx, group)?;
-        if !live.is_empty() {
+        if leases::any_live_on(tx, group)? {
             leased += 1;
-            ids.extend(live.into_iter().map(|l| l.id));
+            ids.extend(leases::live_leases_on(tx, group)?.into_iter().map(|l| l.id));
         }
     }
     if leased >= 2 {
@@ -368,7 +367,7 @@ fn groups_without_auto_links(
 /// former partner be handed out again.
 fn check_split(tx: &Tx, subject: i64, hits: &[i64]) -> Result<(), InventoryError> {
     let current = sql::identity_group(tx, subject)?;
-    if leases::live_leases_on(tx, &current)?.is_empty() {
+    if !leases::any_live_on(tx, &current)? {
         return Ok(());
     }
     let after = closure(&links_after_change(tx, subject, hits)?, subject);

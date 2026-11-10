@@ -24,10 +24,11 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 use clap::{Args, ValueEnum};
+use leclerk::client::wire::{NoticeKind, NoticeView};
 use leclerk::client::{ApiError, Client};
 use leclerk::clock::{Clock, SystemClock};
 use leclerk::model::{Caller, HolderRef, LeaseId, RequestId, UnitSettings};
-use leclerk::store::notices::{Notice, NoticeFilter, NoticeKind};
+use leclerk::store::notices::NoticeFilter;
 use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::Instant;
@@ -509,7 +510,7 @@ pub async fn finish(client: &Client, caller: &Caller, lease: &str) -> Result<Val
 }
 
 /// The error for a notice that dropped the caller's request (exit 4).
-pub fn dropped(n: &Notice) -> ApiError {
+pub fn dropped(n: &NoticeView) -> ApiError {
     ApiError {
         code: "queue_dropped".to_owned(),
         message: n.action.clone(),
@@ -646,7 +647,6 @@ async fn supervise(
     command: &[OsString],
 ) -> anyhow::Result<u8> {
     let lease_id = id(lease, "lease_id")?;
-    let settings: UnitSettings = serde_json::from_value(lease["settings"].clone())?;
     let (program, rest) = command
         .split_first()
         .ok_or_else(|| UsageError("clerk run needs a command after --".to_owned()))?;
@@ -655,7 +655,7 @@ async fn supervise(
         .env("CLERK_LEASE_ID", &lease_id)
         .env("CLERK_RESOURCE", text(&lease["resource"]))
         .env("CLERK_UNIT", text(&lease["unit"]))
-        .envs(settings.env_vars())
+        .envs(unit_env(&lease["settings"]))
         .spawn()
     {
         Ok(child) => child,
@@ -743,6 +743,19 @@ async fn supervise(
     Ok(code)
 }
 
+/// The `CLERK_UNIT_*` variables of a grant's `settings`. Settings of a kind
+/// this clerk does not know give none: the lease is already held, and the
+/// command may not need them.
+fn unit_env(settings: &Value) -> Vec<(String, String)> {
+    match serde_json::from_value::<UnitSettings>(settings.clone()) {
+        Ok(settings) => settings.env_vars(),
+        Err(e) => {
+            note(|| format!("This clerk cannot read the unit's settings ({e}): no CLERK_UNIT_*."));
+            Vec::new()
+        }
+    }
+}
+
 /// Give `lease_id` back after its command exited with `code`: cleanup
 /// confirmed on exit 0, else ended at once with the unit dirty.
 async fn give_back(client: &Client, caller: &Caller, lease_id: &str, code: u8) {
@@ -779,7 +792,7 @@ fn terminal_delivers_sigint() -> bool {
 
 /// When a notice about the running command's lease means the command must
 /// stop: an override, an expiry (cleanup window) or the lease's end.
-fn stop_time(n: &Notice) -> Option<Instant> {
+fn stop_time(n: &NoticeView) -> Option<Instant> {
     match n.kind {
         NoticeKind::Overridden | NoticeKind::CleanupWindowStarted | NoticeKind::LeaseEnded => {
             let left = n
@@ -803,7 +816,7 @@ fn exit_code(status: ExitStatus) -> u8 {
 /// The next notices for the caller: an agent session's own, or, for the
 /// user, those of every live user-holder lease or request (each lease made
 /// by the user's CLI has its own holder). Waits up to [`POLL_SECS`].
-async fn next_batch(client: &Client, caller: &Caller) -> anyhow::Result<Vec<Notice>> {
+async fn next_batch(client: &Client, caller: &Caller) -> anyhow::Result<Vec<NoticeView>> {
     if caller::is_agent(caller) {
         return Ok(client.wait_notices(&caller.holder, POLL_SECS).await?);
     }
@@ -1130,7 +1143,7 @@ pub fn granted_text(v: &Value) -> String {
 }
 
 /// One notice: its kind, then what to do.
-pub fn notice_text(n: &Notice) -> String {
+pub fn notice_text(n: &NoticeView) -> String {
     let kind = serde_json::to_value(n.kind)
         .ok()
         .and_then(|k| k.as_str().map(str::to_owned))

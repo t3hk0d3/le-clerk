@@ -262,7 +262,7 @@ mod notice_queue {
             use super::*;
 
             #[test]
-            fn returns_them_oldest_first_by_created_at_then_insertion() {
+            fn returns_them_in_insertion_order_whatever_their_clock_or_id_says() {
                 let mut f = fixture();
                 let h = holder("h");
                 // Inserted newest first, with ids whose ULID order is the
@@ -277,7 +277,7 @@ mod notice_queue {
                     f.publish(n);
                 }
                 let ids: Vec<_> = f.take(&h, 10).into_iter().map(|n| n.id).collect();
-                assert_eq!(ids, vec![tie_a.id, tie_b.id, late.id]);
+                assert_eq!(ids, vec![late.id, tie_a.id, tie_b.id]);
             }
 
             #[test]
@@ -403,10 +403,12 @@ mod notice_queue {
                 let p = HolderRef::CliProcess {
                     pid: 7,
                     start_time: 100,
+                    boot_id: None,
                 };
                 let other = HolderRef::CliProcess {
                     pid: 7,
                     start_time: 101,
+                    boot_id: None,
                 };
                 f.publish(&notice(&p, NoticeKind::Offered, T0));
                 assert_eq!(f.take(&other, 10).len(), 0);
@@ -827,6 +829,7 @@ mod holder_ref_encoding {
         let h = HolderRef::CliProcess {
             pid: 7,
             start_time: 100,
+            boot_id: None,
         };
         assert_eq!(
             json(&h),

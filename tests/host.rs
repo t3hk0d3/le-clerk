@@ -153,7 +153,11 @@ impl Proc {
         let start_time = liveness::start_time(pid).expect("a running child has a start time");
         Self {
             child,
-            host: Host { pid, start_time },
+            host: Host {
+                pid,
+                start_time,
+                boot_id: None,
+            },
         }
     }
 
@@ -307,7 +311,7 @@ impl Fixture {
 
     /// `s1` hosted by `p` holds `board/u1`, and user `w` waits for it.
     fn held_by_s1(&mut self, p: &Proc) -> LeaseId {
-        self.report("s1", p.host);
+        self.report("s1", p.host.clone());
         let lease = self.grant(agent("s1"));
         self.queue(user("w"));
         lease
@@ -334,9 +338,9 @@ mod scheduler {
                 fn records_its_host() {
                     let mut f = fixture();
                     let p = Proc::spawn();
-                    let reported = f.report("s1", p.host);
+                    let reported = f.report("s1", p.host.clone());
                     assert_eq!(reported.unhosted, Vec::<String>::new());
-                    assert_eq!(f.sessions.host_of("s1"), Some(p.host));
+                    assert_eq!(f.sessions.host_of("s1"), Some(p.host.clone()));
                     assert!(f.sessions.is_alive("s1"));
                 }
             }
@@ -349,7 +353,7 @@ mod scheduler {
                     let mut f = fixture();
                     let p = Proc::spawn();
                     f.held_by_s1(&p);
-                    let reported = f.report("s2", p.host);
+                    let reported = f.report("s2", p.host.clone());
                     assert_eq!(reported.unhosted, vec!["s1".to_owned()]);
                     assert_eq!(f.sessions.host_of("s1"), None);
                     assert!(!f.sessions.is_alive("s1"));
@@ -362,7 +366,7 @@ mod scheduler {
                     let mut f = fixture();
                     let p = Proc::spawn();
                     let lease = f.held_by_s1(&p);
-                    f.report("s2", p.host);
+                    f.report("s2", p.host.clone());
                     f.at(T0 + GRACE_MS - 1);
                     assert_eq!(f.expire(), Vec::<String>::new());
                     assert_eq!(f.lease(&lease).0, "held");
@@ -382,8 +386,8 @@ mod scheduler {
                     assert_eq!(f.sessions.grace_ends("s1"), Some(T0 + GRACE_MS));
                     f.at(T0 + GRACE_MS / 2);
                     let new = Proc::spawn();
-                    f.report("s1", new.host);
-                    assert_eq!(f.sessions.host_of("s1"), Some(new.host));
+                    f.report("s1", new.host.clone());
+                    assert_eq!(f.sessions.host_of("s1"), Some(new.host.clone()));
                     assert_eq!(f.sessions.grace_ends("s1"), None);
                     f.at(T0 + 3 * GRACE_MS);
                     assert_eq!(f.expire(), Vec::<String>::new());
@@ -402,10 +406,11 @@ mod scheduler {
                     let reused = Host {
                         pid: p.host.pid,
                         start_time: p.host.start_time + 1,
+                        boot_id: None,
                     };
                     let reported = f.report("s2", reused);
                     assert_eq!(reported.unhosted, Vec::<String>::new());
-                    assert_eq!(f.sessions.host_of("s1"), Some(p.host));
+                    assert_eq!(f.sessions.host_of("s1"), Some(p.host.clone()));
                     assert!(f.sessions.is_alive("s1"));
                 }
             }
@@ -421,7 +426,7 @@ mod scheduler {
                 fn records_its_host() {
                     let mut f = fixture();
                     let p = Proc::spawn();
-                    assert_eq!(f.touch("s1", Some(p.host)), Hosting::Hosted);
+                    assert_eq!(f.touch("s1", Some(p.host.clone())), Hosting::Hosted);
                     assert!(f.sessions.is_alive("s1"));
                 }
             }
@@ -433,8 +438,8 @@ mod scheduler {
                 fn returns_hosted() {
                     let mut f = fixture();
                     let p = Proc::spawn();
-                    f.report("s1", p.host);
-                    assert_eq!(f.touch("s1", Some(p.host)), Hosting::Hosted);
+                    f.report("s1", p.host.clone());
+                    assert_eq!(f.touch("s1", Some(p.host.clone())), Hosting::Hosted);
                 }
             }
 
@@ -445,9 +450,9 @@ mod scheduler {
                 fn returns_host_runs_other_naming_that_session() {
                     let mut f = fixture();
                     let p = Proc::spawn();
-                    f.report("s1", p.host);
+                    f.report("s1", p.host.clone());
                     assert_eq!(
-                        f.touch("s2", Some(p.host)),
+                        f.touch("s2", Some(p.host.clone())),
                         Hosting::HostRunsOther("s1".into())
                     );
                 }
@@ -456,10 +461,10 @@ mod scheduler {
                 fn records_nothing() {
                     let mut f = fixture();
                     let p = Proc::spawn();
-                    f.report("s1", p.host);
-                    f.touch("s2", Some(p.host));
+                    f.report("s1", p.host.clone());
+                    f.touch("s2", Some(p.host.clone()));
                     assert_eq!(f.sessions.hosts_of("s2"), Vec::<Host>::new());
-                    assert_eq!(f.sessions.hosts_of("s1"), vec![p.host]);
+                    assert_eq!(f.sessions.hosts_of("s1"), vec![p.host.clone()]);
                 }
             }
 
@@ -483,9 +488,9 @@ mod scheduler {
                     let mut f = fixture();
                     let p = Proc::spawn();
                     f.held_by_s1(&p);
-                    f.report("s2", p.host);
+                    f.report("s2", p.host.clone());
                     assert_eq!(
-                        f.touch("s1", Some(p.host)),
+                        f.touch("s1", Some(p.host.clone())),
                         Hosting::HostRunsOther("s2".into())
                     );
                     assert!(!f.sessions.is_alive("s1"));
@@ -505,9 +510,9 @@ mod scheduler {
                 let p = Proc::spawn();
                 let q = Proc::spawn();
                 let lease = f.held_by_s1(&p);
-                f.report("s1", q.host);
-                f.report("s1", p.host);
-                assert!(!f.end("s1", Some(p.host), "prompt_input_exit"));
+                f.report("s1", q.host.clone());
+                f.report("s1", p.host.clone());
+                assert!(!f.end("s1", Some(p.host.clone()), "prompt_input_exit"));
                 assert_eq!(f.lease(&lease).0, "held");
                 assert!(f.sessions.is_alive("s1"));
             }
@@ -518,7 +523,7 @@ mod scheduler {
                 let mut p = Proc::spawn();
                 let q = Proc::spawn();
                 f.held_by_s1(&p);
-                f.report("s1", q.host);
+                f.report("s1", q.host.clone());
                 p.kill();
                 assert_eq!(f.probe(), Vec::<String>::new());
                 assert!(f.sessions.is_alive("s1"));
@@ -531,9 +536,9 @@ mod scheduler {
                 let p = Proc::spawn();
                 let q = Proc::spawn();
                 let lease = f.held_by_s1(&p);
-                f.report("s1", q.host);
-                assert!(!f.end("s1", Some(p.host), "prompt_input_exit"));
-                assert!(f.end("s1", Some(q.host), "prompt_input_exit"));
+                f.report("s1", q.host.clone());
+                assert!(!f.end("s1", Some(p.host.clone()), "prompt_input_exit"));
+                assert!(f.end("s1", Some(q.host.clone()), "prompt_input_exit"));
                 assert_eq!(f.lease(&lease).0, "ended");
             }
         }
@@ -619,7 +624,7 @@ mod scheduler {
                     let lease = f.grant(agent("ghost"));
                     f.sweep();
                     f.at(T0 + GRACE_MS - 1);
-                    f.report("ghost", p.host);
+                    f.report("ghost", p.host.clone());
                     f.at(T0 + GRACE_MS);
                     assert_eq!(f.expire(), Vec::<String>::new());
                     assert_eq!(f.sweep(), Vec::<String>::new());
@@ -634,7 +639,7 @@ mod scheduler {
                 fn starts_no_grace() {
                     let mut f = fixture();
                     let p = Proc::spawn();
-                    f.report("s1", p.host);
+                    f.report("s1", p.host.clone());
                     f.grant(agent("s1"));
                     assert_eq!(f.sweep(), Vec::<String>::new());
                     assert_eq!(f.sessions.grace_ends("s1"), None);
@@ -668,9 +673,9 @@ mod scheduler {
                     let mut f = fixture();
                     let other = Proc::spawn();
                     let mut p = Proc::spawn();
-                    f.report("s0", other.host);
+                    f.report("s0", other.host.clone());
                     f.grant(agent("s0"));
-                    f.report("s1", p.host);
+                    f.report("s1", p.host.clone());
                     f.queue(agent("s1"));
                     p.kill();
                     f.probe();
@@ -694,7 +699,7 @@ mod scheduler {
                     f.held_by_s1(&p);
                     assert_eq!(f.restart(), Vec::<String>::new());
                     assert!(f.sessions.is_alive("s1"));
-                    assert_eq!(f.sessions.host_of("s1"), Some(p.host));
+                    assert_eq!(f.sessions.host_of("s1"), Some(p.host.clone()));
                 }
             }
 
@@ -711,7 +716,7 @@ mod scheduler {
                     assert_eq!(f.restart(), vec!["s1".to_owned()]);
                     assert_eq!(f.sessions.grace_ends("s1"), Some(T0 + 10 + GRACE_MS));
                     let new = Proc::spawn();
-                    f.report("s1", new.host);
+                    f.report("s1", new.host.clone());
                     f.at(T0 + 3 * GRACE_MS);
                     assert_eq!(f.expire(), Vec::<String>::new());
                     assert_eq!(f.lease(&lease).0, "held");
@@ -740,7 +745,7 @@ mod scheduler {
                     let mut f = fixture();
                     let p = Proc::spawn();
                     f.held_by_s1(&p);
-                    f.report("s2", p.host);
+                    f.report("s2", p.host.clone());
                     assert_eq!(f.restart(), vec!["s1".to_owned()]);
                     assert!(!f.sessions.is_alive("s1"));
                     assert!(f.sessions.is_alive("s2"));
@@ -759,7 +764,7 @@ mod scheduler {
                     let mut f = fixture();
                     let p = Proc::spawn();
                     let lease = f.held_by_s1(&p);
-                    assert!(f.end("s1", Some(p.host), "clear"));
+                    assert!(f.end("s1", Some(p.host.clone()), "clear"));
                     let (state, cause, _) = f.lease(&lease);
                     assert_eq!(state, "ended");
                     assert_eq!(cause.as_deref(), Some("holder_gone"));
@@ -771,7 +776,7 @@ mod scheduler {
                     let mut f = fixture();
                     let p = Proc::spawn();
                     f.held_by_s1(&p);
-                    f.end("s1", Some(p.host), "prompt_input_exit");
+                    f.end("s1", Some(p.host.clone()), "prompt_input_exit");
                     let entries = f.audit("session_ended");
                     assert_eq!(entries.len(), 1);
                     assert_eq!(entries[0].detail["session"], "s1");
@@ -783,7 +788,7 @@ mod scheduler {
                     let mut f = fixture();
                     let p = Proc::spawn();
                     f.held_by_s1(&p);
-                    f.end("s1", Some(p.host), "logout");
+                    f.end("s1", Some(p.host.clone()), "logout");
                     assert_eq!(f.sessions.host_of("s1"), None);
                     assert_eq!(f.sessions.grace_ends("s1"), None);
                 }
@@ -798,7 +803,7 @@ mod scheduler {
                     let p = Proc::spawn();
                     let other = Proc::spawn();
                     let lease = f.held_by_s1(&p);
-                    assert!(!f.end("s1", Some(other.host), "prompt_input_exit"));
+                    assert!(!f.end("s1", Some(other.host.clone()), "prompt_input_exit"));
                     assert_eq!(f.lease(&lease).0, "held");
                     assert!(f.sessions.is_alive("s1"));
                     assert_eq!(f.audit("session_ended").len(), 0);
@@ -815,8 +820,8 @@ mod scheduler {
                     let mut f = fixture();
                     let p = Proc::spawn();
                     let lease = f.held_by_s1(&p);
-                    f.report("s2", p.host);
-                    assert!(f.end("s1", Some(p.host), "clear"));
+                    f.report("s2", p.host.clone());
+                    assert!(f.end("s1", Some(p.host.clone()), "clear"));
                     assert_eq!(f.lease(&lease).0, "ended");
                 }
             }
@@ -943,17 +948,17 @@ mod engine {
             let p = Proc::spawn();
             let step = Duration::from_millis(100);
             let first = engine
-                .agent_wait("s1".into(), p.host, step, true, "arm-a".into())
+                .agent_wait("s1".into(), p.host.clone(), step, true, "arm-a".into())
                 .await
                 .unwrap();
             assert_eq!(first, AgentWait::Timeout);
             let second = engine
-                .agent_wait("s1".into(), p.host, step, true, "arm-b".into())
+                .agent_wait("s1".into(), p.host.clone(), step, true, "arm-b".into())
                 .await
                 .unwrap();
             assert_eq!(second, AgentWait::Armed);
             let again = engine
-                .agent_wait("s1".into(), p.host, step, false, "arm-a".into())
+                .agent_wait("s1".into(), p.host.clone(), step, false, "arm-a".into())
                 .await
                 .unwrap();
             assert_eq!(again, AgentWait::Timeout);
@@ -968,12 +973,12 @@ mod engine {
             let p = Proc::spawn();
             let step = Duration::from_millis(100);
             engine
-                .agent_wait("s1".into(), p.host, step, true, "arm-a".into())
+                .agent_wait("s1".into(), p.host.clone(), step, true, "arm-a".into())
                 .await
                 .unwrap();
             engine.disarm("s1".into(), "arm-a");
             let next = engine
-                .agent_wait("s1".into(), p.host, step, true, "arm-b".into())
+                .agent_wait("s1".into(), p.host.clone(), step, true, "arm-b".into())
                 .await
                 .unwrap();
             assert_eq!(next, AgentWait::Timeout);
@@ -986,12 +991,12 @@ mod engine {
             let p = Proc::spawn();
             let step = Duration::from_millis(100);
             engine
-                .agent_wait("s1".into(), p.host, step, true, "arm-a".into())
+                .agent_wait("s1".into(), p.host.clone(), step, true, "arm-a".into())
                 .await
                 .unwrap();
             engine.disarm("s1".into(), "arm-x");
             let next = engine
-                .agent_wait("s1".into(), p.host, step, true, "arm-b".into())
+                .agent_wait("s1".into(), p.host.clone(), step, true, "arm-b".into())
                 .await
                 .unwrap();
             assert_eq!(next, AgentWait::Armed);
@@ -1021,8 +1026,11 @@ mod engine {
                     let (store, clock) = seeded();
                     let engine = engine_on(store, clock);
                     let p = Proc::spawn();
-                    engine.report_host("s1".into(), p.host).await.unwrap();
-                    assert_not_hosted(acquire(&engine, agent("s2"), Some(p.host)).await);
+                    engine
+                        .report_host("s1".into(), p.host.clone())
+                        .await
+                        .unwrap();
+                    assert_not_hosted(acquire(&engine, agent("s2"), Some(p.host.clone())).await);
                 }
 
                 #[tokio::test(flavor = "multi_thread")]
@@ -1030,7 +1038,10 @@ mod engine {
                     let (store, clock) = seeded();
                     let engine = engine_on(store, clock);
                     let p = Proc::spawn();
-                    engine.report_host("s1".into(), p.host).await.unwrap();
+                    engine
+                        .report_host("s1".into(), p.host.clone())
+                        .await
+                        .unwrap();
                     assert_not_hosted(acquire(&engine, agent("s1"), None).await);
                 }
 
@@ -1051,7 +1062,9 @@ mod engine {
                     let (store, clock) = seeded();
                     let engine = engine_on(store, clock);
                     let p = Proc::spawn();
-                    let got = acquire(&engine, agent("s1"), Some(p.host)).await.unwrap();
+                    let got = acquire(&engine, agent("s1"), Some(p.host.clone()))
+                        .await
+                        .unwrap();
                     assert_eq!(got["outcome"], "granted", "{got}");
                     assert!(engine.session_alive("s1".into()).await.unwrap());
                 }
@@ -1081,7 +1094,7 @@ mod engine {
                     let (store, clock) = seeded();
                     let engine = engine_on(store, clock);
                     let p = Proc::spawn();
-                    let lease = offered(&engine, "s1", p.host).await;
+                    let lease = offered(&engine, "s1", p.host.clone()).await;
                     let args = serde_json::json!({ "lease_id": lease });
                     assert_not_hosted(rpc(&engine, "claim", agent("s1"), None, args.clone()).await);
                     let view = rpc(&engine, "get_lease", agent("s1"), None, args)
@@ -1099,9 +1112,9 @@ mod engine {
                     let (store, clock) = seeded();
                     let engine = engine_on(store, clock);
                     let p = Proc::spawn();
-                    let lease = offered(&engine, "s1", p.host).await;
+                    let lease = offered(&engine, "s1", p.host.clone()).await;
                     let args = serde_json::json!({ "lease_id": lease });
-                    let view = rpc(&engine, "claim", agent("s1"), Some(p.host), args)
+                    let view = rpc(&engine, "claim", agent("s1"), Some(p.host.clone()), args)
                         .await
                         .unwrap();
                     assert_eq!(view["state"], "held", "{view}");
@@ -1138,7 +1151,10 @@ mod engine {
                     let (store, clock) = seeded();
                     let engine = engine_on(store, clock);
                     let p = Proc::spawn();
-                    engine.report_host("s1".into(), p.host).await.unwrap();
+                    engine
+                        .report_host("s1".into(), p.host.clone())
+                        .await
+                        .unwrap();
                     let lease = user_holds(&engine).await;
                     rpc(&engine, "rehome_holder", user("x"), None, to(&lease, "s1"))
                         .await
@@ -1155,7 +1171,9 @@ mod engine {
                     let (store, clock) = seeded();
                     let engine = engine_on(store, clock);
                     let p = Proc::spawn();
-                    let lease = acquire(&engine, agent("s1"), Some(p.host)).await.unwrap();
+                    let lease = acquire(&engine, agent("s1"), Some(p.host.clone()))
+                        .await
+                        .unwrap();
                     let args = serde_json::json!({
                         "lease_id": lease["lease_id"], "new_holder": user("y"),
                     });
@@ -1218,7 +1236,10 @@ mod engine {
             let (store, clock) = seeded();
             let engine = engine_on(store, clock);
             let p = Proc::spawn();
-            engine.report_host("s1".into(), p.host).await.unwrap();
+            engine
+                .report_host("s1".into(), p.host.clone())
+                .await
+                .unwrap();
             assert!(engine.session_alive("s1".into()).await.unwrap());
         }
     }
@@ -1231,8 +1252,13 @@ mod engine {
             let (store, clock) = seeded();
             let engine = engine_on(store, clock.clone());
             let mut p = Proc::spawn();
-            engine.report_host("s1".into(), p.host).await.unwrap();
-            acquire(&engine, agent("s1"), Some(p.host)).await.unwrap();
+            engine
+                .report_host("s1".into(), p.host.clone())
+                .await
+                .unwrap();
+            acquire(&engine, agent("s1"), Some(p.host.clone()))
+                .await
+                .unwrap();
             p.kill();
             eventually("the probe notices the dead host", async || {
                 !engine.session_alive("s1".into()).await.unwrap()

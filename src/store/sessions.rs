@@ -3,7 +3,7 @@
 use crate::model::Host;
 use crate::store::{StoreError, Tx};
 
-fn start(host: Host) -> i64 {
+fn start(host: &Host) -> i64 {
     i64::try_from(host.start_time).unwrap_or(i64::MAX)
 }
 
@@ -11,11 +11,11 @@ fn start(host: Host) -> i64 {
 ///
 /// # Errors
 /// [`StoreError`] on SQL failure.
-pub fn add_host(tx: &Tx, session_id: &str, host: Host, now_ms: i64) -> Result<(), StoreError> {
+pub fn add_host(tx: &Tx, session_id: &str, host: &Host, now_ms: i64) -> Result<(), StoreError> {
     tx.conn().execute(
-        "INSERT OR REPLACE INTO agent_hosts (session_id, pid, start_time, last_seen) \
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![session_id, host.pid, start(host), now_ms],
+        "INSERT OR REPLACE INTO agent_hosts (session_id, pid, start_time, last_seen, boot_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![session_id, host.pid, start(host), now_ms, host.boot_id],
     )?;
     Ok(())
 }
@@ -24,10 +24,23 @@ pub fn add_host(tx: &Tx, session_id: &str, host: Host, now_ms: i64) -> Result<()
 ///
 /// # Errors
 /// [`StoreError`] on SQL failure.
-pub fn remove_host(tx: &Tx, session_id: &str, host: Host) -> Result<(), StoreError> {
+pub fn remove_host(tx: &Tx, session_id: &str, host: &Host) -> Result<(), StoreError> {
     tx.conn().execute(
         "DELETE FROM agent_hosts WHERE session_id = ?1 AND pid = ?2 AND start_time = ?3",
         rusqlite::params![session_id, host.pid, start(host)],
+    )?;
+    Ok(())
+}
+
+/// Record the boot id `host` reports on its existing row.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure.
+pub fn set_boot_id(tx: &Tx, session_id: &str, host: &Host) -> Result<(), StoreError> {
+    tx.conn().execute(
+        "UPDATE agent_hosts SET boot_id = ?4 \
+         WHERE session_id = ?1 AND pid = ?2 AND start_time = ?3",
+        rusqlite::params![session_id, host.pid, start(host), host.boot_id],
     )?;
     Ok(())
 }
@@ -49,9 +62,9 @@ pub fn forget(tx: &Tx, session_id: &str) -> Result<(), StoreError> {
 /// # Errors
 /// [`StoreError`] on SQL failure.
 pub fn hosts(tx: &Tx) -> Result<Vec<(String, Host)>, StoreError> {
-    let mut stmt = tx
-        .conn()
-        .prepare("SELECT session_id, pid, start_time FROM agent_hosts ORDER BY session_id")?;
+    let mut stmt = tx.conn().prepare(
+        "SELECT session_id, pid, start_time, boot_id FROM agent_hosts ORDER BY session_id",
+    )?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -59,6 +72,7 @@ pub fn hosts(tx: &Tx) -> Result<Vec<(String, Host)>, StoreError> {
                 Host {
                     pid: r.get(1)?,
                     start_time: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                    boot_id: r.get(3)?,
                 },
             ))
         })?

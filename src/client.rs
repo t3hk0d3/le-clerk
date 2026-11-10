@@ -28,7 +28,11 @@ use crate::config::{Paths, SocketPathTooLong, check_socket_path};
 use crate::error::ErrorCode;
 use crate::model::{Caller, HolderRef, Host, LeaseId, RequestId};
 use crate::scheduler::liveness;
-use crate::store::notices::{Notice, NoticeFilter};
+use crate::store::notices::NoticeFilter;
+
+pub mod wire;
+
+use wire::NoticeView;
 
 /// How long `ensure_running` waits for a spawned daemon to answer.
 pub const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -293,6 +297,7 @@ pub fn cli_caller() -> Caller {
         Some(start_time) => HolderRef::CliProcess {
             pid: std::process::id(),
             start_time,
+            boot_id: liveness::boot_id(),
         },
         None => HolderRef::User {
             tag: "cli".to_owned(),
@@ -673,7 +678,7 @@ impl Client {
         limit: Duration,
     ) -> Result<Value, ApiError> {
         let mut body = json!({ "caller": caller, "args": args });
-        if let Some(host) = self.host {
+        if let Some(host) = &self.host {
             body["host"] = json!(host);
         }
         let body = serde_json::to_vec(&body)
@@ -695,7 +700,7 @@ impl Client {
         &self,
         holder: &HolderRef,
         secs: u64,
-    ) -> Result<Vec<Notice>, ApiError> {
+    ) -> Result<Vec<NoticeView>, ApiError> {
         self.wait_notices_matching(holder, None, secs).await
     }
 
@@ -710,7 +715,7 @@ impl Client {
         holder: &HolderRef,
         filter: Option<&NoticeFilter>,
         secs: u64,
-    ) -> Result<Vec<Notice>, ApiError> {
+    ) -> Result<Vec<NoticeView>, ApiError> {
         self.riding_restarts(|| self.wait_notices_once(holder, filter, secs))
             .await
     }
@@ -721,11 +726,11 @@ impl Client {
         holder: &HolderRef,
         filter: Option<&NoticeFilter>,
         secs: u64,
-    ) -> Result<Vec<Notice>, ApiError> {
+    ) -> Result<Vec<NoticeView>, ApiError> {
         let holder = serde_json::to_string(holder)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let mut params = vec![("holder", holder), ("wait", secs.to_string())];
-        if let Some(host) = self.host {
+        if let Some(host) = &self.host {
             params.push(("host", json!(host).to_string()));
         }
         if let Some(f) = filter {
@@ -752,8 +757,8 @@ impl Client {
         )
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-        let result = decode(status, &body)?;
-        serde_json::from_value(result).map_err(|e| ApiError::new("bad_response", e.to_string()))
+        wire::parse_notices(decode(status, &body)?)
+            .map_err(|e| ApiError::new("bad_response", e.to_string()))
     }
 
     /// One step of agent session `session`'s notice wait from `host`, up to
@@ -765,7 +770,7 @@ impl Client {
     pub async fn agent_wait(
         &self,
         session: &str,
-        host: Host,
+        host: &Host,
         secs: u64,
         first: bool,
         arm: &str,
@@ -778,12 +783,12 @@ impl Client {
     async fn agent_wait_once(
         &self,
         session: &str,
-        host: Host,
+        host: &Host,
         secs: u64,
         first: bool,
         arm: &str,
     ) -> Result<Value, ApiError> {
-        let host = serde_json::to_string(&host)
+        let host = serde_json::to_string(host)
             .map_err(|e| ApiError::new("invalid_request", e.to_string()))?;
         let query = serde_urlencoded::to_string([
             ("session", session.to_owned()),

@@ -94,7 +94,11 @@ fn in_project(tag: &str, project: &str) -> Caller {
 fn me() -> Host {
     let pid = std::process::id();
     let start_time = liveness::start_time(pid).expect("this process is running");
-    Host { pid, start_time }
+    Host {
+        pid,
+        start_time,
+        boot_id: None,
+    }
 }
 
 async fn rpc(
@@ -585,7 +589,11 @@ mod engine {
                 let pid = child.id();
                 let start_time = leclerk::scheduler::liveness::start_time(pid).unwrap();
                 let gone = Caller {
-                    holder: HolderRef::CliProcess { pid, start_time },
+                    holder: HolderRef::CliProcess {
+                        pid,
+                        start_time,
+                        boot_id: None,
+                    },
                     project: None,
                     override_reason: None,
                 };

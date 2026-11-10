@@ -322,6 +322,7 @@ impl Sleeper {
         HolderRef::CliProcess {
             pid,
             start_time: liveness::start_time(pid).expect("child start time"),
+            boot_id: None,
         }
     }
 
@@ -343,6 +344,7 @@ fn self_holder() -> HolderRef {
     HolderRef::CliProcess {
         pid: std::process::id(),
         start_time: liveness::self_start_time().expect("own start time"),
+        boot_id: None,
     }
 }
 
@@ -768,6 +770,7 @@ mod holder_liveness {
                 let stale = HolderRef::CliProcess {
                     pid: std::process::id(),
                     start_time: liveness::self_start_time().expect("own start time") + 1,
+                    boot_id: None,
                 };
                 let lease = f
                     .grant(&as_caller(stale.clone()), req("board", Priority::Normal))

@@ -111,32 +111,64 @@ pub fn publish(tx: &Tx, notice: &Notice) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The notice in `payload`; `None`, logged, when it does not decode. Such a
+/// row stays where it is, undelivered.
+fn decode(tx: &Tx, row: i64, payload: &str) -> Option<Notice> {
+    match serde_json::from_str(payload) {
+        Ok(notice) => Some(notice),
+        Err(e) => {
+            tx.log_skipped("notices", row, &e);
+            None
+        }
+    }
+}
+
+/// `(row_id, notice)` of the first `limit` rows of `(row_id, payload)` that
+/// decode. Rows after those are not read, and rows that do not decode do not
+/// count: however many there are, they cannot hold up the notices behind.
+fn decode_up_to(
+    tx: &Tx,
+    mut rows: rusqlite::Rows<'_>,
+    limit: u32,
+) -> Result<Vec<(i64, Notice)>, StoreError> {
+    let mut out = Vec::new();
+    while out.len() < limit as usize {
+        let Some(r) = rows.next()? else {
+            break;
+        };
+        let row: i64 = r.get(0)?;
+        let payload: String = r.get(1)?;
+        if let Some(notice) = decode(tx, row, &payload) {
+            out.push((row, notice));
+        }
+    }
+    Ok(out)
+}
+
 /// Undelivered notices of `holder`, oldest first, without marking them.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure.
 pub fn pending(tx: &Tx, holder: &HolderRef) -> Result<Vec<Notice>, StoreError> {
     let mut stmt = tx.conn().prepare(
-        "SELECT payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
-         ORDER BY created_at, row_id",
+        "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
+         ORDER BY row_id",
     )?;
-    let payloads = stmt
-        .query_map([serde_json::to_string(holder)?], |r| r.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    payloads
-        .iter()
-        .map(|p| serde_json::from_str(p).map_err(StoreError::from))
-        .collect()
+    let rows = stmt.query([serde_json::to_string(holder)?])?;
+    Ok(decode_up_to(tx, rows, u32::MAX)?
+        .into_iter()
+        .map(|(_, n)| n)
+        .collect())
 }
 
-/// Take up to `limit` undelivered notices of `holder`, oldest first (by
-/// `created_at`, then insertion order, never by id), and mark them delivered
-/// in the same transaction. The holder matches structurally: its JSON
-/// encoding is the serde derive's, whose field order is fixed.
-/// `delivered_at` is set to `now_ms`.
+/// Take up to `limit` undelivered notices of `holder`, in insertion order
+/// (never by the clock or by id), and mark them delivered in the same
+/// transaction. The holder matches structurally: its JSON encoding is the
+/// serde derive's, whose field order is fixed. `delivered_at` is set to
+/// `now_ms`.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure.
 pub fn take(
     tx: &Tx,
     holder: &HolderRef,
@@ -168,11 +200,11 @@ impl NoticeFilter {
 
 /// [`take`], but with `filter` only the notices it matches are taken (up to
 /// `limit`, oldest first); the others stay pending. The filter runs in SQL
-/// on the stored payload, so only the rows taken are read and parsed: a
-/// damaged row that is not taken cannot fail the take.
+/// on the stored payload, so only the rows taken are read and parsed. A row
+/// that does not decode is logged and left undelivered.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row among those taken.
+/// [`StoreError`] on SQL failure.
 pub fn take_matching(
     tx: &Tx,
     holder: &HolderRef,
@@ -184,10 +216,10 @@ pub fn take_matching(
     let mut mark = tx
         .conn()
         .prepare("UPDATE notices SET delivered_at = ?2 WHERE row_id = ?1")?;
-    rows.iter()
-        .map(|(row, payload)| {
+    rows.into_iter()
+        .map(|(row, notice)| {
             mark.execute(rusqlite::params![row, now_ms])?;
-            serde_json::from_str(payload).map_err(StoreError::from)
+            Ok(notice)
         })
         .collect()
 }
@@ -200,7 +232,7 @@ pub fn take_matching(
 /// matches.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row among those returned.
+/// [`StoreError`] on SQL failure.
 pub fn returned(
     tx: &Tx,
     holder: &HolderRef,
@@ -212,10 +244,10 @@ pub fn returned(
     let mut mark = tx
         .conn()
         .prepare("UPDATE notices SET returned_at = COALESCE(returned_at, ?2) WHERE row_id = ?1")?;
-    rows.iter()
-        .map(|(row, payload)| {
+    rows.into_iter()
+        .map(|(row, notice)| {
             mark.execute(rusqlite::params![row, now_ms])?;
-            serde_json::from_str(payload).map_err(StoreError::from)
+            Ok(notice)
         })
         .collect()
 }
@@ -248,19 +280,17 @@ pub fn ack(
 /// first, changing nothing. Showing is not delivery: see [`mark_shown`].
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure.
 pub fn unshown(tx: &Tx, holder: &HolderRef) -> Result<Vec<Notice>, StoreError> {
     let mut stmt = tx.conn().prepare(
-        "SELECT payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
-         AND hook_shown_at IS NULL ORDER BY created_at, row_id",
+        "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
+         AND hook_shown_at IS NULL ORDER BY row_id",
     )?;
-    let payloads = stmt
-        .query_map([serde_json::to_string(holder)?], |r| r.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    payloads
-        .iter()
-        .map(|p| serde_json::from_str(p).map_err(StoreError::from))
-        .collect()
+    let rows = stmt.query([serde_json::to_string(holder)?])?;
+    Ok(decode_up_to(tx, rows, u32::MAX)?
+        .into_iter()
+        .map(|(_, n)| n)
+        .collect())
 }
 
 /// Mark those of `ids` that are undelivered, not yet shown notices of
@@ -288,26 +318,24 @@ pub fn mark_shown(
     )?)
 }
 
-/// `(row_id, payload)` of up to `limit` undelivered notices of `holder`,
+/// `(row_id, notice)` of up to `limit` undelivered notices of `holder`,
 /// oldest first; with `filter`, only those it matches. The filter runs in
-/// SQL on the stored payload, so only the rows selected are read.
+/// SQL on the stored payload, so only the rows selected are read. There is
+/// no SQL `LIMIT`: rows that do not decode must not use it up.
 fn select_pending(
     tx: &Tx,
     holder: &HolderRef,
     filter: Option<&NoticeFilter>,
     limit: u32,
-) -> Result<Vec<(i64, String)>, StoreError> {
+) -> Result<Vec<(i64, Notice)>, StoreError> {
     let holder = serde_json::to_string(holder)?;
-    Ok(match filter {
+    match filter {
         None => {
             let mut stmt = tx.conn().prepare(
                 "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
-                 ORDER BY created_at, row_id LIMIT ?2",
+                 ORDER BY row_id",
             )?;
-            stmt.query_map(rusqlite::params![holder, limit], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
+            decode_up_to(tx, stmt.query([holder])?, limit)
         }
         Some(f) => {
             // CASE keeps json_extract away from payloads that are not JSON.
@@ -317,20 +345,16 @@ fn select_pending(
                         json_extract(payload, '$.lease_id') IN (SELECT value FROM json_each(?2)) \
                         OR json_extract(payload, '$.request_id') IN (SELECT value FROM json_each(?3)) \
                       ELSE 0 END) \
-                 ORDER BY created_at, row_id LIMIT ?4",
+                 ORDER BY row_id",
             )?;
-            stmt.query_map(
-                rusqlite::params![
-                    holder,
-                    serde_json::to_string(&f.leases)?,
-                    serde_json::to_string(&f.requests)?,
-                    limit
-                ],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            )?
-            .collect::<Result<Vec<_>, _>>()?
+            let rows = stmt.query(rusqlite::params![
+                holder,
+                serde_json::to_string(&f.leases)?,
+                serde_json::to_string(&f.requests)?,
+            ])?;
+            decode_up_to(tx, rows, limit)
         }
-    })
+    }
 }
 
 /// The highest notice row written so far; 0 when there are none. Rows only
@@ -373,15 +397,16 @@ pub fn holders_after(tx: &Tx, after: i64) -> Result<Vec<HolderRef>, StoreError> 
 
 /// Hand every undelivered notice of `from` to `to`, as [`rehome`] does for
 /// one lease's notices, keeping whether a hook already showed it (the same
-/// conversation took over). Returns how many moved.
+/// conversation took over). A row that does not decode stays behind, logged.
+/// Returns how many moved.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure.
 pub fn rehome_all(tx: &Tx, from: &HolderRef, to: &HolderRef) -> Result<usize, StoreError> {
     let rows = {
         let mut stmt = tx.conn().prepare(
             "SELECT row_id, payload, hook_shown_at FROM notices WHERE holder = ?1 \
-             AND delivered_at IS NULL ORDER BY created_at, row_id",
+             AND delivered_at IS NULL ORDER BY row_id",
         )?;
         stmt.query_map([serde_json::to_string(from)?], |r| {
             Ok((
@@ -392,8 +417,11 @@ pub fn rehome_all(tx: &Tx, from: &HolderRef, to: &HolderRef) -> Result<usize, St
         })?
         .collect::<Result<Vec<_>, _>>()?
     };
+    let mut moved = 0;
     for (row, payload, shown) in &rows {
-        let mut notice: Notice = serde_json::from_str(payload)?;
+        let Some(mut notice) = decode(tx, *row, payload) else {
+            continue;
+        };
         notice.id = NoticeId::new();
         notice.holder = to.clone();
         publish(tx, &notice)?;
@@ -405,19 +433,21 @@ pub fn rehome_all(tx: &Tx, from: &HolderRef, to: &HolderRef) -> Result<usize, St
         }
         tx.conn()
             .execute("DELETE FROM notices WHERE row_id = ?1", [row])?;
+        moved += 1;
     }
-    Ok(rows.len())
+    Ok(moved)
 }
 
 /// Hand the undelivered notices of `from` about `lease` to `to`. Each one is
-/// written again as a new row, under a fresh id but with its `created_at`
-/// (so its place in the order is kept), before the old row goes: the new
-/// row id is then above every row written so far, which is what wakes the
-/// new holder's waiters. (Deleting first would let SQLite reuse the old,
-/// already-seen row id.) Returns how many moved.
+/// written again as a new row, under a fresh id, before the old row goes:
+/// the new row id is then above every row written so far, which is what
+/// wakes the new holder's waiters. (Deleting first would let SQLite reuse
+/// the old, already-seen row id.) They keep their order among themselves and
+/// come after what `to` already has. A row that does not decode stays
+/// behind, logged. Returns how many moved.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure.
 pub fn rehome(
     tx: &Tx,
     from: &HolderRef,
@@ -427,7 +457,7 @@ pub fn rehome(
     let rows = {
         let mut stmt = tx.conn().prepare(
             "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
-             ORDER BY created_at, row_id",
+             ORDER BY row_id",
         )?;
         stmt.query_map([serde_json::to_string(from)?], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
@@ -436,7 +466,9 @@ pub fn rehome(
     };
     let mut moved = 0;
     for (row, payload) in rows {
-        let mut notice: Notice = serde_json::from_str(&payload)?;
+        let Some(mut notice) = decode(tx, row, &payload) else {
+            continue;
+        };
         if notice.lease_id.as_ref() != Some(lease) {
             continue;
         }

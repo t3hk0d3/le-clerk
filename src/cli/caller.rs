@@ -21,15 +21,24 @@ pub const PID_VAR: &str = "CLAUDE_PID";
 /// its start time; `None` when unset, unparsable or no longer running.
 #[must_use]
 pub fn host() -> Option<Host> {
-    host_from(std::env::var(PID_VAR).ok(), liveness::start_time)
+    host_from(
+        std::env::var(PID_VAR).ok(),
+        liveness::start_time,
+        liveness::boot_id(),
+    )
 }
 
 /// [`host`] with its inputs given.
-fn host_from(pid: Option<String>, start_time: impl Fn(u32) -> Option<u64>) -> Option<Host> {
+fn host_from(
+    pid: Option<String>,
+    start_time: impl Fn(u32) -> Option<u64>,
+    boot_id: Option<String>,
+) -> Option<Host> {
     let pid: u32 = pid?.trim().parse().ok()?;
     Some(Host {
         pid,
         start_time: start_time(pid)?,
+        boot_id,
     })
 }
 
@@ -136,6 +145,7 @@ fn resolve(
             HolderRef::CliProcess {
                 pid: std::process::id(),
                 start_time,
+                boot_id: liveness::boot_id(),
             }
         }
         // Without a start time this process cannot be told from a later one
@@ -159,22 +169,23 @@ mod tests {
 
     #[test]
     fn host_is_claude_pid_with_its_start_time() {
-        let host = host_from(Some("42".to_owned()), |pid| (pid == 42).then_some(7));
+        let host = host_from(Some("42".to_owned()), |pid| (pid == 42).then_some(7), None);
         assert_eq!(
             host,
             Some(Host {
                 pid: 42,
-                start_time: 7
+                start_time: 7,
+                boot_id: None
             })
         );
     }
 
     #[test]
     fn no_host_without_claude_pid_or_with_a_gone_or_bad_one() {
-        assert_eq!(host_from(None, |_| Some(7)), None);
-        assert_eq!(host_from(Some("42".to_owned()), |_| None), None);
-        assert_eq!(host_from(Some("x".to_owned()), |_| Some(7)), None);
-        assert_eq!(host_from(Some(String::new()), |_| Some(7)), None);
+        assert_eq!(host_from(None, |_| Some(7), None), None);
+        assert_eq!(host_from(Some("42".to_owned()), |_| None, None), None);
+        assert_eq!(host_from(Some("x".to_owned()), |_| Some(7), None), None);
+        assert_eq!(host_from(Some(String::new()), |_| Some(7), None), None);
     }
 
     fn project() -> ProjectKey {
@@ -207,7 +218,8 @@ mod tests {
             caller.holder,
             HolderRef::CliProcess {
                 pid: std::process::id(),
-                start_time: 7
+                start_time: 7,
+                boot_id: liveness::boot_id()
             }
         );
     }

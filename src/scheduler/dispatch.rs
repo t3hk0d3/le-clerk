@@ -24,14 +24,10 @@ use crate::store::{Tx, audit};
 pub(super) type HealthCache = HashMap<i64, bool>;
 
 /// Queue order: override requests that displaced a lease first, then higher
-/// priority, then earlier by the clock, then by row id (never by ULID).
-pub(super) fn queue_key(r: &RequestRow) -> (bool, Reverse<Priority>, i64, i64) {
-    (
-        r.override_lease.is_none(),
-        Reverse(r.priority),
-        r.created_at,
-        r.row,
-    )
+/// priority, then by row id: insertion order, never the clock (which can
+/// step back) or the ULID.
+pub(super) fn queue_key(r: &RequestRow) -> (bool, Reverse<Priority>, i64) {
+    (r.override_lease.is_none(), Reverse(r.priority), r.row)
 }
 
 /// One queued request with what it competes for.
@@ -241,7 +237,7 @@ impl Scheduler {
     fn sweep_retiring(&self, tx: &Tx) -> Result<(), SchedulerError> {
         let now = self.now();
         for row in inventory_sql::retiring_unit_rows(tx)? {
-            if !leases::live_leases_on(tx, &[row])?.is_empty() {
+            if leases::any_live_on(tx, &[row])? {
                 continue;
             }
             let Some(unit) = inventory_sql::unit_by_row(tx, row)? else {

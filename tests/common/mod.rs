@@ -119,9 +119,16 @@ impl AgentHosts {
             let child = StdCommand::new("sleep").arg("300").spawn().unwrap();
             let pid = child.id();
             let start_time = liveness::start_time(pid).expect("a running child has a start time");
-            (child, Host { pid, start_time })
+            (
+                child,
+                Host {
+                    pid,
+                    start_time,
+                    boot_id: None,
+                },
+            )
         });
-        Some(*host)
+        Some(host.clone())
     }
 }
 

@@ -12,6 +12,7 @@ use leclerk::client::{ApiError, DaemonError};
 use leclerk::daemon::RunError;
 use leclerk::error::ErrorCode;
 use leclerk::scope::ScopeError;
+use leclerk::store::StoreError;
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -29,7 +30,8 @@ pub const EXIT_USAGE: u8 = 2;
 const EXIT_NOT_FOUND: u8 = 3;
 /// Exit code: refused or conflict.
 pub const EXIT_REFUSED: u8 = 4;
-/// Exit code: the daemon is unavailable, unresponsive or another version.
+/// Exit code: the daemon is unavailable, unresponsive, another version, or
+/// its store is newer than it.
 pub const EXIT_DAEMON: u8 = 5;
 /// Exit code: the request is queued (`--no-wait`).
 pub const EXIT_QUEUED: u8 = 6;
@@ -183,6 +185,14 @@ impl From<anyhow::Error> for Failure {
                     exit: EXIT_DAEMON,
                 };
             }
+            Ok(RunError::Store(store @ StoreError::TooNew { .. })) => {
+                return Self {
+                    code: store.code().to_owned(),
+                    message: store.to_string(),
+                    details: None,
+                    exit: exit_for(store.code()),
+                };
+            }
             Ok(other) => anyhow::Error::new(other),
             Err(e) => e,
         };
@@ -228,7 +238,8 @@ fn exit_for(code: &str) -> u8 {
         | "protocol_mismatch"
         | "daemon_restarting"
         | "daemon_stopping"
-        | "engine_unavailable" => EXIT_DAEMON,
+        | "engine_unavailable"
+        | "store_too_new" => EXIT_DAEMON,
         "invalid_request"
         | "invalid_argument"
         | "invalid_id"
@@ -491,6 +502,7 @@ mod tests {
                     "daemon_unresponsive",
                     "protocol_mismatch",
                     "engine_unavailable",
+                    "store_too_new",
                 ],
             ),
             (

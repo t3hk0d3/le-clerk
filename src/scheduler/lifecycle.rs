@@ -821,7 +821,7 @@ impl Scheduler {
                     // A partner already dirty keeps its earlier record
                     // (reason and previous holder).
                     for row in group(tx, unit.row)? {
-                        if row == unit.row || !leases::live_leases_on(tx, &[row])?.is_empty() {
+                        if row == unit.row || leases::any_live_on(tx, &[row])? {
                             continue;
                         }
                         if inventory_sql::unit_by_row(tx, row)?.is_some_and(|u| u.dirty.is_none()) {

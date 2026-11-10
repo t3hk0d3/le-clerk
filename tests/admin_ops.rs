@@ -91,7 +91,11 @@ fn session(id: &str) -> Caller {
 
 fn cli(pid: u32, start_time: u64) -> Caller {
     Caller {
-        holder: HolderRef::CliProcess { pid, start_time },
+        holder: HolderRef::CliProcess {
+            pid,
+            start_time,
+            boot_id: None,
+        },
         project: None,
         override_reason: None,
     }
@@ -110,7 +114,11 @@ fn admin() -> Caller {
 fn me() -> Host {
     let pid = std::process::id();
     let start_time = liveness::start_time(pid).expect("this process is running");
-    Host { pid, start_time }
+    Host {
+        pid,
+        start_time,
+        boot_id: None,
+    }
 }
 
 async fn rpc(

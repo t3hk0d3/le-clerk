@@ -48,7 +48,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::model::{EndCause, HolderRef, Host, LeaseId};
-use crate::scheduler::liveness::{HolderEnded, process_alive};
+use crate::scheduler::liveness::{HolderEnded, host_alive};
 use crate::scheduler::{Scheduler, SchedulerError, clerk_actor};
 use crate::store::{Store, StoreError, Tx, audit, leases, sessions as host_store};
 
@@ -136,6 +136,7 @@ impl Sessions {
         host: Host,
         now_ms: i64,
     ) -> Result<Reported, StoreError> {
+        self.adopt_boot_id(tx, &host)?;
         let mut left: Vec<String> = self
             .known
             .iter()
@@ -145,7 +146,7 @@ impl Sessions {
         left.sort();
         let mut unhosted = Vec::new();
         for id in left {
-            if self.drop_host(tx, &id, host, now_ms)? {
+            if self.drop_host(tx, &id, &host, now_ms)? {
                 unhosted.push(id);
             }
         }
@@ -174,6 +175,7 @@ impl Sessions {
         let Some(host) = host else {
             return Ok(Hosting::NotHosted);
         };
+        self.adopt_boot_id(tx, &host)?;
         if self.hosts_of(session_id).contains(&host) {
             return Ok(Hosting::Hosted);
         }
@@ -190,6 +192,26 @@ impl Sessions {
         Ok(Hosting::Hosted)
     }
 
+    /// `host` reports its boot id: every record of the same process from
+    /// before boot ids takes it, so the two are one host from now on.
+    fn adopt_boot_id(&mut self, tx: &Tx, host: &Host) -> Result<(), StoreError> {
+        if host.boot_id.is_none() {
+            return Ok(());
+        }
+        for (id, session) in &mut self.known {
+            for known in &mut session.hosts {
+                if known.boot_id.is_none()
+                    && known.pid == host.pid
+                    && known.start_time == host.start_time
+                {
+                    known.boot_id.clone_from(&host.boot_id);
+                    host_store::set_boot_id(tx, id, host)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Add `host` to `session_id`'s hosts and cancel its grace.
     fn add(
         &mut self,
@@ -201,8 +223,8 @@ impl Sessions {
         let session = self.known.entry(session_id.to_owned()).or_default();
         session.grace_until = None;
         if !session.hosts.contains(&host) {
+            host_store::add_host(tx, session_id, &host, now_ms)?;
             session.hosts.push(host);
-            host_store::add_host(tx, session_id, host, now_ms)?;
         }
         Ok(())
     }
@@ -213,11 +235,11 @@ impl Sessions {
         &mut self,
         tx: &Tx,
         session_id: &str,
-        host: Host,
+        host: &Host,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
         let session = self.known.entry(session_id.to_owned()).or_default();
-        session.hosts.retain(|h| *h != host);
+        session.hosts.retain(|h| h != host);
         host_store::remove_host(tx, session_id, host)?;
         if session.hosts.is_empty() && session.grace_until.is_none() {
             session.grace_until = Some(now_ms.saturating_add(self.grace_ms));
@@ -235,13 +257,13 @@ impl Sessions {
         let mut dead: Vec<(String, Host)> = self
             .known
             .iter()
-            .flat_map(|(id, s)| s.hosts.iter().map(move |h| (id.clone(), *h)))
-            .filter(|(_, h)| !process_alive(h.pid, h.start_time))
+            .flat_map(|(id, s)| s.hosts.iter().map(move |h| (id.clone(), h.clone())))
+            .filter(|(_, h)| !host_alive(h))
             .collect();
         dead.sort_by(|a, b| a.0.cmp(&b.0));
         let mut gone = Vec::new();
         for (id, host) in dead {
-            if self.drop_host(tx, &id, host, now_ms)? {
+            if self.drop_host(tx, &id, &host, now_ms)? {
                 tracing::info!(session = %id, "agent session's host processes are gone");
                 gone.push(id);
             }
@@ -292,7 +314,7 @@ impl Sessions {
     pub fn host_of(&self, session_id: &str) -> Option<Host> {
         self.known
             .get(session_id)
-            .and_then(|s| s.hosts.last().copied())
+            .and_then(|s| s.hosts.last().cloned())
     }
 
     /// When `session_id`'s grace runs out, if one is running.
@@ -316,10 +338,10 @@ impl Sessions {
     /// [`StoreError`] on storage failure.
     pub fn boot(&mut self, tx: &Tx, now_ms: i64) -> Result<Vec<String>, StoreError> {
         for (id, host) in host_store::hosts(tx)? {
-            if process_alive(host.pid, host.start_time) {
+            if host_alive(&host) {
                 self.known.entry(id).or_default().hosts.push(host);
             } else {
-                host_store::remove_host(tx, &id, host)?;
+                host_store::remove_host(tx, &id, &host)?;
             }
         }
         let until = now_ms.saturating_add(self.grace_ms);
@@ -378,14 +400,17 @@ impl Sessions {
         host: Option<Host>,
         reason: &str,
     ) -> Result<Option<HolderEnded>, SchedulerError> {
+        if let Some(host) = &host {
+            self.adopt_boot_id(tx, host)?;
+        }
         let hosts = self.hosts_of(session_id);
         if !hosts.is_empty() {
-            let Some(host) = host.filter(|h| hosts.contains(h)) else {
+            let Some(host) = host.as_ref().filter(|h| hosts.contains(h)) else {
                 return Ok(None);
             };
             if hosts.len() > 1 {
                 if let Some(session) = self.known.get_mut(session_id) {
-                    session.hosts.retain(|h| *h != host);
+                    session.hosts.retain(|h| h != host);
                 }
                 host_store::remove_host(tx, session_id, host)?;
                 return Ok(None);
@@ -409,8 +434,8 @@ impl Sessions {
 
     /// The leases the last session `host` ended released, once: the next
     /// session's brief says so (`/clear`).
-    pub fn take_released(&mut self, host: Host) -> Vec<LeaseId> {
-        self.released.remove(&host).unwrap_or_default()
+    pub fn take_released(&mut self, host: &Host) -> Vec<LeaseId> {
+        self.released.remove(host).unwrap_or_default()
     }
 
     /// Drop everything known about `session_id`.

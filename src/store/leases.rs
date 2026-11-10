@@ -189,10 +189,33 @@ fn lease_from_row(r: &Row<'_>) -> rusqlite::Result<Result<LeaseRow, StoreError>>
     })())
 }
 
+/// [`lease_from_row`] with the row id, which it may not get to report.
+fn lease_with_row(r: &Row<'_>) -> rusqlite::Result<(i64, Result<LeaseRow, StoreError>)> {
+    Ok((r.get(0)?, lease_from_row(r)?))
+}
+
+/// The rows that decode; each of the others is logged and skipped, so one
+/// row a query cannot read does not fail it. SQL failures still do.
+fn decodable<T>(
+    tx: &Tx,
+    table: &'static str,
+    rows: impl Iterator<Item = rusqlite::Result<(i64, Result<T, StoreError>)>>,
+) -> Result<Vec<T>, StoreError> {
+    let mut out = Vec::new();
+    for row in rows {
+        match row? {
+            (_, Ok(value)) => out.push(value),
+            (row, Err(e)) => tx.log_skipped(table, row, &e),
+        }
+    }
+    Ok(out)
+}
+
 fn collect_leases(
-    rows: impl Iterator<Item = rusqlite::Result<Result<LeaseRow, StoreError>>>,
+    tx: &Tx,
+    rows: impl Iterator<Item = rusqlite::Result<(i64, Result<LeaseRow, StoreError>)>>,
 ) -> Result<Vec<LeaseRow>, StoreError> {
-    rows.collect::<Result<Vec<_>, _>>()?.into_iter().collect()
+    decodable(tx, "leases", rows)
 }
 
 /// Insert a lease; returns its row id.
@@ -259,6 +282,21 @@ pub fn offer_for_request(tx: &Tx, request: &RequestId) -> Result<Option<LeaseRow
         .transpose()
 }
 
+/// True when any of `units` has a lease that is not ended, read or not: a
+/// row this binary cannot decode still occupies its unit. Whether a unit may
+/// be handed out or removed is decided here, not on the decoded leases.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure.
+pub fn any_live_on(tx: &Tx, units: &[i64]) -> Result<bool, StoreError> {
+    Ok(tx.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM leases WHERE state != 'ended' \
+         AND unit_row IN (SELECT value FROM json_each(?1)))",
+        [serde_json::to_string(units)?],
+        |r| r.get(0),
+    )?)
+}
+
 /// Leases that are not ended on any of `units`, oldest first.
 ///
 /// # Errors
@@ -270,7 +308,7 @@ pub fn live_leases_on(tx: &Tx, units: &[i64]) -> Result<Vec<LeaseRow>, StoreErro
     ))?;
     let mut out = Vec::new();
     for unit in units {
-        out.extend(collect_leases(stmt.query_map([unit], lease_from_row)?)?);
+        out.extend(collect_leases(tx, stmt.query_map([unit], lease_with_row)?)?);
     }
     out.sort_by_key(|l| (l.created_at, l.row));
     Ok(out)
@@ -285,7 +323,7 @@ pub fn lapsed_offers(tx: &Tx, before: i64) -> Result<Vec<LeaseRow>, StoreError> 
         "SELECT {LEASE_COLUMNS} FROM leases WHERE state = 'offered' AND claim_deadline < ?1 \
          ORDER BY claim_deadline, row_id"
     ))?;
-    collect_leases(stmt.query_map([before], lease_from_row)?)
+    collect_leases(tx, stmt.query_map([before], lease_with_row)?)
 }
 
 /// Leases that have a running timer: offered, held or cleaning.
@@ -297,7 +335,7 @@ pub fn timed_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
         "SELECT {LEASE_COLUMNS} FROM leases \
          WHERE state IN ('offered', 'held', 'cleaning') ORDER BY row_id"
     ))?;
-    collect_leases(stmt.query_map([], lease_from_row)?)
+    collect_leases(tx, stmt.query_map([], lease_with_row)?)
 }
 
 /// Move a held lease's end to `ends_at`, record its new total
@@ -432,12 +470,12 @@ pub fn set_ended(tx: &Tx, row: i64, cause: EndCause, confirmed: bool) -> Result<
 /// Every lease that is not ended, by row.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure.
 pub fn live_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {LEASE_COLUMNS} FROM leases WHERE state != 'ended' ORDER BY row_id"
     ))?;
-    collect_leases(stmt.query_map([], lease_from_row)?)
+    collect_leases(tx, stmt.query_map([], lease_with_row)?)
 }
 
 /// Leases in state paused, by row.
@@ -448,7 +486,7 @@ pub fn paused_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {LEASE_COLUMNS} FROM leases WHERE state = 'paused' ORDER BY row_id"
     ))?;
-    collect_leases(stmt.query_map([], lease_from_row)?)
+    collect_leases(tx, stmt.query_map([], lease_with_row)?)
 }
 
 /// One lease by row id.
@@ -676,6 +714,11 @@ const REQUEST_COLUMNS: &str = "row_id, request_id, resource_row, unit_row, holde
      priority, interruptible, purpose, duration_ms, created_at, override_reason, override_lease, \
      skip_checks";
 
+/// [`request_from_row`] with the row id, which it may not get to report.
+fn request_with_row(r: &Row<'_>) -> rusqlite::Result<(i64, Result<RequestRow, StoreError>)> {
+    Ok((r.get(0)?, request_from_row(r)?))
+}
+
 fn request_from_row(r: &Row<'_>) -> rusqlite::Result<Result<RequestRow, StoreError>> {
     let row: i64 = r.get(0)?;
     let id: String = r.get(1)?;
@@ -758,8 +801,8 @@ pub fn find_request(tx: &Tx, id: &RequestId) -> Result<Option<RequestRow>, Store
         .transpose()
 }
 
-/// Every queued request, in insertion order. Callers order them by priority
-/// and `created_at`.
+/// Every queued request, in insertion order. Callers put them in queue
+/// order.
 ///
 /// # Errors
 /// [`StoreError`] on SQL failure or a damaged row.
@@ -767,10 +810,7 @@ pub fn queued_requests(tx: &Tx) -> Result<Vec<RequestRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {REQUEST_COLUMNS} FROM requests WHERE state = 'queued' ORDER BY row_id"
     ))?;
-    let rows = stmt
-        .query_map([], request_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
-    rows.into_iter().collect()
+    decodable(tx, "requests", stmt.query_map([], request_with_row)?)
 }
 
 /// Remove a request from the queue. A yield ask pending for it is
@@ -837,7 +877,7 @@ pub fn orphan_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
               OR resource_row NOT IN (SELECT row_id FROM resources)) \
          ORDER BY row_id"
     ))?;
-    collect_leases(stmt.query_map([], lease_from_row)?)
+    collect_leases(tx, stmt.query_map([], lease_with_row)?)
 }
 
 /// Queued requests whose resource, or pinned unit, does not exist, by row.
@@ -851,8 +891,5 @@ pub fn orphan_requests(tx: &Tx) -> Result<Vec<RequestRow>, StoreError> {
               OR (unit_row IS NOT NULL AND unit_row NOT IN (SELECT row_id FROM units))) \
          ORDER BY row_id"
     ))?;
-    let rows = stmt
-        .query_map([], request_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
-    rows.into_iter().collect()
+    decodable(tx, "requests", stmt.query_map([], request_with_row)?)
 }

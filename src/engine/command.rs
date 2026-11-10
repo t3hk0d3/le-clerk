@@ -21,7 +21,7 @@ use crate::inventory::{
 };
 use crate::model::{
     Caller, HealthSpec, HolderRef, Host, LeaseId, NoticeId, Priority, ProjectKey, PromotionId,
-    RequestId, ResourceId, ResourceType, Scope, UnitId, UnitSettings,
+    RequestId, ResourceId, ResourceType, Scope, UnitId, UnitSettingsInput,
 };
 use crate::scheduler::session::{Hosting, Sessions};
 use crate::scheduler::{AcquireRequest, Confirm, LeaseEdit, Scheduler, Target};
@@ -158,7 +158,7 @@ pub struct AddUnitArgs {
     #[serde(default)]
     pub scope: Option<ScopeSpec>,
     pub id: UnitId,
-    pub settings: UnitSettings,
+    pub settings: UnitSettingsInput,
     #[serde(default)]
     pub description: String,
 }
@@ -174,7 +174,7 @@ pub struct UpdateUnitArgs {
     pub scope: Option<ScopeSpec>,
     pub unit: UnitId,
     #[serde(default)]
-    pub settings: Option<UnitSettings>,
+    pub settings: Option<UnitSettingsInput>,
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -579,6 +579,13 @@ pub(crate) struct Services<'a> {
     pub defer_on_check: bool,
 }
 
+/// An acquire's answer between the engine and its handle only: ask again
+/// when the check of a target unit is back. It has no [`AcquireView`] and
+/// never reaches a client.
+pub(crate) fn still_checking() -> Value {
+    json!({ "outcome": "checking" })
+}
+
 impl Command {
     /// True when the command never changes scheduling state, so the engine
     /// need not tick and dispatch after it. (Admin reads still write their
@@ -827,7 +834,7 @@ impl Command {
                 let who = scoped(tx, who, a.scope.as_ref(), &a.resource)?;
                 let new = NewUnit {
                     id: a.id,
-                    settings: a.settings,
+                    settings: a.settings.into(),
                     description: a.description,
                 };
                 encode(CreatedUnit::from(inv.add_unit(
@@ -839,7 +846,7 @@ impl Command {
             }
             Self::UpdateUnit(who, a) => {
                 let patch = UnitPatch {
-                    settings: a.settings,
+                    settings: a.settings.map(Into::into),
                     description: a.description,
                 };
                 let who = scoped(tx, who, a.scope.as_ref(), &a.resource)?;
@@ -882,7 +889,10 @@ impl Command {
                 } else {
                     sched.acquire(tx, &who, req)?
                 };
-                encode(AcquireView::from(outcome))
+                match AcquireView::from_outcome(outcome) {
+                    Some(view) => encode(view),
+                    None => Ok(still_checking()),
+                }
             }
             Self::Claim(who, a) => encode(LeaseView::from(sched.claim(tx, &who, &a.lease_id)?)),
             Self::Cancel(who, a) => {
@@ -1304,8 +1314,10 @@ impl HookCommand {
             Self::SessionStart(a) => {
                 let (unhosted, released) = match a.host {
                     Some(host) => (
-                        sessions.report(tx, &a.session_id, host, now_ms)?.unhosted,
-                        sessions.take_released(host),
+                        sessions
+                            .report(tx, &a.session_id, host.clone(), now_ms)?
+                            .unhosted,
+                        sessions.take_released(&host),
                     ),
                     None => (Vec::new(), Vec::new()),
                 };

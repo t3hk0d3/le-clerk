@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use leclerk::client::wire::{NoticeKind, NoticeView};
 use leclerk::client::{ApiError, Client, DaemonError, DaemonInfo, Launcher};
 use leclerk::clock::{Clock, ManualClock, SystemClock};
 use leclerk::config::{Config, Paths};
@@ -20,7 +21,7 @@ use leclerk::model::{
 };
 use leclerk::scheduler::liveness::self_start_time;
 use leclerk::scheduler::{AcquireOutcome, AcquireRequest, Confirm, HealthProbe, Scheduler, Target};
-use leclerk::store::notices::{Notice, NoticeFilter, NoticeKind};
+use leclerk::store::notices::NoticeFilter;
 use leclerk::store::{Store, StoreError, Tx, audit};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -213,11 +214,12 @@ async fn parked_agent_wait(
     let host = Host {
         pid: std::process::id(),
         start_time: self_start_time().expect("this process has a start time"),
+        boot_id: None,
     };
     let poller = Client::connect(&h.paths).await.unwrap();
     let wait = tokio::spawn(async move {
         poller
-            .agent_wait("parked", host, 60, true, "test-arm")
+            .agent_wait("parked", &host, 60, true, "test-arm")
             .await
     });
     let deadline = Instant::now() + PATIENCE;
@@ -285,7 +287,7 @@ async fn occupancy(client: &Client) -> Value {
 }
 
 /// Long-poll `who` until a notice of `kind` arrives; returns it.
-async fn notice_of(client: &Client, who: &HolderRef, kind: NoticeKind) -> Notice {
+async fn notice_of(client: &Client, who: &HolderRef, kind: NoticeKind) -> NoticeView {
     let deadline = Instant::now() + PATIENCE;
     loop {
         assert!(Instant::now() < deadline, "no {kind:?} notice for {who:?}");
@@ -596,11 +598,11 @@ mod daemon {
             use super::*;
 
             #[tokio::test(flavor = "multi_thread")]
-            async fn version_reports_protocol_4() {
+            async fn version_reports_protocol_5() {
                 let h = Harness::new();
                 let client = h.start().await;
-                assert_eq!(client.daemon().protocol, Some(4));
-                assert_eq!(leclerk::PROTOCOL, 4);
+                assert_eq!(client.daemon().protocol, Some(5));
+                assert_eq!(leclerk::PROTOCOL, 5);
             }
         }
 
@@ -1255,7 +1257,7 @@ mod daemon {
                         .wait_notices_matching(&holder("a"), Some(&elsewhere), 1)
                         .await
                         .unwrap();
-                    assert_eq!(filtered, Vec::<Notice>::new());
+                    assert_eq!(filtered, Vec::<NoticeView>::new());
                     let rest = client.wait_notices(&holder("a"), 5).await.unwrap();
                     assert!(
                         rest.iter()
@@ -1737,7 +1739,11 @@ mod restart_grace {
             })
         }
 
-        fn notices(&mut self, who: &str, kind: NoticeKind) -> Vec<Notice> {
+        fn notices(
+            &mut self,
+            who: &str,
+            kind: leclerk::store::notices::NoticeKind,
+        ) -> Vec<leclerk::store::notices::Notice> {
             let h = holder(who);
             self.with_tx(|tx, _| leclerk::store::notices::pending(tx, &h).unwrap())
                 .into_iter()
@@ -1835,7 +1841,10 @@ mod restart_grace {
         fn tells_the_holder_the_new_deadline() {
             let (mut f, lease, startup) = setup();
             f.grace();
-            let started = f.notices("a", NoticeKind::CleanupWindowStarted);
+            let started = f.notices(
+                "a",
+                leclerk::store::notices::NoticeKind::CleanupWindowStarted,
+            );
             assert_eq!(started.len(), 2, "{started:?}");
             let fresh = &started[1];
             assert_eq!(fresh.lease_id.as_ref(), Some(&lease));
@@ -1892,7 +1901,7 @@ mod restart_grace {
         fn tells_the_holder_the_new_deadline() {
             let (mut f, lease, startup) = setup();
             f.grace();
-            let offered = f.notices("b", NoticeKind::Offered);
+            let offered = f.notices("b", leclerk::store::notices::NoticeKind::Offered);
             assert_eq!(offered.len(), 2, "{offered:?}");
             let fresh = &offered[1];
             assert_eq!(fresh.lease_id.as_ref(), Some(&lease));

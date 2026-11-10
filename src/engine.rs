@@ -608,16 +608,20 @@ impl EngineHandle {
         command: Command,
         host: Option<Host>,
     ) -> Result<Value, ApiError> {
-        let first = self.send_command(command.clone(), host, true).await?;
-        if first["outcome"] != "checking" {
+        let first = self
+            .send_command(command.clone(), host.clone(), true)
+            .await?;
+        if first != still_checking() {
             return Ok(first);
         }
         let limit = Duration::from_secs(self.config.health_timeout) + CHECK_WAIT_SLACK;
         // The engine wakes every waiter when a check comes back.
         let answer = self
             .wait_until(&command.caller().holder, limit, || async {
-                let answer = self.send_command(command.clone(), host, true).await?;
-                Ok((answer["outcome"] != "checking").then_some(answer))
+                let answer = self
+                    .send_command(command.clone(), host.clone(), true)
+                    .await?;
+                Ok((answer != still_checking()).then_some(answer))
             })
             .await
             .map_err(|e| self.announced(e))?;

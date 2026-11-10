@@ -15,9 +15,9 @@ use std::sync::Once;
 use std::time::Duration;
 
 use crossterm::terminal;
+use leclerk::client::wire::{NoticeKind, NoticeView};
 use leclerk::client::{ApiError, Client};
 use leclerk::model::{Caller, HolderRef};
-use leclerk::store::notices::{Notice, NoticeKind};
 use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -111,7 +111,7 @@ impl Screen {
     }
 
     /// Print a notice.
-    pub fn notice(&self, n: &Notice) {
+    pub fn notice(&self, n: &NoticeView) {
         let value = serde_json::to_value(n).unwrap_or(Value::Null);
         self.say(&value, &lease::notice_text(n));
     }
@@ -146,7 +146,7 @@ fn poll(client: &Client, holder: &HolderRef, phase: &Phase) -> PollFuture {
     })
 }
 
-type PollFuture = Pin<Box<dyn Future<Output = Result<Vec<Notice>, ApiError>>>>;
+type PollFuture = Pin<Box<dyn Future<Output = Result<Vec<NoticeView>, ApiError>>>>;
 
 /// Bytes typed on stdin, read by a thread of their own (the read blocks;
 /// the thread ends with the process).
@@ -353,7 +353,7 @@ impl View<'_> {
     /// Show `n` and act on it; true when the view is done.
     async fn on_notice(
         &self,
-        n: &Notice,
+        n: &NoticeView,
         keys: &mut mpsc::UnboundedReceiver<u8>,
     ) -> anyhow::Result<bool> {
         let request = n.request_id.as_ref().map(|r| r.as_str().to_owned());
@@ -573,6 +573,7 @@ mod tests {
         let holder = HolderRef::CliProcess {
             pid: 1,
             start_time: 1,
+            boot_id: None,
         };
         let phase = Phase::Held {
             lease: "L".to_owned(),

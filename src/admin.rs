@@ -20,7 +20,7 @@ use crate::health;
 use crate::inventory::{Inventory, InventoryError, NewResource, NewUnit, Warning};
 use crate::model::{
     Caller, Description, EndCause, HealthSpec, HolderRef, LeaseId, ProjectKey, RequestId, Resource,
-    ResourceId, ResourceType, Scope, Unit, UnitId, UnitSettings, UsageTemplate,
+    ResourceId, ResourceType, Scope, Unit, UnitId, UnitSettings, UnitSettingsInput, UsageTemplate,
 };
 use crate::scheduler::liveness;
 use crate::scheduler::{Lease, LeaseEdit, Scheduler, SchedulerError};
@@ -346,6 +346,7 @@ pub struct ExportResource {
 #[serde(deny_unknown_fields)]
 pub struct ExportUnit {
     pub id: UnitId,
+    #[serde(deserialize_with = "UnitSettingsInput::strict")]
     pub settings: UnitSettings,
     /// Called `notes` in exports made before descriptions existed.
     #[serde(default, alias = "notes")]
@@ -910,10 +911,7 @@ impl<'a> Admin<'a> {
             .map(|l| l.holder)
             .chain(leases::queued_requests(tx)?.into_iter().map(|r| r.holder));
         for holder in holders {
-            let HolderRef::CliProcess { pid, start_time } = holder else {
-                continue;
-            };
-            if !seen.insert(holder.clone()) || liveness::process_alive(pid, start_time) {
+            if !liveness::process_holder_gone(&holder) || !seen.insert(holder.clone()) {
                 continue;
             }
             if fix {
@@ -1223,15 +1221,18 @@ mod tests {
         let spec = HolderSpec::Pid(7);
         assert!(spec.matches(&HolderRef::CliProcess {
             pid: 7,
-            start_time: 1
+            start_time: 1,
+            boot_id: None
         }));
         assert!(spec.matches(&HolderRef::CliProcess {
             pid: 7,
-            start_time: 99
+            start_time: 99,
+            boot_id: None
         }));
         assert!(!spec.matches(&HolderRef::CliProcess {
             pid: 8,
-            start_time: 1
+            start_time: 1,
+            boot_id: None
         }));
         assert!(!spec.matches(&HolderRef::User { tag: "7".into() }));
     }

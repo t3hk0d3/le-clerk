@@ -575,7 +575,7 @@ fn group(tx: &Tx, unit_row: i64) -> Result<Vec<i64>, SchedulerError> {
 
 /// True when any member of `group` has a live lease.
 fn group_busy(tx: &Tx, group: &[i64]) -> Result<bool, SchedulerError> {
-    Ok(!leases::live_leases_on(tx, group)?.is_empty())
+    Ok(leases::any_live_on(tx, group)?)
 }
 
 /// The health checks `unit` must pass.
