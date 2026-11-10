@@ -16,7 +16,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::Context;
-use leclerk::client::Client;
+use leclerk::client::{ApiError, Client, DaemonError};
 use leclerk::model::{Caller, HolderRef};
 use leclerk::scheduler::liveness::process_alive;
 use serde_json::{Value, json};
@@ -26,6 +26,7 @@ use tokio::time::Instant;
 use super::Ctx;
 use super::caller;
 use super::lease::WaitArgs;
+use super::output::{EXIT_DAEMON, Exit};
 
 /// How long a new wait waits out another wait's arm before giving way:
 /// longer than a killed wait's hold (its last step plus the daemon's hold).
@@ -48,7 +49,10 @@ pub async fn agent(ctx: &Ctx, caller: &Caller, args: &WaitArgs) -> anyhow::Resul
     let HolderRef::AgentSession { session_id } = &caller.holder else {
         anyhow::bail!("not an agent session");
     };
-    let client = ctx.client().await?;
+    let client = match ctx.waiting_client().await {
+        Err(DaemonError::Stopped) => return daemon_stopped(Format::of(ctx.out), args),
+        got => got?,
+    };
     // This wait's arm token: its steps hold the session's one armed wait.
     let arm = ulid::Ulid::new().to_string();
     let result = steps(ctx, caller, args, &client, host, session_id, &arm).await;
@@ -89,10 +93,7 @@ async fn steps(
         let step = tokio::select! {
             got = client.agent_wait(session_id, host, STEP.as_secs(), first, arm) => match got {
                 Ok(step) => step,
-                Err(e) => return match daemon_gone(&e) {
-                    Some(why) => finish(md, args, &why),
-                    None => Err(e.into()),
-                },
+                Err(e) => return daemon_gone(md, args, e),
             },
             _ = term.recv() => return finish(md, args, &stopped()),
             _ = int.recv() => return finish(md, args, &stopped()),
@@ -267,21 +268,39 @@ fn ended(why: &str) -> Value {
     })
 }
 
-/// What a wait prints when the daemon went away for good: stopped, or
-/// replaced by one speaking another protocol (a restart is ridden out inside
-/// the client). `None` for any other error.
-fn daemon_gone(e: &leclerk::client::ApiError) -> Option<Value> {
+/// End a wait on the daemon's error `e`: said in words when the daemon went
+/// away for good, stopped or replaced by one speaking another protocol (a
+/// restart is ridden out inside the client).
+fn daemon_gone(md: Format, args: &WaitArgs, e: ApiError) -> anyhow::Result<()> {
     match e.code.as_str() {
-        "daemon_stopping" => Some(gone(
+        "daemon_stopping" => daemon_stopped(md, args),
+        "protocol_mismatch" => finish(
+            md,
+            args,
+            &gone(
+                "the clerk was upgraded to a version this wait cannot talk to",
+                "Start the wait again (the new `clerk` on PATH speaks the new protocol).",
+            ),
+        ),
+        _ => Err(e.into()),
+    }
+}
+
+/// End a wait whose daemon was stopped. A `--follow` wait also exits
+/// [`EXIT_DAEMON`]: nothing will report to it any more.
+fn daemon_stopped(md: Format, args: &WaitArgs) -> anyhow::Result<()> {
+    finish(
+        md,
+        args,
+        &gone(
             "the clerk daemon was stopped",
             "Tell the user the clerk daemon is stopped; arm a wait again once it runs.",
-        )),
-        "protocol_mismatch" => Some(gone(
-            "the clerk was upgraded to a version this wait cannot talk to",
-            "Start the wait again (the new `clerk` on PATH speaks the new protocol).",
-        )),
-        _ => None,
+        ),
+    )?;
+    if args.follow {
+        return Err(Exit(EXIT_DAEMON).into());
     }
+    Ok(())
 }
 
 /// The daemon went away for good (`why`); `next` says what to do.

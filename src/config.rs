@@ -264,6 +264,13 @@ impl Paths {
         ))
     }
 
+    /// The marker a deliberate stop leaves in the state directory: while
+    /// it exists, waiting clients do not start a daemon.
+    #[must_use]
+    pub fn stop_marker(&self) -> PathBuf {
+        self.db.with_file_name("stopped")
+    }
+
     fn under(run: &std::path::Path, state: &std::path::Path, config: &std::path::Path) -> Self {
         Self {
             socket: run.join("clerk.sock"),

@@ -505,22 +505,52 @@ impl EngineHandle {
     /// The command's [`ApiError`], or `engine_unavailable` when the engine
     /// has stopped.
     pub async fn call(&self, command: Command) -> Result<Value, ApiError> {
-        if let Command::DaemonStop(_, a) = &command {
-            let going = if a.restart { GOING_RESTART } else { GOING_STOP };
-            // The first stop says how; a later one (the shutdown's own)
-            // does not change it.
-            let _ = self.going.compare_exchange(
-                0,
-                going,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            );
-        }
+        // The first stop says how; a later one (the shutdown's own) does
+        // not change it.
+        let marked = match &command {
+            Command::DaemonStop(_, a) => self.mark_going(a.restart),
+            _ => false,
+        };
         let (reply, answer) = oneshot::channel();
         self.jobs
             .send(Job::Command(Box::new(command), reply))
             .map_err(|_| ApiError::unavailable())?;
-        answer.await.map_err(|_| ApiError::unavailable())?
+        let result = answer.await.map_err(|_| ApiError::unavailable())?;
+        if marked && result.is_err() {
+            // The stop failed, so the daemon goes on: waits must too.
+            self.going.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// The daemon starts going away, for good or (`restart`) to come back:
+    /// long-polls answer what it announces from now on, the parked ones at
+    /// once, while the engine still runs. The first call says how; later
+    /// ones do not change it.
+    pub fn begin_shutdown(&self, restart: bool) {
+        self.mark_going(restart);
+        self.waiters.notify_all();
+    }
+
+    /// True once a deliberate stop began (not a restart, and not an engine
+    /// that merely died).
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.going.load(std::sync::atomic::Ordering::SeqCst) == GOING_STOP
+    }
+
+    /// Record how the daemon is going away, unless that is known already;
+    /// true when this call decided it.
+    fn mark_going(&self, restart: bool) -> bool {
+        let going = if restart { GOING_RESTART } else { GOING_STOP };
+        self.going
+            .compare_exchange(
+                0,
+                going,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
     /// Deliver `holder`'s pending notices, oldest first, waiting up to
@@ -563,18 +593,23 @@ impl EngineHandle {
     /// clients instead: `daemon_restarting` (reconnect) or
     /// `daemon_stopping` (give up).
     fn announced(&self, e: ApiError) -> ApiError {
+        self.going_away().unwrap_or(e)
+    }
+
+    /// What the daemon announces to waiting clients once it is going away.
+    fn going_away(&self) -> Option<ApiError> {
         match self.going.load(std::sync::atomic::Ordering::SeqCst) {
-            GOING_RESTART => ApiError::new(
+            GOING_RESTART => Some(ApiError::new(
                 ErrorKind::Unavailable,
                 "daemon_restarting",
                 "the clerk daemon is restarting; reconnect in a moment",
-            ),
-            GOING_STOP => ApiError::new(
+            )),
+            GOING_STOP => Some(ApiError::new(
                 ErrorKind::Unavailable,
                 "daemon_stopping",
                 "the clerk daemon was stopped",
-            ),
-            _ => e,
+            )),
+            _ => None,
         }
     }
 
@@ -583,7 +618,8 @@ impl EngineHandle {
     /// last check). Dropping the future (a client gone) ends the wait.
     ///
     /// # Errors
-    /// The first error `check` returns.
+    /// The first error `check` returns; what the daemon announces once it
+    /// is going away.
     pub async fn wait_until<T, F, Fut>(
         &self,
         holder: &HolderRef,
@@ -602,6 +638,9 @@ impl EngineHandle {
             let notified = registration.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            if let Some(announced) = self.going_away() {
+                return Err(announced);
+            }
             if let Some(found) = check().await? {
                 return Ok(Some(found));
             }
@@ -802,19 +841,24 @@ impl EngineHandle {
             .await
     }
 
-    /// Send the job `make` builds around a reply sender; its answer.
+    /// Send the job `make` builds around a reply sender; its answer. An
+    /// engine gone during a stop or a restart answers what the daemon
+    /// announces, not `engine_unavailable` (which clients reconnect on).
     async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> Job) -> Result<T, ApiError> {
         let (reply, answer) = oneshot::channel();
         self.jobs
             .send(make(reply))
-            .map_err(|_| ApiError::unavailable())?;
-        answer.await.map_err(|_| ApiError::unavailable())?
+            .map_err(|_| self.announced(ApiError::unavailable()))?;
+        answer
+            .await
+            .map_err(|_| self.announced(ApiError::unavailable()))?
     }
 }
 
 /// When the engine thread ends, however it ends: sets the stopped flag and
-/// wakes every parked long-poll, whose next take then fails at once with
-/// `engine_unavailable`. The job inbox is gone by then (`run` owns it).
+/// wakes every parked long-poll, which then answers what the daemon
+/// announces (`engine_unavailable` if the engine merely died). The job
+/// inbox is gone by then (`run` owns it).
 struct StopSignal {
     stopped: watch::Sender<bool>,
     waiters: Arc<Waiters>,

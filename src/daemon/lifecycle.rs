@@ -8,6 +8,11 @@
 //! or `daemon_stop`. On the way out the engine is stopped, the socket
 //! removed, and only then the lock released, so a successor never finds a
 //! socket that belongs to nobody it could not remove.
+//!
+//! A deliberate stop (`daemon_stop`, SIGTERM, SIGINT; not a restart) leaves
+//! a marker ([`Paths::stop_marker`]), written before the listener closes:
+//! while it exists, waiting clients do not start a daemon. The next daemon
+//! removes it as soon as it holds the lock; a crash never writes one.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, Write};
@@ -95,6 +100,7 @@ pub fn run(paths: &Paths, config: Config) -> Result<(), RunError> {
         return Ok(());
     };
     init_logging(&paths.log)?;
+    remove_stop_marker(&paths.stop_marker());
     let info = ServerInfo {
         version: std::env::var(VERSION_OVERRIDE_ENV).unwrap_or_else(|_| crate::VERSION.into()),
         protocol: match std::env::var(PROTOCOL_OVERRIDE_ENV) {
@@ -151,7 +157,7 @@ fn start_and_serve(
         tracing::info!(leases = graced, "restart grace applied");
     }
     let engine = Engine::spawn(store, clock, config, health).map_err(RunError::Start)?;
-    runtime.block_on(serve(listener, engine, info, signals))
+    runtime.block_on(serve(listener, engine, info, signals, paths.stop_marker()))
 }
 
 /// SIGTERM and SIGINT streams.
@@ -172,16 +178,17 @@ impl Signals {
 
 /// Serve `engine` on `listener` until a signal or an engine stop.
 ///
-/// Shutdown order: stop accepting connections; give in-flight requests
-/// [`DRAIN_GRACE`] to finish against the live engine; stop the engine
-/// (finishing the command in flight and waking parked long-polls, which
-/// then return); give the remaining connections [`SHUTDOWN_GRACE`]; wait
-/// for the engine thread to end.
+/// Shutdown order: announce it (parked long-polls answer at once) and, for
+/// a deliberate stop, write `stop_marker`; stop accepting connections; give
+/// in-flight requests [`DRAIN_GRACE`] to finish against the live engine;
+/// stop the engine (finishing the command in flight); give the remaining
+/// connections [`SHUTDOWN_GRACE`]; wait for the engine thread to end.
 async fn serve(
     listener: UnixListener,
     engine: EngineHandle,
     info: &ServerInfo,
     mut signals: Signals,
+    stop_marker: PathBuf,
 ) -> Result<(), RunError> {
     listener.set_nonblocking(true).map_err(RunError::Serve)?;
     let listener = tokio::net::UnixListener::from_std(listener).map_err(RunError::Serve)?;
@@ -190,9 +197,20 @@ async fn serve(
     let watcher = engine.clone();
     let shutdown = async move {
         tokio::select! {
-            _ = signals.term.recv() => tracing::info!("SIGTERM received; stopping"),
-            _ = signals.int.recv() => tracing::info!("SIGINT received; stopping"),
+            _ = signals.term.recv() => {
+                tracing::info!("SIGTERM received; stopping");
+                watcher.begin_shutdown(false);
+            }
+            _ = signals.int.recv() => {
+                tracing::info!("SIGINT received; stopping");
+                watcher.begin_shutdown(false);
+            }
             () = watcher.stopped() => tracing::info!("engine stopped; stopping"),
+        }
+        // Before the listener closes: a client finding it closed must find
+        // the marker too. An engine that merely died is no deliberate stop.
+        if watcher.is_stopping() {
+            write_stop_marker(&stop_marker);
         }
         let _ = begun.send(());
     };
@@ -237,6 +255,23 @@ fn daemon_caller() -> Caller {
         },
         project: None,
         override_reason: None,
+    }
+}
+
+/// Leave the marker of a deliberate stop. Best effort: without it, waiting
+/// clients treat the stop as a crash.
+fn write_stop_marker(path: &Path) {
+    if let Err(e) = fs::write(path, format!("{}\n", std::process::id())) {
+        tracing::warn!(error = %e, "cannot write the stop marker");
+    }
+}
+
+/// Remove the marker a deliberate stop left, if any.
+fn remove_stop_marker(path: &Path) {
+    if let Err(e) = fs::remove_file(path)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(error = %e, "cannot remove the stop marker");
     }
 }
 

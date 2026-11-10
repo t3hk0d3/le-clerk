@@ -176,7 +176,8 @@ fn keys() -> mpsc::UnboundedReceiver<u8> {
 /// mode must already be on.
 ///
 /// # Errors
-/// [`Exit`] for the exits above; a daemon error ends the view with it.
+/// [`Exit`] for the exits above; a daemon error ends the view with it, at
+/// once for `daemon_stopping`.
 pub async fn run(
     client: &Client,
     caller: &Caller,
@@ -259,6 +260,14 @@ impl View<'_> {
                                 );
                             }
                             batch
+                        }
+                        Err(e) if e.code == "daemon_stopping" => {
+                            self.screen.say(
+                                &json!({"daemon": "stopped"}),
+                                "The clerk daemon was stopped; this view ends, and what it held \
+                                 ends with it.",
+                            );
+                            return Err(e.into());
                         }
                         Err(e) => {
                             failures += 1;

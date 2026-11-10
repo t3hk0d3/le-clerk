@@ -2372,6 +2372,22 @@ mod cli {
         text
     }
 
+    /// Everything `child` printed on stderr, once it exited.
+    fn stderr_of(child: &mut std::process::Child) -> String {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut text).unwrap();
+        text
+    }
+
+    /// True when nothing answers on `env`'s socket and its daemon lock is
+    /// free.
+    fn no_daemon(env: &Env) -> bool {
+        let paths = env.paths();
+        let lock_free = fs::File::open(&paths.lock)
+            .map_or(true, |f| FileExt::try_lock_exclusive(&f).unwrap_or(false));
+        lock_free && std::os::unix::net::UnixStream::connect(&paths.socket).is_err()
+    }
+
     /// Exit code of `child`, which must end within [`PATIENCE`].
     fn code_of(child: &mut std::process::Child) -> i32 {
         let status = wait_within(child, PATIENCE).expect("clerk ended in time");
@@ -2711,7 +2727,7 @@ mod cli {
                 use super::*;
 
                 #[test]
-                fn cancels_the_request() {
+                fn exits_5_without_a_cancel_call_or_a_daemon() {
                     let env = Env::new();
                     seed(&env, "board", "k1");
                     hold(&env, "x");
@@ -2722,10 +2738,11 @@ mod cli {
                         assert!(Instant::now() < deadline, "never queued");
                         std::thread::sleep(Duration::from_millis(50));
                     }
-                    std::thread::sleep(Duration::from_millis(300));
                     env.cmd().args(["daemon", "stop"]).assert().success();
                     assert_eq!(code_of(&mut child), 5);
-                    assert_eq!(env.ok(&["queue", "board"])[0]["queue"], json!([]));
+                    let said = stderr_of(&mut child);
+                    assert!(!said.contains("cancel"), "{said}");
+                    assert!(no_daemon(&env), "a daemon runs after the stop");
                 }
             }
 
@@ -4300,6 +4317,419 @@ mod cli {
             );
             free(&env, "x", &theirs);
             assert_eq!(code_of(&mut child), 0);
+        }
+    }
+
+    /// A deliberate stop stays stopped while clients wait: none of them
+    /// starts a daemon again, by RPC or by signal.
+    mod daemon_stop_with_waiters {
+        use super::*;
+
+        /// How long a stopped daemon is watched for coming back: past
+        /// `RECONNECT_START_AFTER` and a whole wait step.
+        const STAYS_DOWN: Duration = Duration::from_secs(10);
+
+        /// An environment whose clerk is a private copy of the binary, so
+        /// whatever daemon its waiters could start runs from that copy.
+        struct Stopping {
+            env: Env,
+            clerk: PathBuf,
+        }
+
+        impl Stopping {
+            /// With its daemon running, started from the private copy.
+            fn new() -> Self {
+                let env = Env::new();
+                let clerk = env.home().join("clerk-private");
+                fs::copy(env!("CARGO_BIN_EXE_clerk"), &clerk).unwrap();
+                let this = Self { env, clerk };
+                let mut status = std::process::Command::new(&this.clerk);
+                status
+                    .arg("status")
+                    .env("CLERK_HOME", this.env.home())
+                    .env_remove(SESSION_VAR)
+                    .env_remove(CLAUDE_PID)
+                    .stdin(Stdio::null());
+                // Another test's fork may hold the copy's write descriptor
+                // until that child execs: the copy is "busy" until then.
+                let deadline = Instant::now() + PATIENCE;
+                let out = loop {
+                    match status.output() {
+                        Err(e)
+                            if e.raw_os_error() == Some(libc::ETXTBSY)
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        got => break got.unwrap(),
+                    }
+                };
+                assert!(out.status.success(), "{out:?}");
+                this
+            }
+
+            /// [`spawn`], from the private copy.
+            fn spawn(&self, args: &[&str], session: Option<&str>) -> Bg {
+                use std::os::unix::process::CommandExt;
+                let mut cmd = std::process::Command::new(&self.clerk);
+                cmd.process_group(0);
+                cmd.args(args)
+                    .env("CLERK_HOME", self.env.home())
+                    .env_remove(SESSION_VAR)
+                    .env_remove(CLAUDE_PID)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                if let Some(session) = session {
+                    cmd.arg("--json")
+                        .env(SESSION_VAR, session)
+                        .env(CLAUDE_PID, std::process::id().to_string());
+                }
+                Bg(cmd.spawn().unwrap())
+            }
+
+            /// The daemon's pid, from its lock file (`None` while a new
+            /// daemon is still writing it).
+            fn daemon_pid(&self) -> Option<libc::pid_t> {
+                let text = fs::read_to_string(self.env.paths().lock).ok()?;
+                text.trim().parse().ok()
+            }
+
+            fn signal_daemon(&self, signal: libc::c_int) {
+                let pid = self.daemon_pid().expect("the daemon recorded its pid");
+                // SAFETY: kill(2) on the daemon this test's clerk started.
+                assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+            }
+
+            fn stop_by_rpc(&self) {
+                self.env.cmd().args(["daemon", "stop"]).assert().success();
+            }
+
+            fn stop_by_sigterm(&self) {
+                self.signal_daemon(libc::SIGTERM);
+                poll_until("the daemon is gone", || no_daemon(&self.env));
+            }
+
+            /// Assert no daemon runs, now and for all of [`STAYS_DOWN`].
+            fn assert_stays_down(&self) {
+                let until = Instant::now() + STAYS_DOWN;
+                while Instant::now() < until {
+                    assert!(no_daemon(&self.env), "a daemon came back after the stop");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            /// An agent wait of `sess-1` (with `extra` arguments), armed.
+            fn armed_wait(&self, extra: &[&str]) -> Bg {
+                let dir = self.env.dir("alpha");
+                self.env
+                    .agent("sess-1", &dir)
+                    .args(["leases", "--mine"])
+                    .assert()
+                    .success();
+                let mut args = vec!["wait"];
+                args.extend_from_slice(extra);
+                let wait = self.spawn(&args, Some("sess-1"));
+                poll_until("the wait is armed", || {
+                    self.env
+                        .rpc("session_brief", &user("x"), json!({"session_id": "sess-1"}))
+                        .is_ok_and(|brief| brief["open_waits"].as_u64() > Some(0))
+                });
+                wait
+            }
+
+            /// A user's `acquire --wait`, queued behind another holder.
+            fn queued_acquire(&self) -> Bg {
+                seed(&self.env, "board", "k1");
+                hold(&self.env, "x");
+                let child = self.spawn(&["acquire", "board", "--for", "10m", "--wait"], None);
+                poll_until("the request is queued", || {
+                    self.env.ok(&["queue", "board"])[0]["queue"] != json!([])
+                });
+                child
+            }
+
+            /// `clerk run` supervising a shell that ends once the `go` file
+            /// appears; returns it and that file's path.
+            fn supervising_run(&self) -> (Bg, PathBuf) {
+                seed(&self.env, "board", "k1");
+                let started = self.env.home().join("started");
+                let go = self.env.home().join("go");
+                let script = format!(
+                    "touch {}; while [ ! -e {} ]; do sleep 0.05; done",
+                    started.display(),
+                    go.display()
+                );
+                let child = self.spawn(
+                    &["run", "board", "--for", "10m", "--", "sh", "-c", &script],
+                    None,
+                );
+                poll_until("the command runs", || started.exists());
+                (child, go)
+            }
+
+            /// A live view holding the board, on a terminal.
+            fn live_view(&self) -> common::Tty {
+                seed(&self.env, "board", "k1");
+                let tty = common::Tty::spawn_in(
+                    self.env.home(),
+                    "\"$CLERK\" acquire board --for 10m; echo EXIT=$?",
+                    &[("CLERK", self.clerk.to_str().unwrap())],
+                );
+                tty.expect("Granted");
+                tty
+            }
+        }
+
+        /// Poll `done` until it holds; panic after [`PATIENCE`].
+        fn poll_until(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + PATIENCE;
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting until {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        mod on_daemon_stop_with_an_agent_wait_follow {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let _wait = s.armed_wait(&["--follow"]);
+                s.stop_by_rpc();
+                s.assert_stays_down();
+            }
+
+            #[test]
+            fn the_wait_prints_the_stopped_notice_and_exits_5() {
+                let s = Stopping::new();
+                let mut wait = s.armed_wait(&["--follow"]);
+                s.stop_by_rpc();
+                assert_eq!(code_of(&mut wait), 5);
+                let out = stdout_of(&mut wait);
+                let body: Value = serde_json::from_str(out.trim()).unwrap();
+                assert!(
+                    body["summary"][0].as_str().unwrap().contains("stopped"),
+                    "{body}"
+                );
+            }
+        }
+
+        mod on_sigterm_with_an_agent_wait_follow {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let _wait = s.armed_wait(&["--follow"]);
+                s.stop_by_sigterm();
+                s.assert_stays_down();
+            }
+        }
+
+        mod on_daemon_stop_with_an_agent_wait {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let _wait = s.armed_wait(&[]);
+                s.stop_by_rpc();
+                s.assert_stays_down();
+            }
+        }
+
+        mod on_sigterm_with_an_agent_wait {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let _wait = s.armed_wait(&[]);
+                s.stop_by_sigterm();
+                s.assert_stays_down();
+            }
+        }
+
+        mod on_an_agent_wait_started_after_a_stop {
+            use super::*;
+
+            #[test]
+            fn says_stopped_without_starting_a_daemon() {
+                let s = Stopping::new();
+                s.stop_by_rpc();
+                let mut wait = s.spawn(&["wait", "--follow"], Some("sess-1"));
+                assert_eq!(code_of(&mut wait), 5);
+                let out = stdout_of(&mut wait);
+                assert!(out.contains("stopped"), "{out}");
+                assert!(no_daemon(&s.env), "the wait started a daemon");
+            }
+        }
+
+        mod on_daemon_stop_with_acquire_wait_queued {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let _child = s.queued_acquire();
+                s.stop_by_rpc();
+                s.assert_stays_down();
+            }
+
+            #[test]
+            fn the_waiter_says_its_request_ends_with_the_daemon() {
+                let s = Stopping::new();
+                let mut child = s.queued_acquire();
+                s.stop_by_rpc();
+                assert_eq!(code_of(&mut child), 5);
+                let said = stderr_of(&mut child);
+                assert!(said.contains("ends with the daemon"), "{said}");
+                assert!(!said.contains("cancel"), "{said}");
+            }
+        }
+
+        mod on_sigterm_with_acquire_wait_queued {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let _child = s.queued_acquire();
+                s.stop_by_sigterm();
+                s.assert_stays_down();
+            }
+        }
+
+        mod on_daemon_stop_with_clerk_run_supervising_a_child {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let (_child, _go) = s.supervising_run();
+                s.stop_by_rpc();
+                s.assert_stays_down();
+            }
+
+            #[test]
+            fn run_keeps_supervising_the_child_without_notices_and_says_so_on_stderr() {
+                let s = Stopping::new();
+                let (mut child, go) = s.supervising_run();
+                s.stop_by_rpc();
+                assert!(child.try_wait().unwrap().is_none(), "run ended on the stop");
+                fs::write(&go, "").unwrap();
+                assert_eq!(code_of(&mut child), 0);
+                let said = stderr_of(&mut child);
+                assert!(said.contains("without notices"), "{said}");
+            }
+        }
+
+        mod on_sigterm_with_clerk_run_supervising_a_child {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let (_child, _go) = s.supervising_run();
+                s.stop_by_sigterm();
+                s.assert_stays_down();
+            }
+        }
+
+        mod on_daemon_stop_with_clerk_live_open {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let _tty = s.live_view();
+                s.stop_by_rpc();
+                s.assert_stays_down();
+            }
+
+            #[test]
+            fn the_view_says_so_and_exits_5() {
+                let s = Stopping::new();
+                let tty = s.live_view();
+                s.stop_by_rpc();
+                tty.expect("was stopped");
+                tty.expect("EXIT=5");
+            }
+        }
+
+        mod on_sigterm_with_clerk_live_open {
+            use super::*;
+
+            #[test]
+            fn no_daemon_runs_10_s_later() {
+                let s = Stopping::new();
+                let _tty = s.live_view();
+                s.stop_by_sigterm();
+                s.assert_stays_down();
+            }
+        }
+
+        mod on_a_one_shot_command_after_a_stop {
+            use super::*;
+
+            #[test]
+            fn starts_the_daemon_and_removes_the_marker() {
+                let s = Stopping::new();
+                s.stop_by_rpc();
+                assert!(
+                    s.env.paths().stop_marker().exists(),
+                    "no marker after a stop"
+                );
+                s.env.ok(&["status"]);
+                assert!(!no_daemon(&s.env), "the command started no daemon");
+                assert!(!s.env.paths().stop_marker().exists());
+            }
+        }
+
+        mod on_a_crash_with_an_agent_wait_running {
+            use super::*;
+
+            #[test]
+            fn the_wait_starts_a_daemon_again() {
+                let s = Stopping::new();
+                let mut wait = s.armed_wait(&["--follow"]);
+                let old = s.daemon_pid();
+                s.signal_daemon(libc::SIGKILL);
+                let socket = s.env.paths().socket;
+                // No lock probe here: it could make the new daemon's own
+                // try-lock fail.
+                poll_until("a new daemon answers", || {
+                    s.daemon_pid().is_some_and(|pid| Some(pid) != old)
+                        && std::os::unix::net::UnixStream::connect(&socket).is_ok()
+                });
+                assert!(wait.try_wait().unwrap().is_none(), "the wait ended");
+            }
+        }
+    }
+
+    mod next_after_daemon_stop {
+        use super::*;
+
+        mod on_agent_daemon_stop {
+            use super::*;
+
+            #[test]
+            fn next_says_the_daemon_stays_stopped_until_the_next_clerk_command() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                env.agent("sess-1", &dir)
+                    .args(["leases", "--mine"])
+                    .assert()
+                    .success();
+                let body = json_of(env.agent("sess-1", &dir).args(["daemon", "stop"]));
+                let next = body["next"].as_str().unwrap();
+                assert!(
+                    next.contains("stays stopped until the next clerk command"),
+                    "{body}"
+                );
+            }
         }
     }
 

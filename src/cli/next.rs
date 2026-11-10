@@ -229,6 +229,10 @@ pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
                 ARM_AGAIN.to_owned()
             },
         ),
+        "daemon" if v["running"] == false => (
+            vec!["The clerk daemon is stopped.".to_owned()],
+            "Nothing: the daemon stays stopped until the next clerk command.".to_owned(),
+        ),
         _ => (Vec::new(), WHERE_YOU_STAND.to_owned()),
     }
 }

@@ -6,6 +6,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use leclerk::client::{Client, DaemonError, DaemonInfo, Launcher};
@@ -907,18 +908,91 @@ mod daemon {
                 h.stop(&client).await;
                 let outcome = tokio::time::timeout(PATIENCE, wait).await.unwrap().unwrap();
                 assert!(started.elapsed() < Duration::from_secs(20));
-                match outcome {
-                    Ok(notices) => assert_eq!(notices, Vec::new()),
-                    Err(e) => assert!(
-                        [
-                            "daemon_stopping",
-                            "engine_unavailable",
-                            "daemon_unavailable"
-                        ]
-                        .contains(&e.code.as_str()),
-                        "{e:?}"
-                    ),
+                assert_eq!(outcome.unwrap_err().code, "daemon_stopping");
+                assert_eq!(h.daemons(), Vec::<u32>::new());
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn writes_the_stop_marker() {
+                let h = Harness::new();
+                let client = h.start().await;
+                h.stop(&client).await;
+                assert!(h.paths.stop_marker().exists());
+            }
+        }
+
+        mod on_daemon_restart {
+            use super::*;
+
+            /// The marker must not block the waiters riding the restart out.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn leaves_no_stop_marker() {
+                let h = Harness::new();
+                let client = h.start().await;
+                let pid = client.daemon().pid;
+                client
+                    .call("daemon_stop", &user("admin"), json!({"restart": true}))
+                    .await
+                    .expect("daemon_stop");
+                let socket = h.paths.socket.clone();
+                tokio::task::spawn_blocking(move || {
+                    until("the daemon exits", || !alive(pid));
+                    until("the socket is gone", || !socket.exists());
+                })
+                .await
+                .unwrap();
+                assert!(!h.paths.stop_marker().exists());
+            }
+        }
+
+        mod on_start {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn removes_the_stop_marker() {
+                let h = Harness::new();
+                let client = h.start().await;
+                h.stop(&client).await;
+                assert!(h.paths.stop_marker().exists(), "the stop left no marker");
+                h.start().await;
+                assert!(!h.paths.stop_marker().exists());
+            }
+        }
+
+        mod on_sigkill {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn leaves_no_stop_marker() {
+                let h = Harness::new();
+                let client = h.start().await;
+                let pid = client.daemon().pid;
+                unsafe {
+                    libc::kill(pid.cast_signed(), libc::SIGKILL);
                 }
+                tokio::task::spawn_blocking(move || until("the daemon dies", || !alive(pid)))
+                    .await
+                    .unwrap();
+                assert!(!h.paths.stop_marker().exists());
+            }
+        }
+
+        mod on_sigint {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn writes_the_stop_marker() {
+                let h = Harness::new();
+                let client = h.start().await;
+                let marker = h.paths.stop_marker();
+                unsafe {
+                    libc::kill(client.daemon().pid.cast_signed(), libc::SIGINT);
+                }
+                tokio::task::spawn_blocking(move || {
+                    until("the marker is written", || marker.exists());
+                })
+                .await
+                .unwrap();
             }
         }
 
@@ -941,11 +1015,152 @@ mod daemon {
                 .await
                 .unwrap();
             }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn writes_the_stop_marker() {
+                let h = Harness::new();
+                let client = h.start().await;
+                let marker = h.paths.stop_marker();
+                unsafe {
+                    libc::kill(client.daemon().pid.cast_signed(), libc::SIGTERM);
+                }
+                tokio::task::spawn_blocking(move || {
+                    until("the marker is written", || marker.exists());
+                })
+                .await
+                .unwrap();
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_parked_long_poll_answers_daemon_stopping() {
+                let h = Harness::new();
+                let client = h.start().await;
+                let poller = Client::connect(&h.paths).await.unwrap();
+                let wait =
+                    tokio::spawn(async move { poller.wait_notices(&holder("idle"), 60).await });
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                unsafe {
+                    libc::kill(client.daemon().pid.cast_signed(), libc::SIGTERM);
+                }
+                let outcome = tokio::time::timeout(PATIENCE, wait).await.unwrap().unwrap();
+                assert_eq!(outcome.unwrap_err().code, "daemon_stopping");
+            }
         }
     }
 
     mod client {
         use super::*;
+
+        mod reconnect {
+            use super::*;
+
+            /// Shorter than `RECONNECT_START_AFTER`: a `reconnect` still
+            /// running by then is dropped before it could start anything
+            /// (under a test binary, `current_exe` is not clerk).
+            const REFUSAL: Duration = Duration::from_secs(2);
+
+            mod on_daemon_stopping_seen {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn returns_daemon_stopping_without_starting_a_daemon() {
+                    let h = Harness::new();
+                    let client = h.start().await;
+                    let poller = Client::connect(&h.paths).await.unwrap();
+                    let waiting = poller.clone();
+                    let wait =
+                        tokio::spawn(
+                            async move { waiting.wait_notices(&holder("idle"), 60).await },
+                        );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    h.stop(&client).await;
+                    let outcome = tokio::time::timeout(PATIENCE, wait).await.unwrap().unwrap();
+                    assert_eq!(outcome.unwrap_err().code, "daemon_stopping");
+                    // Only the announcement is left to go by.
+                    fs::remove_file(h.paths.stop_marker()).unwrap();
+                    let got = tokio::time::timeout(REFUSAL, poller.reconnect())
+                        .await
+                        .expect("reconnect went on after daemon_stopping");
+                    assert_eq!(got.unwrap_err().code, "daemon_stopping");
+                    assert_eq!(h.daemons(), Vec::<u32>::new());
+                }
+            }
+
+            mod on_daemon_unavailable_with_the_stop_marker_present {
+                use super::*;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn returns_daemon_stopping_without_starting_a_daemon() {
+                    let h = Harness::new();
+                    let client = h.start().await;
+                    h.stop(&client).await;
+                    let got = tokio::time::timeout(REFUSAL, client.reconnect())
+                        .await
+                        .expect("reconnect ignored the stop marker");
+                    assert_eq!(got.unwrap_err().code, "daemon_stopping");
+                    assert_eq!(h.daemons(), Vec::<u32>::new());
+                }
+            }
+
+            mod on_engine_unavailable_repeatedly_while_version_answers {
+                use super::*;
+
+                /// A daemon whose engine is gone: `/v1/version` answers, the
+                /// notices route says `engine_unavailable`. Returns how many
+                /// notice requests it served.
+                fn engineless(paths: &Paths) -> Arc<AtomicUsize> {
+                    use axum::http::StatusCode;
+                    use axum::routing::get;
+
+                    fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
+                    let listener = tokio::net::UnixListener::bind(&paths.socket).unwrap();
+                    let polls = Arc::new(AtomicUsize::new(0));
+                    let counted = polls.clone();
+                    let app = axum::Router::new()
+                        .route(
+                            "/v1/version",
+                            get(|| async {
+                                axum::Json(json!({
+                                    "version": leclerk::VERSION,
+                                    "protocol": leclerk::PROTOCOL,
+                                    "pid": 1,
+                                }))
+                            }),
+                        )
+                        .route(
+                            "/v1/notices",
+                            get(move || {
+                                counted.fetch_add(1, Ordering::SeqCst);
+                                async {
+                                    (
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        axum::Json(json!({"error": {
+                                            "code": "engine_unavailable",
+                                            "message": "the engine is gone",
+                                        }})),
+                                    )
+                                }
+                            }),
+                        );
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    polls
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn backs_off_instead_of_retrying_in_a_tight_loop() {
+                    let h = Harness::new();
+                    let polls = engineless(&h.paths);
+                    let client = Client::connect(&h.paths).await.unwrap();
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        client.wait_notices(&holder("idle"), 1),
+                    )
+                    .await;
+                    let served = polls.load(Ordering::SeqCst);
+                    assert!((1..=10).contains(&served), "polled {served} times in 1 s");
+                }
+            }
+        }
 
         mod call {
             use super::*;

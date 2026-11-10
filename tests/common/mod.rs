@@ -184,10 +184,15 @@ impl Tty {
     }
 
     pub fn spawn_with(env: &Env, sh: &str, vars: &[(&str, &str)]) -> Self {
+        Self::spawn_in(env.home(), sh, vars)
+    }
+
+    /// [`Tty::spawn_with`] for the clerk home `home`.
+    pub fn spawn_in(home: &Path, sh: &str, vars: &[(&str, &str)]) -> Self {
         let mut child = StdCommand::new("script")
             .args(["-qefc", sh, "/dev/null"])
             .env("CLERK", env!("CARGO_BIN_EXE_clerk"))
-            .env("CLERK_HOME", env.home())
+            .env("CLERK_HOME", home)
             .env_remove(SESSION_VAR)
             .env_remove(PID_VAR)
             .envs(vars.iter().copied())

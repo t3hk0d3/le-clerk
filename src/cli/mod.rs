@@ -264,6 +264,18 @@ impl Ctx {
         let host = std::env::var_os(caller::SESSION_VAR).and(caller::host());
         Ok(Client::ensure_running(&self.paths).await?.with_host(host))
     }
+
+    /// [`Ctx::client`] for a command that only waits: a daemon that was
+    /// stopped deliberately stays stopped.
+    ///
+    /// # Errors
+    /// [`DaemonError::Stopped`] then; otherwise as [`Ctx::client`].
+    pub async fn waiting_client(&self) -> Result<Client, DaemonError> {
+        let host = std::env::var_os(caller::SESSION_VAR).and(caller::host());
+        Ok(Client::ensure_running_unless_stopped(&self.paths)
+            .await?
+            .with_host(host))
+    }
 }
 
 /// Parse the command line, run the command and return its exit code.

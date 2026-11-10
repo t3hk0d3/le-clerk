@@ -577,6 +577,124 @@ mod engine {
         }
     }
 
+    mod begin_shutdown {
+        use super::*;
+
+        /// A long-poll of `b`, parked.
+        async fn parked(
+            h: &EngineHandle,
+        ) -> tokio::task::JoinHandle<Result<Vec<Notice>, ApiError>> {
+            let waiter = {
+                let h = h.clone();
+                tokio::spawn(async move { h.wait_notices(holder("b"), MAX_WAIT).await })
+            };
+            until_parked(h, &holder("b")).await;
+            waiter
+        }
+
+        mod on_a_stop_while_long_polls_are_parked {
+            use super::*;
+
+            /// The engine still runs: the drain has not even begun.
+            #[tokio::test]
+            async fn parked_long_polls_answer_daemon_stopping_at_once() {
+                let (h, _clock) = spawn();
+                let waiter = parked(&h).await;
+                h.begin_shutdown(false);
+                let got = tokio::time::timeout(PATIENCE, waiter)
+                    .await
+                    .expect("the parked long-poll was not woken")
+                    .unwrap();
+                assert_eq!(got.unwrap_err().code, "daemon_stopping");
+                ok(&h, "list_resources", &user("a"), json!({})).await;
+            }
+
+            #[tokio::test]
+            async fn a_new_long_poll_answers_daemon_stopping_at_once() {
+                let (h, _clock) = spawn();
+                h.begin_shutdown(false);
+                let got = tokio::time::timeout(PATIENCE, h.wait_notices(holder("b"), MAX_WAIT))
+                    .await
+                    .expect("the long-poll parked during a stop");
+                assert_eq!(got.unwrap_err().code, "daemon_stopping");
+            }
+
+            #[tokio::test]
+            async fn reads_as_stopping() {
+                let (h, _clock) = spawn();
+                assert!(!h.is_stopping());
+                h.begin_shutdown(false);
+                assert!(h.is_stopping());
+            }
+        }
+
+        mod on_a_restart_while_long_polls_are_parked {
+            use super::*;
+
+            #[tokio::test]
+            async fn parked_long_polls_answer_daemon_restarting() {
+                let (h, _clock) = spawn();
+                let waiter = parked(&h).await;
+                h.begin_shutdown(true);
+                let got = tokio::time::timeout(PATIENCE, waiter)
+                    .await
+                    .expect("the parked long-poll was not woken")
+                    .unwrap();
+                assert_eq!(got.unwrap_err().code, "daemon_restarting");
+            }
+
+            #[tokio::test]
+            async fn does_not_read_as_stopping() {
+                let (h, _clock) = spawn();
+                h.begin_shutdown(true);
+                assert!(!h.is_stopping());
+            }
+        }
+
+        mod on_a_second_shutdown {
+            use super::*;
+
+            /// The shutdown's own stop must not turn a restart into a stop.
+            #[tokio::test]
+            async fn the_first_says_how() {
+                let (h, _clock) = spawn();
+                h.begin_shutdown(true);
+                h.begin_shutdown(false);
+                assert!(!h.is_stopping());
+            }
+        }
+    }
+
+    mod ask {
+        use super::*;
+
+        mod on_a_job_sent_after_the_inbox_closed_during_a_stop {
+            use super::*;
+
+            #[tokio::test]
+            async fn answers_daemon_stopping() {
+                let (h, _clock) = spawn();
+                ok(&h, "daemon_stop", &user("admin"), json!({})).await;
+                tokio::time::timeout(PATIENCE, h.stopped()).await.unwrap();
+                let err = h.session_alive("s".to_owned()).await.unwrap_err();
+                assert_eq!(err.code, "daemon_stopping");
+            }
+        }
+
+        mod on_a_job_sent_after_the_inbox_closed_during_a_restart {
+            use super::*;
+
+            #[tokio::test]
+            async fn answers_daemon_restarting() {
+                let (h, _clock) = spawn();
+                ok(&h, "daemon_stop", &user("admin"), json!({"restart": true})).await;
+                tokio::time::timeout(PATIENCE, h.stopped()).await.unwrap();
+                let err = h.session_alive("s".to_owned()).await.unwrap_err();
+                assert_eq!(err.code, "daemon_restarting");
+            }
+        }
+    }
+
     mod wait_notices_matching {
         use super::*;
 

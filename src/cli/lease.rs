@@ -407,7 +407,7 @@ pub async fn wait(ctx: &Ctx, args: WaitArgs) -> anyhow::Result<()> {
     if caller::is_agent(&caller) {
         return super::wait::agent(ctx, &caller, &args).await;
     }
-    let client = ctx.client().await?;
+    let client = ctx.waiting_client().await?;
     loop {
         let batch = next_batch(&client, &caller).await?;
         if args.once {
@@ -506,7 +506,8 @@ pub fn dropped(n: &Notice) -> ApiError {
 /// notices about the request are taken (the holder's others stay pending);
 /// those that are not the offer are shown on stderr. SIGINT, SIGTERM or
 /// SIGHUP cancels the request, and so does a failed wait, so a detached
-/// holder never leaves a request queued behind it.
+/// holder never leaves a request queued behind it. A stopped daemon needs
+/// no cancel: its next start ends the requests of processes that are gone.
 async fn await_offer(
     ctx: &Ctx,
     client: &Client,
@@ -535,6 +536,10 @@ async fn await_offer(
         };
         let batch = match waited {
             Ok(batch) => batch,
+            Err(e) if e.code == "daemon_stopping" => {
+                note(|| format!("Request {request} ends with the daemon, which was stopped."));
+                return Err(e.into());
+            }
             Err(e) => {
                 cancel_after_failure(ctx, caller, request).await;
                 return Err(e.into());
@@ -653,6 +658,8 @@ async fn supervise(
     let mut notices = Box::pin(wait());
     let mut stop_at: Option<Instant> = None;
     let mut stopped = false;
+    // Off once the daemon was stopped: polling on would only reconnect.
+    let mut polling = true;
     let status = loop {
         let deadline = async move {
             match stop_at {
@@ -662,7 +669,7 @@ async fn supervise(
         };
         tokio::select! {
             status = child.wait() => break status?,
-            batch = &mut notices => {
+            batch = &mut notices, if polling => {
                 match batch {
                     Ok(batch) => {
                         for n in &batch {
@@ -672,6 +679,14 @@ async fn supervise(
                             }
                         }
                         notices = Box::pin(wait());
+                    }
+                    Err(e) if e.code == "daemon_stopping" => {
+                        note(|| {
+                            "The clerk daemon was stopped: the command keeps running, without \
+                             notices about its lease."
+                                .to_owned()
+                        });
+                        polling = false;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "cannot read notices; retrying");
@@ -695,8 +710,15 @@ async fn supervise(
         }
     };
     let code = exit_code(status);
+    give_back(client, caller, &lease_id, code).await;
+    Ok(code)
+}
+
+/// Give `lease_id` back after its command exited with `code`: cleanup
+/// confirmed on exit 0, else ended at once with the unit dirty.
+async fn give_back(client: &Client, caller: &Caller, lease_id: &str, code: u8) {
     let given_back = if code == 0 {
-        finish(client, caller, &lease_id).await.map(drop)
+        finish(client, caller, lease_id).await.map(drop)
     } else {
         client
             .call(
@@ -711,7 +733,6 @@ async fn supervise(
         // An override or an administrator may have ended it already.
         tracing::debug!(error = %e, "lease not given back");
     }
-    Ok(code)
 }
 
 /// True when our controlling terminal's foreground process group is ours

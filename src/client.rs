@@ -10,6 +10,8 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -52,6 +54,10 @@ pub const RECONNECT_FOR: Duration = Duration::from_secs(30);
 /// itself before it starts one.
 pub const RECONNECT_START_AFTER: Duration = Duration::from_secs(3);
 const BACKOFF_MAX: Duration = Duration::from_millis(200);
+/// First and longest pause before asking again after `engine_unavailable`:
+/// the version route still answers then, so `reconnect` returns at once.
+const ENGINE_RETRY_MIN: Duration = Duration::from_millis(100);
+const ENGINE_RETRY_MAX: Duration = Duration::from_secs(2);
 
 /// Why no usable daemon could be reached.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -89,6 +95,10 @@ pub enum DaemonError {
         /// The daemon's pid, from its lock file, when known.
         pid: Option<u32>,
     },
+    /// The daemon was stopped deliberately and a command that only waits
+    /// does not start it again.
+    #[error("the clerk daemon was stopped; any other clerk command starts it")]
+    Stopped,
 }
 
 fn protocol_text(protocol: Option<u32>) -> String {
@@ -106,6 +116,7 @@ impl ErrorCode for DaemonError {
             DaemonError::ProtocolMismatch { .. } => "protocol_mismatch",
             DaemonError::Unresponsive { .. } => "daemon_unresponsive",
             DaemonError::SocketPathTooLong(_) => "socket_path_too_long",
+            DaemonError::Stopped => "daemon_stopping",
         }
     }
 }
@@ -138,6 +149,10 @@ impl ApiError {
             "daemon_unavailable",
             format!("the clerk daemon did not answer ({why}); retry, or check the daemon log"),
         )
+    }
+
+    fn stopped() -> Self {
+        Self::new("daemon_stopping", "the clerk daemon was stopped")
     }
 }
 
@@ -289,6 +304,9 @@ pub struct Client {
     /// The agent session's host, sent with every request (see
     /// [`Client::with_host`]).
     host: Option<Host>,
+    /// The daemon answered `daemon_stopping`, and none has answered since
+    /// (see [`Client::reconnect`]). Shared by this client's clones.
+    told_stopped: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -314,6 +332,7 @@ impl Client {
             socket: paths.socket.clone(),
             daemon,
             host: None,
+            told_stopped: Arc::default(),
         })
     }
 
@@ -419,6 +438,24 @@ impl Client {
         }
     }
 
+    /// [`Client::ensure_running`] for a command that only waits: a daemon
+    /// that was stopped deliberately stays stopped.
+    ///
+    /// # Errors
+    /// [`DaemonError::Stopped`] while the stop marker exists and no daemon
+    /// answers; otherwise as [`Client::ensure_running`].
+    pub async fn ensure_running_unless_stopped(paths: &Paths) -> Result<Self, DaemonError> {
+        if !paths.stop_marker().exists() {
+            return Self::ensure_running(paths).await;
+        }
+        match Self::connect(paths).await {
+            Err(DaemonError::Unavailable | DaemonError::Unresponsive { .. }) => {
+                Err(DaemonError::Stopped)
+            }
+            done => done,
+        }
+    }
+
     /// Stop the running daemon, whatever its version, and wait until its
     /// socket is gone. Returns who was stopped, or `None` when no daemon
     /// was running.
@@ -450,6 +487,7 @@ impl Client {
             socket: paths.socket.clone(),
             daemon,
             host: None,
+            told_stopped: Arc::default(),
         };
         let deadline = Instant::now() + STOP_TIMEOUT;
         let left = || deadline.saturating_duration_since(Instant::now());
@@ -494,18 +532,25 @@ impl Client {
     /// connection): wait until a daemon answers again, then check it speaks
     /// this client's protocol. A daemon is started when none is back after
     /// [`RECONNECT_START_AFTER`] (it crashed, or the restart's own start
-    /// failed); gives up after [`RECONNECT_FOR`].
+    /// failed), never after a deliberate stop; gives up after
+    /// [`RECONNECT_FOR`].
     ///
     /// # Errors
-    /// `protocol_mismatch` when the daemon that answers speaks another
-    /// protocol; `daemon_unavailable` when none answers in time.
+    /// `daemon_stopping` when none answers and the daemon said it stopped
+    /// or left the stop marker; `protocol_mismatch` when the daemon that
+    /// answers speaks another protocol; `daemon_unavailable` when none
+    /// answers in time.
     pub async fn reconnect(&self) -> Result<(), ApiError> {
         let started_at = Instant::now();
         let mut pause = BACKOFF_MIN;
         let mut started = false;
         loop {
             let found = match Self::probe_within(&self.paths, PROBE_TIMEOUT).await {
-                Ok(d) => Some(d),
+                Ok(d) => {
+                    self.told_stopped.store(false, Ordering::SeqCst);
+                    Some(d)
+                }
+                Err(_) if self.stopped_deliberately() => return Err(ApiError::stopped()),
                 Err(_) if !started && started_at.elapsed() >= RECONNECT_START_AFTER => {
                     started = true;
                     Self::ensure_running(&self.paths)
@@ -525,6 +570,39 @@ impl Client {
             }
             tokio::time::sleep(pause).await;
             pause = (pause * 2).min(BACKOFF_MAX);
+        }
+    }
+
+    /// Whether the daemon that went away was stopped on purpose.
+    fn stopped_deliberately(&self) -> bool {
+        self.told_stopped.load(Ordering::SeqCst) || self.paths.stop_marker().exists()
+    }
+
+    /// Run the request `once` until it gets an answer, riding out restarts
+    /// and lost connections (see [`Client::reconnect`]).
+    async fn riding_restarts<T, F, Fut>(&self, mut once: F) -> Result<T, ApiError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, ApiError>>,
+    {
+        let mut pause = ENGINE_RETRY_MIN;
+        loop {
+            match once().await {
+                Err(e) if reconnects(&e.code) => {
+                    if e.code == "engine_unavailable" {
+                        tokio::time::sleep(pause).await;
+                        pause = (pause * 2).min(ENGINE_RETRY_MAX);
+                    }
+                    self.reconnect().await?;
+                }
+                Err(e) => {
+                    if e.code == "daemon_stopping" {
+                        self.told_stopped.store(true, Ordering::SeqCst);
+                    }
+                    return Err(e);
+                }
+                done => return done,
+            }
         }
     }
 
@@ -618,12 +696,8 @@ impl Client {
         filter: Option<&NoticeFilter>,
         secs: u64,
     ) -> Result<Vec<Notice>, ApiError> {
-        loop {
-            match self.wait_notices_once(holder, filter, secs).await {
-                Err(e) if reconnects(&e.code) => self.reconnect().await?,
-                other => return other,
-            }
-        }
+        self.riding_restarts(|| self.wait_notices_once(holder, filter, secs))
+            .await
     }
 
     /// One [`Client::wait_notices_matching`] request.
@@ -681,12 +755,8 @@ impl Client {
         first: bool,
         arm: &str,
     ) -> Result<Value, ApiError> {
-        loop {
-            match self.agent_wait_once(session, host, secs, first, arm).await {
-                Err(e) if reconnects(&e.code) => self.reconnect().await?,
-                other => return other,
-            }
-        }
+        self.riding_restarts(|| self.agent_wait_once(session, host, secs, first, arm))
+            .await
     }
 
     /// One [`Client::agent_wait`] request.
