@@ -1019,15 +1019,15 @@ plugin
 
 - [x] **Step 1:** §11.1: a background waiter released after 35 min wakes the
   idle agent: passed 2026-11-10 (Appendix C item 6).
-- [ ] **Step 2:** §11.2: release the waiter while the agent is mid-turn (a
+- [x] **Step 2:** §11.2: release the waiter while the agent is mid-turn (a
   prompt that runs `sleep 60` in the foreground); record what the agent sees
   and when.
-- [ ] **Step 3:** §11.3: `claude -p` with `BASH_DEFAULT_TIMEOUT_MS` unset and a
+- [x] **Step 3:** §11.3: `claude -p` with `BASH_DEFAULT_TIMEOUT_MS` unset and a
   waiter started with `timeout: 60000`; record whether the kill wakes it.
-- [ ] **Step 4:** §11.4–11.5: `/clear` then `SessionEnd` input (a hook that
+- [x] **Step 4:** §11.4–11.5: `/clear` then `SessionEnd` input (a hook that
   logs its stdin); `kill -9` then `claude --continue`: the SessionStart hook
   input (`source`, `session_id`) and `CLAUDE_PID`.
-- [ ] **Step 5:** §11.6: list for the user (desktop app, VS Code); not faked.
+- [x] **Step 5:** §11.6: list for the user (desktop app, VS Code); not faked.
 - [ ] **Step 6:** Commit: `docs: CLI-only verify-first results`
 
 ### Task 9: Remove MCP

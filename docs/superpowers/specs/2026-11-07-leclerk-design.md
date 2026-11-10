@@ -1364,3 +1364,22 @@ private tmux server, model haiku). Scripts and screens:
    started a turn on its own, the agent read the output file and replied
    `WOKE flag-long` (`evidence/c-2.txt`). The waiter's own shell error about
    a process name with spaces is a spike-script flaw, not Claude Code's.
+7. **A background command ending mid-turn (§11.2): seen within the turn.**
+   The waiter ended while a foreground command ran; Claude Code queued the
+   completion and attached it to the agent's next model call in the same
+   turn, and the agent read the output file and acted
+   (`evidence/d-midturn.txt`).
+8. **A time-limited background command in `-p` (§11.3): wakes the agent.**
+   Started with `timeout: 60000`; at 60 s Claude Code sent it SIGTERM
+   (`[killed]` appended to its output) and started a turn on the
+   notification, as for a normal completion (`evidence/e-p-timeout.jsonl`).
+   Hence `clerk wait` prints a result on SIGTERM too (plan Task 11 ruling).
+9. **`/clear` hooks (§11.5):** SessionEnd for the old session
+   (`reason: clear`, its own `session_id` and `CLAUDE_CODE_SESSION_ID`),
+   then SessionStart for the new one (`source: clear`), same `CLAUDE_PID`
+   (`evidence/f-hooks.log`).
+10. **`kill -9` then `--continue` (§11.4):** no SessionEnd for the killed
+    process; the new process's SessionStart has `source: resume`, the
+    continued session's ID and a new `CLAUDE_PID`; Bash sees the same.
+11. **Not checked here (§11.6):** the desktop app and the VS Code extension;
+    left for the user.
