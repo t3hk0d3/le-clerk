@@ -4099,10 +4099,19 @@ mod cli {
             );
             assert_eq!(code, Some(3), "{text}");
             assert!(text.starts_with("## Error: not_found\n"), "{text}");
-            assert!(
-                text.trim_end().ends_with("to see where you stand."),
-                "{text}"
-            );
+            let message = text.lines().nth(1).unwrap();
+            assert!(message.ends_with("to see where you stand."), "{text}");
+            assert!(text.contains("- kind: lease"), "details follow: {text}");
+        }
+
+        #[test]
+        fn a_mistyped_command_is_a_markdown_error() {
+            let env = Env::new();
+            let dir = env.dir("alpha");
+            let (text, code) = stdout(env.agent_md("sess-1", &dir).args(["aquire", "board"]));
+            assert_eq!(code, Some(2), "{text}");
+            assert!(text.starts_with("## Error: usage_error\n"), "{text}");
+            assert!(text.trim_end().ends_with("run it again."), "{text}");
         }
 
         #[test]

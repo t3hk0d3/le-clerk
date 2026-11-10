@@ -335,7 +335,9 @@ impl Output {
         match self.mode {
             Mode::Json if self.markdown && self.agent.is_some() => {
                 let mut stdout = io::stdout().lock();
-                let _ = writeln!(stdout, "{}", super::md::error(&f.code, &f.message));
+                let now = leclerk::clock::Clock::now_ms(&leclerk::clock::SystemClock);
+                let md = super::md::error(&f.code, &f.message, f.details.as_ref(), now);
+                let _ = writeln!(stdout, "{md}");
             }
             Mode::Json => {
                 let mut error = json!({"code": f.code, "message": f.message});

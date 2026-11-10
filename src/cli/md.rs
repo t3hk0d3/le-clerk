@@ -102,10 +102,20 @@ pub fn wait(value: &Value, now_ms: i64) -> String {
     parts.join("\n\n")
 }
 
-/// An error, for an agent: heading, message (ending with the next step).
+/// An error, for an agent: heading, message (ending with the next step),
+/// then its details as labelled fields.
 #[must_use]
-pub fn error(code: &str, message: &str) -> String {
-    format!("## Error: {code}\n{message}")
+pub fn error(code: &str, message: &str, details: Option<&Value>, now_ms: i64) -> String {
+    let mut out = format!("## Error: {code}\n{message}");
+    if let Some(d) = details.filter(|d| !is_empty(d)) {
+        let fields = match d {
+            Value::Object(_) => body(d, now_ms, &[]),
+            other => format!("- details: {}", scalar("", other, now_ms)),
+        };
+        out.push_str("\n\n");
+        out.push_str(&fields);
+    }
+    out
 }
 
 /// The heading of a hand-tuned layout and the fields it already shows.
@@ -284,7 +294,7 @@ fn is_empty(v: &Value) -> bool {
 
 /// A field holding a unix-ms time.
 fn is_time(key: &str) -> bool {
-    key.ends_with("_at") || key == "deadline" || key.ends_with("_deadline")
+    key == "at" || key.ends_with("_at") || key == "deadline" || key.ends_with("_deadline")
 }
 
 /// A field holding a length of time in ms.
@@ -478,8 +488,35 @@ mod tests {
     }
 
     #[test]
+    fn an_error_shows_its_details() {
+        let md = error(
+            "extend_refused",
+            "a higher-priority request is waiting.",
+            Some(&json!({"waiting_purpose": "urgent", "due_at": NOW + 60_000})),
+            NOW,
+        );
+        assert!(md.contains("- waiting_purpose: urgent"), "{md}");
+        assert!(md.contains("(in 1m)"), "{md}");
+    }
+
+    #[test]
+    fn a_time_under_at_is_a_date_and_time() {
+        let md = render(
+            "x",
+            &json!({"dirty": {"at": NOW - 120_000, "reason": "holder_gone"}}),
+            NOW,
+        );
+        assert!(md.contains("(2m ago)"), "{md}");
+    }
+
+    #[test]
     fn an_error_has_its_code_heading_and_message() {
-        let md = error("not_found", "no such lease. Run `clerk leases --mine`.");
+        let md = error(
+            "not_found",
+            "no such lease. Run `clerk leases --mine`.",
+            None,
+            NOW,
+        );
         assert_eq!(
             md,
             "## Error: not_found\nno such lease. Run `clerk leases --mine`."

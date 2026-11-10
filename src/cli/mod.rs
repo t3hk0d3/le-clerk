@@ -330,7 +330,15 @@ fn parse_failure(e: &clap::Error) -> ExitCode {
         .next()
         .unwrap_or_default();
     let message = body.trim().trim_start_matches("error: ").to_owned();
-    Output::new(Mode::Json).fail(UsageError(message))
+    let mut out = Output::new(Mode::Json);
+    let agent = std::env::var_os(caller::SESSION_VAR).is_some_and(|v| !v.is_empty());
+    let json_wanted = json_flag
+        || std::env::var("CLERK_AGENT_FORMAT").is_ok_and(|f| matches!(f.trim(), "json" | "human"));
+    if agent && !json_wanted {
+        // An agent mistyping a command reads the same Markdown errors.
+        out = out.for_agent("usage").markdown();
+    }
+    out.fail(UsageError(message))
 }
 
 fn run_daemon() -> anyhow::Result<()> {
