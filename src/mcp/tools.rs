@@ -10,23 +10,30 @@
 //! - Results carry the engine's JSON as structured content (always an
 //!   object) plus one text block. Engine errors become tool errors whose
 //!   structured content is `{"error": {"code", "message", "details"}}`.
+//! - `lease_wait`, and `lease_acquire` when it queues, may answer with a
+//!   task instead (see [`crate::mcp::wait`]).
 
 use std::fmt::Write as _;
 use std::sync::Arc;
 
 use rmcp::handler::server::common::schema_for_input;
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool};
+use rmcp::model::{
+    CallToolResponse, CallToolResult, ContentBlock, CreateTaskResult, JsonObject, Tool,
+};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
-use crate::engine::{ApiError, Command, EngineHandle, ErrorKind};
+use crate::duration::parse_duration;
+use crate::engine::{ApiError, Command, EngineHandle};
 use crate::mcp::McpIdentity;
+use crate::mcp::wait::{self, Batch, Live};
 use crate::model::{
-    BuiltinCheck, HealthSpec, Priority, ResourceType, Scope, UnitSettings, allowed_builtins,
-    placeholder_keys,
+    BuiltinCheck, HealthSpec, LeaseId, NoticeId, Priority, RequestId, ResourceType, Scope,
+    UnitSettings, allowed_builtins, placeholder_keys,
 };
+use crate::store::notices::{Notice, NoticeKind};
 
 /// What a tool produced: structured content and the text block.
 struct Outcome {
@@ -45,12 +52,32 @@ impl Outcome {
         text.push_str(next);
         Self { structured, text }
     }
+
+    /// The tool result.
+    fn into_result(self) -> CallToolResult {
+        let mut result = CallToolResult::success(vec![ContentBlock::text(self.text)]);
+        result.structured_content = Some(self.structured);
+        result
+    }
+}
+
+/// What a tool answers: a result now, or a task to poll.
+enum Answer {
+    Done(Outcome),
+    Task(CreateTaskResult),
+}
+
+impl From<Outcome> for Answer {
+    fn from(o: Outcome) -> Self {
+        Self::Done(o)
+    }
 }
 
 /// What a tool call runs with.
 struct Ctx<'a> {
     engine: &'a EngineHandle,
     identity: &'a McpIdentity,
+    live: &'a Live,
 }
 
 impl Ctx<'_> {
@@ -79,10 +106,10 @@ macro_rules! tools {
             ctx: &Ctx<'_>,
             name: &str,
             args: Value,
-        ) -> Option<Result<Outcome, ApiError>> {
+        ) -> Option<Result<Answer, ApiError>> {
             Some(match name {
                 $( $name => match parse::<$args>($name, args) {
-                    Ok(a) => $handler(ctx, a).await,
+                    Ok(a) => $handler(ctx, a).await.map(Answer::from),
                     Err(e) => Err(e),
                 }, )*
                 _ => return None,
@@ -117,47 +144,58 @@ tools! {
     "unit_retire" => unit_retire(UnitArgs),
         "Retire a unit: removed now when free, otherwise never granted again and removed once \
          its lease ends.";
-    "lease_acquire" => not_yet(LeaseAcquireArgs),
-        "Lease a unit of a resource for a while, or queue for one.";
-    "lease_status" => not_yet(NoArgs),
+    "lease_acquire" => lease_acquire(LeaseAcquireArgs),
+        "Lease a unit of a resource for a while, or queue for one. A queued request is \
+         offered the unit later: keep lease_wait running, it claims the offer for you.";
+    "lease_status" => lease_status(NoArgs),
         "This session's leases, queued requests and pending notices.";
-    "lease_extend" => not_yet(LeaseExtendArgs),
+    "lease_extend" => lease_extend(LeaseExtendArgs),
         "Extend a lease you hold.";
-    "lease_release" => not_yet(LeaseReleaseArgs),
+    "lease_release" => lease_release(LeaseReleaseArgs),
         "Release a lease: its cleanup window starts.";
-    "lease_confirm" => not_yet(LeaseConfirmArgs),
+    "lease_confirm" => lease_confirm(LeaseConfirmArgs),
         "Confirm a released or yielded unit is clean.";
-    "lease_set_interruptible" => not_yet(LeaseInterruptibleArgs),
+    "lease_set_interruptible" => lease_set_interruptible(LeaseInterruptibleArgs),
         "Say whether others may borrow your unit while you pause.";
-    "lease_yield_refuse" => not_yet(LeaseIdArgs),
+    "lease_yield_refuse" => lease_yield_refuse(LeaseIdArgs),
         "Refuse a request to yield your unit.";
-    "lease_reclaim" => not_yet(LeaseIdArgs),
+    "lease_reclaim" => lease_reclaim(LeaseIdArgs),
         "Take your unit back from a borrower who overran.";
-    "lease_cancel" => not_yet(RequestIdArgs),
+    "lease_cancel" => lease_cancel(RequestIdArgs),
         "Cancel a queued request.";
-    "lease_claim" => not_yet(LeaseIdArgs),
+    "lease_claim" => lease_claim(LeaseIdArgs),
         "Claim a unit offered to you.";
-    "lease_wait" => not_yet(LeaseWaitArgs),
-        "Wait for this session's notices; acknowledge the previous batch with ack.";
+    "lease_wait" => lease_wait(LeaseWaitArgs),
+        "Wait for this session's notices (offers are claimed for you). Returns at once while \
+         any are unacknowledged; pass the previous result's notice ids as ack. Keep one \
+         running while you hold or wait for anything.";
 }
 
-/// Run tool `name` with `args` as `identity`; `None` when there is no such
-/// tool. Engine and argument errors come back as tool errors.
+/// Run tool `name` with `args` as `identity` in request `live`; `None` when
+/// there is no such tool. Engine and argument errors come back as tool
+/// errors.
 pub async fn call(
     engine: &EngineHandle,
     identity: &McpIdentity,
+    live: &Live,
     name: &str,
     args: Value,
-) -> Option<CallToolResult> {
-    let ctx = Ctx { engine, identity };
+) -> Option<CallToolResponse> {
+    let ctx = Ctx {
+        engine,
+        identity,
+        live,
+    };
     Some(match dispatch(&ctx, name, args).await? {
-        Ok(outcome) => {
-            let mut result = CallToolResult::success(vec![ContentBlock::text(outcome.text)]);
-            result.structured_content = Some(outcome.structured);
-            result
-        }
-        Err(e) => tool_error(&e),
+        Ok(Answer::Done(outcome)) => CallToolResponse::Complete(outcome.into_result()),
+        Ok(Answer::Task(task)) => CallToolResponse::Task(task),
+        Err(e) => CallToolResponse::Complete(tool_error(&e)),
     })
+}
+
+/// A task result: the outcome, or the error as a tool error.
+fn task_result(outcome: Result<Outcome, ApiError>) -> CallToolResult {
+    outcome.map_or_else(|e| tool_error(&e), Outcome::into_result)
 }
 
 /// A tool error carrying the engine's code, message and details.
@@ -334,23 +372,23 @@ pub struct UnitArgs {
 }
 
 /// What `lease_acquire` asks for.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetArgs {
     /// Resource id.
     pub resource: String,
     /// A specific unit; absent means any free unit.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
 }
 
-/// `lease_acquire` (provisional until the leasing tools land).
+/// `lease_acquire`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseAcquireArgs {
     /// What to lease.
     pub target: TargetArgs,
-    /// How long you expect to use it, e.g. "30m".
+    /// How long you expect to use it: <n>s|m|h|d, e.g. "30m" (at most 30d).
     #[serde(rename = "for")]
     pub duration: String,
     /// What you will do with it, shown to others who wait.
@@ -374,18 +412,18 @@ pub struct LeaseIdArgs {
     pub lease_id: String,
 }
 
-/// `lease_extend` (provisional).
+/// `lease_extend`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseExtendArgs {
     /// The lease id from the grant.
     pub lease_id: String,
-    /// How much longer you need it, e.g. "15m".
+    /// The lease then ends this long from now: <n>s|m|h|d, e.g. "15m".
     #[serde(rename = "for")]
     pub duration: String,
 }
 
-/// `lease_release` (provisional).
+/// `lease_release`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseReleaseArgs {
@@ -397,7 +435,7 @@ pub struct LeaseReleaseArgs {
 }
 
 /// How a unit was left.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfirmChoice {
     /// The unit is clean.
@@ -406,7 +444,7 @@ pub enum ConfirmChoice {
     Yielded,
 }
 
-/// `lease_confirm` (provisional).
+/// `lease_confirm`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseConfirmArgs {
@@ -417,7 +455,7 @@ pub struct LeaseConfirmArgs {
     pub how: Option<ConfirmChoice>,
 }
 
-/// `lease_set_interruptible` (provisional).
+/// `lease_set_interruptible`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseInterruptibleArgs {
@@ -427,7 +465,7 @@ pub struct LeaseInterruptibleArgs {
     pub interruptible: bool,
 }
 
-/// `lease_cancel` (provisional).
+/// `lease_cancel`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestIdArgs {
@@ -435,11 +473,11 @@ pub struct RequestIdArgs {
     pub request_id: String,
 }
 
-/// `lease_wait` (provisional).
+/// `lease_wait`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseWaitArgs {
-    /// Notice ids from the previous `lease_wait` result.
+    /// The notice ids of the previous `lease_wait` result, once handled.
     #[serde(default)]
     pub ack: Vec<String>,
 }
@@ -659,16 +697,424 @@ async fn unit_retire(ctx: &Ctx<'_>, a: UnitArgs) -> Result<Outcome, ApiError> {
     ))
 }
 
-/// A leasing tool whose handler is not in this build yet.
-// Async and generic to fit the tool table; the leasing tools replace it.
-#[allow(clippy::unused_async)]
-async fn not_yet<A>(_ctx: &Ctx<'_>, _args: A) -> Result<Outcome, ApiError> {
-    Err(ApiError {
-        kind: ErrorKind::Unavailable,
-        code: "not_implemented",
-        message: "this leasing tool is not available yet; use the clerk CLI".to_owned(),
-        details: None,
-    })
+// ---------------------------------------------------------------------------
+// Leasing tools
+// ---------------------------------------------------------------------------
+
+/// The sentence every `lease_wait` result ends with.
+fn re_arm(ids: &[String]) -> String {
+    // Encoding a list of strings cannot fail.
+    let list = serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_owned());
+    format!("Call lease_wait again with ack={list} while you hold or wait for anything.")
+}
+
+/// `for` as milliseconds.
+fn duration_ms(text: &str) -> Result<u64, ApiError> {
+    let d = parse_duration(text).map_err(|e| ApiError::invalid_argument(e.to_string()))?;
+    Ok(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// "in 59 min" (or "now") for `at`, unix ms, seen at `now`.
+fn ends_in(at: i64, now: i64) -> String {
+    let mins = (at.saturating_sub(now) + 59_999) / 60_000;
+    if mins <= 0 {
+        "now".to_owned()
+    } else {
+        format!("in {mins} min")
+    }
+}
+
+/// The text brief of a grant or held lease (both carry the same fields).
+fn grant_brief(v: &Value, now: i64) -> String {
+    let mut brief = format!(
+        "You hold {}/{} (lease {}), ending {}: {}",
+        str_at(v, "/resource"),
+        str_at(v, "/unit"),
+        str_at(v, "/lease_id"),
+        v["ends_at"]
+            .as_i64()
+            .map_or_else(|| "later".to_owned(), |at| ends_in(at, now)),
+        str_at(v, "/resource_description"),
+    );
+    let unit = str_at(v, "/unit_description");
+    if !unit.is_empty() {
+        let _ = write!(brief, " ({unit})");
+    }
+    brief.push('.');
+    if let Some(tags) = v["resource_tags"].as_array().filter(|t| !t.is_empty()) {
+        let tags: Vec<&str> = tags.iter().filter_map(Value::as_str).collect();
+        let _ = write!(brief, " Tags: {}.", tags.join(", "));
+    }
+    if v["dirty"].is_object() {
+        brief.push_str(" It was handed over without confirmed cleanup; check it first.");
+    }
+    let usage = str_at(v, "/usage");
+    if !usage.is_empty() {
+        let _ = write!(brief, " Usage: {usage}");
+    }
+    brief
+}
+
+/// The next step once a unit is held.
+const HELD_NEXT: &str = "Call lease_release when you are done with it.";
+
+/// The next step while a request waits in the queue.
+const QUEUED_NEXT: &str = "Call lease_wait to wait for the offer; it claims the unit for you.";
+
+/// Claim offered lease `lease`; when it is already this session's (an
+/// earlier, dropped `lease_wait` claimed it), its current state instead.
+async fn claim_offer(ctx: &Ctx<'_>, lease: &LeaseId) -> Result<Value, ApiError> {
+    let id = json!({ "lease_id": lease });
+    match ctx.engine("claim", id.clone()).await {
+        Ok(v) => Ok(v),
+        Err(e) => match ctx.engine("get_lease", id).await {
+            Ok(v) if matches!(str_at(&v, "/state"), "held" | "paused") => Ok(v),
+            _ => Err(e),
+        },
+    }
+}
+
+async fn lease_acquire(ctx: &Ctx<'_>, a: LeaseAcquireArgs) -> Result<Answer, ApiError> {
+    let mut args = json!({
+        "target": a.target,
+        "duration_ms": duration_ms(&a.duration)?,
+        "interruptible": a.interruptible,
+        "purpose": a.purpose,
+    });
+    if let Some(p) = a.priority {
+        args["priority"] = json!(p);
+    }
+    if let Some(r) = a.override_reason {
+        args["override_reason"] = json!(r);
+    }
+    let got = ctx.engine("acquire", args).await?;
+    let now = ctx.engine.now_ms();
+    match str_at(&got, "/outcome") {
+        "granted" => Ok(Outcome::new(got.clone(), &[grant_brief(&got, now)], HELD_NEXT).into()),
+        "queued" => {
+            let request = RequestId::parse(str_at(&got, "/request_id"))
+                .map_err(|e| ApiError::internal(format!("bad request id from acquire: {e}")))?;
+            if let Some(tasks) = ctx.live.tasks() {
+                let (engine, identity) = (ctx.engine.clone(), ctx.identity.clone());
+                let work = async move {
+                    let live = Live::default();
+                    let ctx = Ctx {
+                        engine: &engine,
+                        identity: &identity,
+                        live: &live,
+                    };
+                    task_result(queued_outcome(&ctx, &request).await)
+                };
+                return Ok(Answer::Task(tasks.spawn(ctx.engine, ctx.identity, work)));
+            }
+            Ok(Outcome::new(
+                got.clone(),
+                &[format!(
+                    "Queued for {} at position {} (request {}).",
+                    a.target.resource,
+                    got["position"],
+                    str_at(&got, "/request_id"),
+                )],
+                QUEUED_NEXT,
+            )
+            .into())
+        }
+        _ => Ok(Outcome::new(
+            got.clone(),
+            &[format!(
+                "Your borrower is being ended so lease {} comes back to you.",
+                str_at(&got, "/lease_id")
+            )],
+            "Call lease_wait to hear when the unit is back.",
+        )
+        .into()),
+    }
+}
+
+/// What a queued request came to, within the wait cap (a task's result).
+async fn queued_outcome(ctx: &Ctx<'_>, request: &RequestId) -> Result<Outcome, ApiError> {
+    let holder = ctx.identity.caller().holder;
+    let Some(notice) = wait::request_outcome(ctx.engine, &holder, request).await? else {
+        return Ok(Outcome::new(
+            json!({ "outcome": "queued", "request_id": request }),
+            &[format!("Request {request} is still queued.")],
+            QUEUED_NEXT,
+        ));
+    };
+    match (notice.kind, &notice.lease_id) {
+        (NoticeKind::Offered, Some(lease)) => {
+            let lease = claim_offer(ctx, lease).await?;
+            let brief = grant_brief(&lease, ctx.engine.now_ms());
+            Ok(Outcome::new(lease, &[brief], HELD_NEXT))
+        }
+        _ => Ok(Outcome::new(
+            json!({ "outcome": "dropped", "request_id": request, "notice": notice }),
+            std::slice::from_ref(&notice.action),
+            "Call lease_acquire again if you still need it.",
+        )),
+    }
+}
+
+async fn lease_status(ctx: &Ctx<'_>, NoArgs {}: NoArgs) -> Result<Outcome, ApiError> {
+    let mut mine = ctx.engine("list_my_leases", json!({})).await?;
+    let pending = ctx
+        .engine
+        .pending_notices(ctx.identity.caller().holder)
+        .await?
+        .len();
+    mine["pending_notices"] = json!(pending);
+    let leases = mine["leases"].as_array().map_or(0, Vec::len);
+    let requests = mine["requests"].as_array().map_or(0, Vec::len);
+    let mut summary = vec![format!(
+        "{leases} lease(s), {requests} queued request(s), {pending} pending notice(s)."
+    )];
+    if let Some(list) = mine["requests"].as_array() {
+        for r in list {
+            summary.push(format!(
+                "Request {} for {} is at position {}.",
+                str_at(r, "/request_id"),
+                str_at(r, "/resource"),
+                r["position"]
+            ));
+        }
+    }
+    let next = if pending > 0 {
+        "Call lease_wait to read the pending notices."
+    } else if leases + requests > 0 {
+        "Keep lease_wait running while you hold or wait for anything."
+    } else {
+        "Call lease_acquire before using a resource."
+    };
+    Ok(Outcome::new(mine, &summary, next))
+}
+
+async fn lease_extend(ctx: &Ctx<'_>, a: LeaseExtendArgs) -> Result<Outcome, ApiError> {
+    let ms = i64::try_from(duration_ms(&a.duration)?).unwrap_or(i64::MAX);
+    let now = ctx.engine.now_ms();
+    let lease = ctx
+        .engine(
+            "extend",
+            json!({ "lease_id": a.lease_id, "ends_at": now.saturating_add(ms) }),
+        )
+        .await?;
+    let ends = lease["ends_at"]
+        .as_i64()
+        .map_or_else(|| "later".to_owned(), |at| ends_in(at, now));
+    Ok(Outcome::new(
+        lease,
+        &[format!("Lease {} now ends {ends}.", a.lease_id)],
+        HELD_NEXT,
+    ))
+}
+
+async fn lease_release(ctx: &Ctx<'_>, a: LeaseReleaseArgs) -> Result<Outcome, ApiError> {
+    let lease = ctx
+        .engine(
+            "release",
+            json!({ "lease_id": a.lease_id, "failed": a.failed }),
+        )
+        .await?;
+    let (summary, next) = if str_at(&lease, "/state") == "cleaning" {
+        (
+            format!(
+                "Released lease {}; its cleanup window ends {}.",
+                a.lease_id,
+                lease["cleanup_deadline"]
+                    .as_i64()
+                    .map_or_else(|| "soon".to_owned(), |at| ends_in(at, ctx.engine.now_ms()))
+            ),
+            "Call lease_confirm when the unit is clean.",
+        )
+    } else {
+        (
+            format!("Lease {} ended; the unit is marked dirty.", a.lease_id),
+            "Call lease_status to see what you still hold.",
+        )
+    };
+    Ok(Outcome::new(lease, &[summary], next))
+}
+
+async fn lease_confirm(ctx: &Ctx<'_>, a: LeaseConfirmArgs) -> Result<Outcome, ApiError> {
+    let mut args = json!({ "lease_id": a.lease_id });
+    if let Some(how) = a.how {
+        args["how"] = json!(how);
+    }
+    ctx.engine("confirm", args).await?;
+    let yielded = a.how == Some(ConfirmChoice::Yielded);
+    let (summary, next) = if yielded {
+        (
+            format!(
+                "Lease {} is paused and lent out; your time is kept.",
+                a.lease_id
+            ),
+            "Call lease_wait to hear when your unit is back.",
+        )
+    } else {
+        (
+            format!("Lease {} is over; the unit is clean.", a.lease_id),
+            "Call lease_status to see what you still hold.",
+        )
+    };
+    Ok(Outcome::new(
+        json!({ "confirmed": { "lease_id": a.lease_id, "how": a.how.unwrap_or(ConfirmChoice::Clean) } }),
+        &[summary],
+        next,
+    ))
+}
+
+async fn lease_set_interruptible(
+    ctx: &Ctx<'_>,
+    a: LeaseInterruptibleArgs,
+) -> Result<Outcome, ApiError> {
+    let lease = ctx
+        .engine(
+            "set_interruptible",
+            json!({ "lease_id": a.lease_id, "interruptible": a.interruptible }),
+        )
+        .await?;
+    let (summary, next) = if a.interruptible {
+        (
+            format!("Others may now ask to borrow lease {}'s unit.", a.lease_id),
+            "Keep lease_wait running to hear of yield requests, and call lease_release when you \
+             are done.",
+        )
+    } else {
+        (
+            format!("Lease {} is no longer interruptible.", a.lease_id),
+            HELD_NEXT,
+        )
+    };
+    Ok(Outcome::new(lease, &[summary], next))
+}
+
+async fn lease_yield_refuse(ctx: &Ctx<'_>, a: LeaseIdArgs) -> Result<Outcome, ApiError> {
+    ctx.engine("refuse_yield", json!({ "lease_id": a.lease_id }))
+        .await?;
+    Ok(Outcome::new(
+        json!({ "refused_yield": { "lease_id": a.lease_id } }),
+        &[format!(
+            "You keep lease {}; the requester will not ask you again.",
+            a.lease_id
+        )],
+        HELD_NEXT,
+    ))
+}
+
+async fn lease_reclaim(ctx: &Ctx<'_>, a: LeaseIdArgs) -> Result<Outcome, ApiError> {
+    ctx.engine("reclaim", json!({ "lease_id": a.lease_id }))
+        .await?;
+    Ok(Outcome::new(
+        json!({ "reclaiming": { "lease_id": a.lease_id } }),
+        &[format!(
+            "The borrower of lease {}'s unit is being ended.",
+            a.lease_id
+        )],
+        "Call lease_wait to hear when the unit is back.",
+    ))
+}
+
+async fn lease_cancel(ctx: &Ctx<'_>, a: RequestIdArgs) -> Result<Outcome, ApiError> {
+    ctx.engine("cancel", json!({ "request_id": a.request_id }))
+        .await?;
+    Ok(Outcome::new(
+        json!({ "cancelled": { "request_id": a.request_id } }),
+        &[format!("Cancelled request {}.", a.request_id)],
+        "Call lease_status to see what you still hold.",
+    ))
+}
+
+async fn lease_claim(ctx: &Ctx<'_>, a: LeaseIdArgs) -> Result<Outcome, ApiError> {
+    let lease = ctx
+        .engine("claim", json!({ "lease_id": a.lease_id }))
+        .await?;
+    let brief = grant_brief(&lease, ctx.engine.now_ms());
+    Ok(Outcome::new(lease, &[brief], HELD_NEXT))
+}
+
+async fn lease_wait(ctx: &Ctx<'_>, a: LeaseWaitArgs) -> Result<Answer, ApiError> {
+    let ack = a
+        .ack
+        .iter()
+        .map(|id| NoticeId::parse(id).map_err(|e| ApiError::invalid_argument(e.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let holder = ctx.identity.caller().holder;
+    let acknowledged = if ack.is_empty() {
+        0
+    } else {
+        ctx.engine.ack_notices(holder.clone(), ack).await?
+    };
+    if let Some(tasks) = ctx.live.tasks() {
+        let (engine, identity) = (ctx.engine.clone(), ctx.identity.clone());
+        let work = async move {
+            let live = Live::default();
+            let ctx = Ctx {
+                engine: &engine,
+                identity: &identity,
+                live: &live,
+            };
+            task_result(wait_outcome(&ctx, acknowledged).await)
+        };
+        return Ok(Answer::Task(tasks.spawn(ctx.engine, ctx.identity, work)));
+    }
+    let _open = ctx.engine.open_wait(&holder);
+    wait_outcome(ctx, acknowledged).await.map(Answer::from)
+}
+
+/// One `lease_wait` batch, with its offers claimed.
+async fn wait_outcome(ctx: &Ctx<'_>, acknowledged: usize) -> Result<Outcome, ApiError> {
+    let holder = ctx.identity.caller().holder;
+    let (notices, timed_out) = match wait::next_batch(ctx.engine, &holder, ctx.live).await? {
+        Batch::Notices(n) => (n, false),
+        Batch::Empty => (Vec::new(), true),
+        // Nobody reads this result; the notices stay pending.
+        Batch::Gone => (Vec::new(), false),
+    };
+    let now = ctx.engine.now_ms();
+    let mut summary = Vec::new();
+    let mut grants = Vec::new();
+    let mut claim_errors = Vec::new();
+    if notices.is_empty() {
+        summary.push("No notices arrived.".to_owned());
+    } else {
+        summary.push(format!("{} notice(s):", notices.len()));
+    }
+    for n in &notices {
+        summary.push(notice_line(n));
+        if let (NoticeKind::Offered, Some(lease)) = (n.kind, &n.lease_id) {
+            match claim_offer(ctx, lease).await {
+                Ok(lease) => {
+                    summary.push(format!("Claimed it for you. {}", grant_brief(&lease, now)));
+                    summary.push(HELD_NEXT.to_owned());
+                    grants.push(lease);
+                }
+                Err(e) => {
+                    summary.push(format!("Could not claim lease {lease}: {}.", e.message));
+                    claim_errors.push(json!({ "lease_id": lease, "error": e }));
+                }
+            }
+        }
+    }
+    let ids: Vec<String> = notices.iter().map(|n| n.id.as_str().to_owned()).collect();
+    Ok(Outcome::new(
+        json!({
+            "notices": notices,
+            "grants": grants,
+            "claim_errors": claim_errors,
+            "acknowledged": acknowledged,
+            "timed_out": timed_out,
+        }),
+        &summary,
+        &re_arm(&ids),
+    ))
+}
+
+/// One notice as a text line, naming its id.
+fn notice_line(n: &Notice) -> String {
+    let kind = serde_json::to_value(n.kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    format!("[{}] {kind}: {}", n.id, n.action)
 }
 
 /// The string at `pointer` in `v`, or "".

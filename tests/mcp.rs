@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -82,11 +83,15 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Self {
+        Self::start_with(Config::default())
+    }
+
+    fn start_with(config: Config) -> Self {
         let dir = TempDir::new().unwrap();
         let engine = Engine::spawn(
             Store::open_in_memory().unwrap(),
             Arc::new(ManualClock::new(T0)),
-            Config::default(),
+            config,
             Arc::new(Healthy),
         )
         .unwrap();
@@ -164,6 +169,23 @@ impl Daemon {
             .unwrap()
     }
 
+    /// Lease `lease` of agent session `session` (in project "a"), as the
+    /// engine reports it.
+    async fn lease_of(&self, session: &str, lease: &Value) -> Value {
+        let caller = Caller {
+            holder: HolderRef::AgentSession {
+                session_id: session.into(),
+            },
+            project: Some(leclerk::model::ProjectKey(self.project("a"))),
+            override_reason: None,
+        };
+        let args = json!({ "lease_id": lease });
+        self.engine
+            .call(Command::parse("get_lease", caller, args).unwrap())
+            .await
+            .unwrap()
+    }
+
     /// Every resource, in every scope.
     async fn all_resources(&self) -> Vec<Value> {
         let v = self.admin("list_resources", json!({"view": "all"})).await;
@@ -212,6 +234,10 @@ struct Raw {
     headers: Vec<(&'static str, String)>,
     version: &'static str,
     next_id: AtomicU64,
+    /// Send `_meta.progressToken` with every request.
+    progress: bool,
+    /// Declare the tasks extension in the per-request client capabilities.
+    tasks: bool,
 }
 
 /// What came back for one request.
@@ -228,7 +254,21 @@ impl Raw {
             headers: identity_headers(session, project),
             version: "2026-07-28",
             next_id: AtomicU64::new(1),
+            progress: false,
+            tasks: false,
         }
+    }
+
+    /// Ask for progress notifications (a `progressToken` per request).
+    fn with_progress(mut self) -> Self {
+        self.progress = true;
+        self
+    }
+
+    /// Declare `io.modelcontextprotocol/tasks` per request.
+    fn with_tasks(mut self) -> Self {
+        self.tasks = true;
+        self
     }
 
     /// Send `value` as header `name` instead of what the identity says.
@@ -244,14 +284,33 @@ impl Raw {
         self
     }
 
-    async fn request(&self, method: &str, mut params: Value) -> Reply {
+    async fn request(&self, method: &str, params: Value) -> Reply {
+        let (status, id, messages) = self.exchange(method, params).await;
+        let message = messages
+            .into_iter()
+            .find(|m| m.get("id") == Some(&json!(id)))
+            .unwrap_or_else(|| panic!("no response for {id}"));
+        Reply { status, message }
+    }
+
+    /// Every message of one request's response (notifications first, as
+    /// sent), with the HTTP status and the request id.
+    async fn exchange(&self, method: &str, mut params: Value) -> (u16, u64, Vec<Value>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if self.version == "2026-07-28" {
+            let capabilities = if self.tasks {
+                json!({"extensions": {"io.modelcontextprotocol/tasks": {}}})
+            } else {
+                json!({})
+            };
             params["_meta"] = json!({
                 "io.modelcontextprotocol/protocolVersion": "2026-07-28",
                 "io.modelcontextprotocol/clientInfo": {"name": "mcp-test", "version": "0"},
-                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientCapabilities": capabilities,
             });
+            if self.progress {
+                params["_meta"]["progressToken"] = json!(id);
+            }
         }
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let stream = tokio::net::UnixStream::connect(&self.socket).await.unwrap();
@@ -265,7 +324,11 @@ impl Raw {
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", self.version)
             .header("mcp-method", method);
-        if let Some(name) = params.get("name").and_then(Value::as_str) {
+        if let Some(name) = params
+            .get("name")
+            .or_else(|| params.get("taskId"))
+            .and_then(Value::as_str)
+        {
             req = req.header("mcp-name", name);
         }
         for (k, v) in &self.headers {
@@ -283,7 +346,7 @@ impl Raw {
             .is_some_and(|c| c.starts_with("text/event-stream"));
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let message = if sse {
+        let messages = if sse {
             text.split("\n\n")
                 .filter_map(|ev| {
                     let data: Vec<&str> = ev
@@ -293,12 +356,21 @@ impl Raw {
                         .collect();
                     serde_json::from_str::<Value>(&data.join("\n")).ok()
                 })
-                .find(|m| m.get("id") == Some(&json!(id)))
-                .unwrap_or_else(|| panic!("no response for {id} in {text:?}"))
+                .collect()
         } else {
-            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {status} {text:?}"))
+            vec![serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {status} {text:?}"))]
         };
-        Reply { status, message }
+        (status, id, messages)
+    }
+
+    /// Start `tools/call` and drop the connection after `after`, as a dying
+    /// proxy would.
+    async fn call_and_disconnect(&self, tool: &str, args: Value, after: Duration) {
+        let call = self.exchange("tools/call", json!({"name": tool, "arguments": args}));
+        assert!(
+            tokio::time::timeout(after, call).await.is_err(),
+            "{tool} answered before the disconnect"
+        );
     }
 
     /// `tools/call`; the JSON-RPC `result` (a `CallToolResult`).
@@ -947,6 +1019,738 @@ mod tools {
             for (tool, args) in calls {
                 let error = s.err(tool, args).await;
                 assert_eq!(error["code"], json!("not_found"), "{tool}: {error}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mcp::tools leasing
+// ---------------------------------------------------------------------------
+
+/// The holder of agent session `id`.
+fn agent(id: &str) -> HolderRef {
+    HolderRef::AgentSession {
+        session_id: id.to_owned(),
+    }
+}
+
+/// Waits short enough for tests: progress every 50 ms, an empty batch after
+/// 400 ms.
+fn quick() -> Config {
+    Config {
+        mcp_progress_ms: 50,
+        mcp_wait_cap_ms: 400,
+        ..Config::default()
+    }
+}
+
+/// `lease_acquire` of any unit of `resource` for an hour; its structured
+/// content.
+async fn acquire(s: &Raw, resource: &str) -> Value {
+    acquire_with(
+        s,
+        json!({"target": {"resource": resource}, "for": "1h", "purpose": "flash"}),
+    )
+    .await
+}
+
+async fn acquire_with(s: &Raw, args: Value) -> Value {
+    s.ok("lease_acquire", args).await
+}
+
+/// The sentence every `lease_wait` result ends with, for `ids`.
+fn re_arm(ids: &[String]) -> String {
+    format!(
+        "Call lease_wait again with ack={} while you hold or wait for anything.",
+        serde_json::to_string(ids).unwrap()
+    )
+}
+
+/// The ids of a `lease_wait` result's notices.
+fn notice_ids(structured: &Value) -> Vec<String> {
+    structured["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Give `s` a `lease_ended` notice: it leases `resource`, and the user ends
+/// the lease. Returns the lease id.
+async fn ended_notice(d: &Daemon, s: &Raw, resource: &str) -> String {
+    let grant = acquire(s, resource).await;
+    let lease = grant["lease_id"].as_str().unwrap().to_owned();
+    d.admin("admin_release", json!({"lease_id": lease})).await;
+    lease
+}
+
+/// The undelivered notice ids of `session`, as the engine sees them.
+async fn pending_ids(d: &Daemon, session: &str) -> Vec<String> {
+    d.engine
+        .pending_notices(agent(session))
+        .await
+        .unwrap()
+        .iter()
+        .map(|n| n.id.as_str().to_owned())
+        .collect()
+}
+
+/// Poll until `f` holds, for at most 5 s.
+async fn eventually(mut f: impl FnMut() -> bool, what: &str) {
+    let until = Instant::now() + Duration::from_secs(5);
+    while !f() {
+        assert!(Instant::now() < until, "timed out waiting until {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// `s1` holds the single unit of `board`; `s2` queues for it. Returns the
+/// lease and the request.
+async fn held_pool(s1: &Raw, s2: &Raw) -> (String, Value) {
+    seed(s1, "board", "k", &[]).await;
+    let grant = acquire(s1, "board").await;
+    let queued = acquire(s2, "board").await;
+    (grant["lease_id"].as_str().unwrap().to_owned(), queued)
+}
+
+/// `s1` releases `lease` and confirms it clean, so the unit goes to the
+/// next waiter.
+async fn hand_over(s1: &Raw, lease: &str) {
+    s1.ok("lease_release", json!({"lease_id": lease})).await;
+    s1.ok("lease_confirm", json!({"lease_id": lease})).await;
+}
+
+mod leasing {
+    use super::*;
+
+    mod lease_acquire {
+        use super::*;
+
+        mod on_a_free_unit {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn returns_the_grant_with_descriptions_tags_and_rendered_usage_next_step_names_lease_release()
+             {
+                let d = Daemon::start();
+                let s = d.session("s1", "a");
+                s.ok(
+                    "resource_create",
+                    json!({"id": "board", "type": "generic", "description": "an nRF board",
+                           "usage": "Flash {unit.id} of {resource.id}.", "tags": ["nrf"]}),
+                )
+                .await;
+                s.ok(
+                    "unit_add",
+                    json!({"resource": "board", "id": "u1", "description": "the left one",
+                           "settings": {"type": "generic", "identity_key": "k"}}),
+                )
+                .await;
+                let result = s
+                    .call(
+                        "lease_acquire",
+                        json!({"target": {"resource": "board"}, "for": "30m", "purpose": "flash"}),
+                    )
+                    .await;
+                let got = &result["structuredContent"];
+                assert_eq!(got["outcome"], json!("granted"), "{result}");
+                assert_eq!(got["resource_description"], json!("an nRF board"));
+                assert_eq!(got["unit_description"], json!("the left one"));
+                assert_eq!(got["resource_tags"], json!(["nrf"]));
+                assert_eq!(got["usage"], json!("Flash u1 of board."));
+                let text = text_of(&result);
+                assert!(text.contains("Flash u1 of board."), "{text}");
+                let next = text.rsplit(". ").next().unwrap();
+                assert!(next.contains("lease_release"), "{text}");
+            }
+        }
+
+        mod on_a_held_pool {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn returns_queued_with_position_next_step_is_lease_wait() {
+                let d = Daemon::start();
+                let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+                seed(&s1, "board", "k", &[]).await;
+                acquire(&s1, "board").await;
+                let result = s2
+                    .call(
+                        "lease_acquire",
+                        json!({"target": {"resource": "board"}, "for": "1h", "purpose": "test"}),
+                    )
+                    .await;
+                let got = &result["structuredContent"];
+                assert_eq!(got["outcome"], json!("queued"), "{result}");
+                assert_eq!(got["position"], json!(1));
+                let text = text_of(&result);
+                let next = text.rsplit(". ").next().unwrap();
+                assert!(next.contains("lease_wait"), "{text}");
+            }
+        }
+
+        mod on_a_resource_with_no_units {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn returns_tool_error_no_units() {
+                let d = Daemon::start();
+                let s = d.session("s1", "a");
+                s.ok("resource_create", json!({"id": "empty", "type": "generic"}))
+                    .await;
+                let error = s
+                    .err(
+                        "lease_acquire",
+                        json!({"target": {"resource": "empty"}, "for": "1h", "purpose": "x"}),
+                    )
+                    .await;
+                assert_eq!(error["code"], json!("no_units"), "{error}");
+            }
+        }
+    }
+
+    mod lease_wait {
+        use super::*;
+
+        mod on_pending_notices {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn returns_them_at_once_listing_their_ids_in_the_text_block() {
+                let d = Daemon::start();
+                let s = d.session("s1", "a");
+                seed(&s, "board", "k", &[]).await;
+                let lease = ended_notice(&d, &s, "board").await;
+                let started = Instant::now();
+                let result = s.call("lease_wait", json!({})).await;
+                assert!(started.elapsed() < Duration::from_secs(5));
+                let got = &result["structuredContent"];
+                let ids = notice_ids(got);
+                assert!(
+                    got["notices"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|n| n["kind"] == json!("lease_ended") && n["lease_id"] == json!(lease)),
+                    "{result}"
+                );
+                let text = text_of(&result);
+                for id in &ids {
+                    assert!(text.contains(id.as_str()), "{id} not in {text}");
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn does_not_mark_them_delivered() {
+                let d = Daemon::start();
+                let s = d.session("s1", "a");
+                seed(&s, "board", "k", &[]).await;
+                ended_notice(&d, &s, "board").await;
+                let ids = notice_ids(&s.ok("lease_wait", json!({})).await);
+                assert_ne!(ids, Vec::<String>::new());
+                assert_eq!(pending_ids(&d, "s1").await, ids);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn returns_only_this_sessions_notices() {
+                let d = Daemon::start_with(quick());
+                let s1 = d.session("s1", "a");
+                seed(&s1, "board", "k", &[]).await;
+                ended_notice(&d, &s1, "board").await;
+                let got = d.session("s2", "a").ok("lease_wait", json!({})).await;
+                assert_eq!(got["notices"], json!([]), "{got}");
+            }
+        }
+
+        mod on_ack_with_ids_from_the_previous_result {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn marks_exactly_those_delivered_they_are_not_returned_again() {
+                let d = Daemon::start_with(quick());
+                let s = d.session("s1", "a");
+                seed(&s, "board", "k", &[]).await;
+                seed(&s, "probe", "k2", &[]).await;
+                ended_notice(&d, &s, "board").await;
+                ended_notice(&d, &s, "probe").await;
+                let first = notice_ids(&s.ok("lease_wait", json!({})).await);
+                assert!(first.len() >= 2, "{first:?}");
+                let (acked, kept) = first.split_at(1);
+                let again = notice_ids(&s.ok("lease_wait", json!({"ack": acked})).await);
+                assert_eq!(again, kept);
+                assert_eq!(pending_ids(&d, "s1").await, kept);
+            }
+        }
+
+        mod on_a_previous_result_never_acknowledged {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn returns_its_notices_again() {
+                let d = Daemon::start();
+                let s = d.session("s1", "a");
+                seed(&s, "board", "k", &[]).await;
+                ended_notice(&d, &s, "board").await;
+                let first = notice_ids(&s.ok("lease_wait", json!({})).await);
+                let again = notice_ids(&s.ok("lease_wait", json!({})).await);
+                assert_ne!(first, Vec::<String>::new());
+                assert_eq!(again, first);
+            }
+        }
+
+        mod on_an_offered_notice {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn claims_it_in_the_same_call_and_returns_the_grant_brief() {
+                let d = Daemon::start();
+                let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+                let (lease, _) = held_pool(&s1, &s2).await;
+                hand_over(&s1, &lease).await;
+                let result = s2.call("lease_wait", json!({})).await;
+                let got = &result["structuredContent"];
+                let offered = got["notices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|n| n["kind"] == json!("offered"))
+                    .unwrap_or_else(|| panic!("no offer in {result}"))
+                    .clone();
+                let grant = &got["grants"][0];
+                assert_eq!(grant["lease_id"], offered["lease_id"], "{result}");
+                assert_eq!(grant["state"], json!("held"), "{result}");
+                assert_eq!(grant["resource_description"], json!("a thing"));
+                let now = d.lease_of("s2", &offered["lease_id"]).await;
+                assert_eq!(now["state"], json!("held"));
+                assert!(text_of(&result).contains("lease_release"), "{result}");
+            }
+        }
+
+        mod on_none_pending {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sends_a_progress_notification_every_interval() {
+                let d = Daemon::start_with(quick());
+                let s = d.session("s1", "a").with_progress();
+                let (_, id, messages) = s
+                    .exchange("tools/call", json!({"name": "lease_wait", "arguments": {}}))
+                    .await;
+                let progress: Vec<&Value> = messages
+                    .iter()
+                    .filter(|m| m["method"] == json!("notifications/progress"))
+                    .collect();
+                // 400 ms at one every 50 ms: about 7, allowing for slow runs.
+                assert!(
+                    (3..=8).contains(&progress.len()),
+                    "{} progress notifications: {messages:?}",
+                    progress.len()
+                );
+                for p in progress {
+                    assert_eq!(p["params"]["progressToken"], json!(id), "{p}");
+                }
+            }
+
+            #[test]
+            fn the_default_progress_interval_is_30_s() {
+                assert_eq!(Config::default().mcp_progress_ms, 30_000);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn returns_an_empty_batch_after_the_cap() {
+                let d = Daemon::start_with(quick());
+                let s = d.session("s1", "a");
+                let started = Instant::now();
+                let got = s.ok("lease_wait", json!({})).await;
+                let waited = started.elapsed();
+                assert_eq!(got["notices"], json!([]), "{got}");
+                assert!(waited >= Duration::from_millis(400), "{waited:?}");
+                assert!(waited < Duration::from_secs(5), "{waited:?}");
+            }
+
+            #[test]
+            fn the_default_cap_is_20_min() {
+                assert_eq!(Config::default().mcp_wait_cap_ms, 20 * 60 * 1000);
+            }
+        }
+
+        mod on_the_proxy_disconnecting_mid_wait {
+            use super::*;
+
+            /// Start a `lease_wait` for `s1`, see it open, and drop the
+            /// connection.
+            async fn wait_and_disconnect(d: &Daemon) {
+                let s = d.session("s1", "a");
+                let call = tokio::spawn(async move {
+                    s.call_and_disconnect("lease_wait", json!({}), Duration::from_millis(300))
+                        .await;
+                });
+                let engine = d.engine.clone();
+                eventually(|| engine.open_waits(&agent("s1")) == 1, "the wait is open").await;
+                call.await.unwrap();
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_wait_ends() {
+                let d = Daemon::start();
+                wait_and_disconnect(&d).await;
+                let engine = d.engine.clone();
+                eventually(|| engine.open_waits(&agent("s1")) == 0, "the wait ends").await;
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn unacknowledged_notices_stay_pending() {
+                let d = Daemon::start();
+                let s = d.session("s1", "a");
+                seed(&s, "board", "k", &[]).await;
+                wait_and_disconnect(&d).await;
+                ended_notice(&d, &s, "board").await;
+                let pending = pending_ids(&d, "s1").await;
+                assert_ne!(pending, Vec::<String>::new());
+                let got = notice_ids(&s.ok("lease_wait", json!({})).await);
+                assert_eq!(got, pending);
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn every_result_ends_with_the_re_arm_sentence() {
+            let d = Daemon::start_with(quick());
+            let s = d.session("s1", "a");
+            let empty = s.call("lease_wait", json!({})).await;
+            assert!(text_of(&empty).ends_with(&re_arm(&[])), "{empty}");
+            seed(&s, "board", "k", &[]).await;
+            ended_notice(&d, &s, "board").await;
+            let full = s.call("lease_wait", json!({})).await;
+            let ids = notice_ids(&full["structuredContent"]);
+            assert_ne!(ids, Vec::<String>::new());
+            assert!(text_of(&full).ends_with(&re_arm(&ids)), "{full}");
+        }
+    }
+
+    mod lease_status {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn returns_this_sessions_leases_queue_positions_and_pending_notice_count_only() {
+            let d = Daemon::start();
+            let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+            seed(&s1, "board", "k", &[]).await;
+            seed(&s1, "probe", "k2", &[]).await;
+            seed(&s1, "spare", "k3", &[]).await;
+            let mine = acquire(&s1, "board").await;
+            acquire(&s2, "probe").await;
+            let queued = acquire(&s1, "probe").await;
+            ended_notice(&d, &s1, "spare").await;
+            let got = s1.ok("lease_status", json!({})).await;
+            let leases: Vec<&Value> = got["leases"].as_array().unwrap().iter().collect();
+            assert_eq!(leases.len(), 1, "{got}");
+            assert_eq!(leases[0]["lease_id"], mine["lease_id"]);
+            let requests = got["requests"].as_array().unwrap();
+            assert_eq!(requests.len(), 1, "{got}");
+            assert_eq!(requests[0]["request_id"], queued["request_id"]);
+            assert_eq!(requests[0]["position"], json!(1));
+            assert_eq!(
+                got["pending_notices"],
+                json!(pending_ids(&d, "s1").await.len()),
+                "{got}"
+            );
+            let theirs = s2.ok("lease_status", json!({})).await;
+            assert_eq!(theirs["requests"], json!([]), "{theirs}");
+            assert_eq!(theirs["pending_notices"], json!(0), "{theirs}");
+        }
+    }
+
+    /// `lease_extend` / `lease_release` / `lease_confirm` /
+    /// `lease_set_interruptible` / `lease_yield_refuse` / `lease_reclaim` /
+    /// `lease_cancel` / `lease_claim`: map 1:1 to the engine; the next step
+    /// text matches the resulting state.
+    mod lease_lifecycle {
+        use super::*;
+
+        /// The last sentence of a tool result's text block.
+        fn next_step(result: &Value) -> String {
+            text_of(result).rsplit(". ").next().unwrap().to_owned()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lease_extend_moves_the_end_from_now_next_step_lease_release() {
+            let d = Daemon::start();
+            let s = d.session("s1", "a");
+            seed(&s, "board", "k", &[]).await;
+            let lease = acquire(&s, "board").await["lease_id"].clone();
+            let result = s
+                .call("lease_extend", json!({"lease_id": lease, "for": "2h"}))
+                .await;
+            assert_eq!(
+                result["structuredContent"]["ends_at"],
+                json!(T0 + 2 * 3_600_000),
+                "{result}"
+            );
+            assert!(next_step(&result).contains("lease_release"), "{result}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lease_release_starts_cleanup_next_step_lease_confirm() {
+            let d = Daemon::start();
+            let s = d.session("s1", "a");
+            seed(&s, "board", "k", &[]).await;
+            let lease = acquire(&s, "board").await["lease_id"].clone();
+            let result = s.call("lease_release", json!({"lease_id": lease})).await;
+            assert_eq!(
+                result["structuredContent"]["state"],
+                json!("cleaning"),
+                "{result}"
+            );
+            assert!(next_step(&result).contains("lease_confirm"), "{result}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lease_release_failed_ends_it_dirty_next_step_lease_status() {
+            let d = Daemon::start();
+            let s = d.session("s1", "a");
+            seed(&s, "board", "k", &[]).await;
+            let lease = acquire(&s, "board").await["lease_id"].clone();
+            let result = s
+                .call("lease_release", json!({"lease_id": lease, "failed": true}))
+                .await;
+            assert_eq!(result["structuredContent"]["state"], json!("ended"));
+            assert!(next_step(&result).contains("lease_status"), "{result}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lease_confirm_ends_the_lease_next_step_lease_status() {
+            let d = Daemon::start();
+            let s = d.session("s1", "a");
+            seed(&s, "board", "k", &[]).await;
+            let lease = acquire(&s, "board").await["lease_id"].clone();
+            s.ok("lease_release", json!({"lease_id": lease})).await;
+            let result = s.call("lease_confirm", json!({"lease_id": lease})).await;
+            assert_ne!(result["isError"], json!(true), "{result}");
+            let now = d.lease_of("s1", &lease).await;
+            assert_eq!(now["state"], json!("ended"));
+            assert!(next_step(&result).contains("lease_status"), "{result}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lease_set_interruptible_sets_it_next_step_lease_wait() {
+            let d = Daemon::start();
+            let s = d.session("s1", "a");
+            seed(&s, "board", "k", &[]).await;
+            let lease = acquire(&s, "board").await["lease_id"].clone();
+            let result = s
+                .call(
+                    "lease_set_interruptible",
+                    json!({"lease_id": lease, "interruptible": true}),
+                )
+                .await;
+            assert_eq!(result["structuredContent"]["interruptible"], json!(true));
+            assert!(next_step(&result).contains("lease_wait"), "{result}");
+        }
+
+        /// `s1` holds `board` interruptibly; `s2` asks for it at high
+        /// priority, so `s1` is asked to yield. Returns s1's lease.
+        async fn asked_to_yield(s1: &Raw, s2: &Raw) -> Value {
+            seed(s1, "board", "k", &[]).await;
+            let lease = acquire_with(
+                s1,
+                json!({"target": {"resource": "board"}, "for": "1h", "purpose": "long",
+                       "interruptible": true}),
+            )
+            .await["lease_id"]
+                .clone();
+            acquire_with(
+                s2,
+                json!({"target": {"resource": "board"}, "for": "5m", "purpose": "urgent",
+                       "priority": "high"}),
+            )
+            .await;
+            lease
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lease_yield_refuse_withdraws_the_ask_next_step_lease_release() {
+            let d = Daemon::start();
+            let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+            let lease = asked_to_yield(&s1, &s2).await;
+            let asked = d.lease_of("s1", &lease).await;
+            assert!(asked["yield_deadline"].is_i64(), "{asked}");
+            let result = s1
+                .call("lease_yield_refuse", json!({"lease_id": lease}))
+                .await;
+            assert_ne!(result["isError"], json!(true), "{result}");
+            let now = d.lease_of("s1", &lease).await;
+            assert_eq!(now["yield_deadline"], json!(null), "{now}");
+            assert!(next_step(&result).contains("lease_release"), "{result}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lease_reclaim_returns_the_engines_answer() {
+            let d = Daemon::start();
+            let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+            let lease = asked_to_yield(&s1, &s2).await;
+            s1.ok(
+                "lease_confirm",
+                json!({"lease_id": lease, "how": "yielded"}),
+            )
+            .await;
+            s2.ok("lease_wait", json!({})).await;
+            let error = s1.err("lease_reclaim", json!({"lease_id": lease})).await;
+            assert_eq!(error["code"], json!("borrower_not_overrun"), "{error}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lease_cancel_drops_the_request_next_step_lease_status() {
+            let d = Daemon::start();
+            let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+            let (_, queued) = held_pool(&s1, &s2).await;
+            let result = s2
+                .call("lease_cancel", json!({"request_id": queued["request_id"]}))
+                .await;
+            assert_ne!(result["isError"], json!(true), "{result}");
+            let status = s2.ok("lease_status", json!({})).await;
+            assert_eq!(status["requests"], json!([]), "{status}");
+            assert!(next_step(&result).contains("lease_status"), "{result}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lease_claim_takes_the_offer_next_step_lease_release() {
+            let d = Daemon::start();
+            let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+            let (lease, _) = held_pool(&s1, &s2).await;
+            hand_over(&s1, &lease).await;
+            let offered = d
+                .engine
+                .pending_notices(agent("s2"))
+                .await
+                .unwrap()
+                .into_iter()
+                .find_map(|n| n.lease_id)
+                .unwrap();
+            let result = s2
+                .call("lease_claim", json!({"lease_id": offered.as_str()}))
+                .await;
+            assert_eq!(
+                result["structuredContent"]["state"],
+                json!("held"),
+                "{result}"
+            );
+            assert!(next_step(&result).contains("lease_release"), "{result}");
+        }
+    }
+
+    mod tasks {
+        use super::*;
+
+        /// Poll `tasks/get` until the task leaves `working`; its result.
+        async fn finished(s: &Raw, task: &str) -> Value {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let reply = s.request("tasks/get", json!({"taskId": task})).await;
+                let got = reply.message["result"].clone();
+                if got["status"] != json!("working") {
+                    return got;
+                }
+                assert!(Instant::now() < until, "task {task} never finished");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        mod on_a_request_whose_client_capabilities_declare_tasks {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn lease_acquire_on_a_held_pool_returns_a_task_at_once_that_completes_with_the_grant()
+             {
+                let d = Daemon::start();
+                let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a").with_tasks());
+                seed(&s1, "board", "k", &[]).await;
+                let lease = acquire(&s1, "board").await["lease_id"].clone();
+                let started = Instant::now();
+                let handle = s2
+                    .call(
+                        "lease_acquire",
+                        json!({"target": {"resource": "board"}, "for": "1h", "purpose": "x"}),
+                    )
+                    .await;
+                assert!(started.elapsed() < Duration::from_secs(2));
+                assert_eq!(handle["resultType"], json!("task"), "{handle}");
+                assert_eq!(handle["pollIntervalMs"], json!(5000), "{handle}");
+                hand_over(&s1, lease.as_str().unwrap()).await;
+                let done = finished(&s2, handle["taskId"].as_str().unwrap()).await;
+                assert_eq!(done["status"], json!("completed"), "{done}");
+                let grant = &done["result"]["structuredContent"];
+                assert_eq!(grant["state"], json!("held"), "{done}");
+                assert!(
+                    done["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("lease_release"),
+                    "{done}"
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_open_task_counts_as_an_open_wait() {
+                let d = Daemon::start();
+                let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a").with_tasks());
+                seed(&s1, "board", "k", &[]).await;
+                let lease = acquire(&s1, "board").await["lease_id"].clone();
+                let handle = s2
+                    .call(
+                        "lease_acquire",
+                        json!({"target": {"resource": "board"}, "for": "1h", "purpose": "x"}),
+                    )
+                    .await;
+                assert_eq!(handle["resultType"], json!("task"), "{handle}");
+                assert_eq!(d.engine.open_waits(&agent("s2")), 1);
+                hand_over(&s1, lease.as_str().unwrap()).await;
+                finished(&s2, handle["taskId"].as_str().unwrap()).await;
+                let engine = d.engine.clone();
+                eventually(|| engine.open_waits(&agent("s2")) == 0, "the task closes").await;
+            }
+        }
+
+        mod on_another_sessions_task {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn tasks_get_reads_as_unknown() {
+                let d = Daemon::start();
+                let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a").with_tasks());
+                held_pool(&s1, &d.session("s3", "a")).await;
+                let handle = s2
+                    .call(
+                        "lease_acquire",
+                        json!({"target": {"resource": "board"}, "for": "1h", "purpose": "x"}),
+                    )
+                    .await;
+                let task = handle["taskId"].as_str().unwrap();
+                let reply = d
+                    .session("s9", "a")
+                    .request("tasks/get", json!({"taskId": task}))
+                    .await;
+                assert!(reply.message.get("result").is_none(), "{}", reply.message);
+                assert!(reply.message["error"].is_object(), "{}", reply.message);
+            }
+        }
+
+        mod on_a_request_without_the_capability {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn behaves_exactly_as_the_blocking_path() {
+                let d = Daemon::start_with(quick());
+                let (s1, s2) = (d.session("s1", "a"), d.session("s2", "a"));
+                let (_, queued) = held_pool(&s1, &s2).await;
+                assert_eq!(queued["outcome"], json!("queued"), "{queued}");
+                let waited = s2.call("lease_wait", json!({})).await;
+                assert_ne!(waited["resultType"], json!("task"), "{waited}");
+                assert!(
+                    waited["structuredContent"]["notices"].is_array(),
+                    "{waited}"
+                );
             }
         }
     }

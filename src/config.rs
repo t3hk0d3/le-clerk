@@ -24,8 +24,16 @@ pub const YIELD_WINDOW_SECS: u64 = 120;
 pub const HEALTH_TIMEOUT_SECS: u64 = 10;
 /// Reconnection grace, seconds (reserved for phase 3).
 pub const RECONNECT_GRACE_SECS: u64 = 60;
+/// Gap between progress notifications of a blocked `lease_wait`, ms.
+pub const MCP_PROGRESS_MS: u64 = 30_000;
+/// Longest a `lease_wait` (or a waiting task) blocks before it answers with
+/// an empty batch, ms.
+pub const MCP_WAIT_CAP_MS: u64 = 20 * 60 * 1000;
+/// The `pollIntervalMs` suggested for MCP tasks, ms.
+pub const MCP_TASK_POLL_MS: u64 = 5_000;
 
-/// Timing configuration; every value is in seconds except the ratio.
+/// Timing configuration; every value is in seconds except the ratio and the
+/// `*_ms` values (milliseconds).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -45,6 +53,12 @@ pub struct Config {
     pub health_timeout: u64,
     /// Reconnection grace.
     pub reconnect_grace: u64,
+    /// Gap between progress notifications of a blocked `lease_wait`, ms.
+    pub mcp_progress_ms: u64,
+    /// Longest a `lease_wait` (or a waiting MCP task) blocks, ms.
+    pub mcp_wait_cap_ms: u64,
+    /// The `pollIntervalMs` suggested for MCP tasks, ms.
+    pub mcp_task_poll_ms: u64,
 }
 
 impl Default for Config {
@@ -58,6 +72,9 @@ impl Default for Config {
             yield_window: YIELD_WINDOW_SECS,
             health_timeout: HEALTH_TIMEOUT_SECS,
             reconnect_grace: RECONNECT_GRACE_SECS,
+            mcp_progress_ms: MCP_PROGRESS_MS,
+            mcp_wait_cap_ms: MCP_WAIT_CAP_MS,
+            mcp_task_poll_ms: MCP_TASK_POLL_MS,
         }
     }
 }
@@ -131,8 +148,8 @@ impl Config {
     }
 
     /// Check the values: `warning_lead_ratio` is a number in `[0, 1]`, and
-    /// the cleanup, claim and yield windows and the health timeout are
-    /// positive.
+    /// the cleanup, claim and yield windows, the health timeout and the MCP
+    /// intervals are positive.
     ///
     /// # Errors
     /// [`ConfigError::Invalid`] naming the first offending key.
@@ -147,6 +164,9 @@ impl Config {
             ("claim_window", self.claim_window),
             ("yield_window", self.yield_window),
             ("health_timeout", self.health_timeout),
+            ("mcp_progress_ms", self.mcp_progress_ms),
+            ("mcp_wait_cap_ms", self.mcp_wait_cap_ms),
+            ("mcp_task_poll_ms", self.mcp_task_poll_ms),
         ] {
             if value == 0 {
                 return Err(ConfigError::Invalid { key });

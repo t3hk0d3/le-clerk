@@ -180,8 +180,81 @@ pub fn take_matching(
     limit: u32,
     now_ms: i64,
 ) -> Result<Vec<Notice>, StoreError> {
+    let rows = select_pending(tx, holder, filter, limit)?;
+    let mut mark = tx
+        .conn()
+        .prepare("UPDATE notices SET delivered_at = ?2 WHERE row_id = ?1")?;
+    rows.iter()
+        .map(|(row, payload)| {
+            mark.execute(rusqlite::params![row, now_ms])?;
+            serde_json::from_str(payload).map_err(StoreError::from)
+        })
+        .collect()
+}
+
+/// Acknowledged delivery (MCP `lease_wait`): up to `limit` undelivered
+/// notices of `holder`, oldest first, returned **without** marking them
+/// delivered. Each is marked returned (`returned_at = now_ms`, kept from
+/// its first return), and stays pending until [`ack`] names it, so a result
+/// the client threw away loses nothing. With `filter`, only the notices it
+/// matches.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure or a damaged row among those returned.
+pub fn returned(
+    tx: &Tx,
+    holder: &HolderRef,
+    filter: Option<&NoticeFilter>,
+    limit: u32,
+    now_ms: i64,
+) -> Result<Vec<Notice>, StoreError> {
+    let rows = select_pending(tx, holder, filter, limit)?;
+    let mut mark = tx
+        .conn()
+        .prepare("UPDATE notices SET returned_at = COALESCE(returned_at, ?2) WHERE row_id = ?1")?;
+    rows.iter()
+        .map(|(row, payload)| {
+            mark.execute(rusqlite::params![row, now_ms])?;
+            serde_json::from_str(payload).map_err(StoreError::from)
+        })
+        .collect()
+}
+
+/// Mark delivered those of `ids` that are undelivered notices of `holder`
+/// already [`returned`]; other ids (unknown, another holder's, never
+/// returned, already delivered) are ignored. Returns how many were marked.
+///
+/// # Errors
+/// [`StoreError`] on SQL failure.
+pub fn ack(
+    tx: &Tx,
+    holder: &HolderRef,
+    ids: &[NoticeId],
+    now_ms: i64,
+) -> Result<usize, StoreError> {
+    let ids: Vec<&str> = ids.iter().map(NoticeId::as_str).collect();
+    Ok(tx.conn().execute(
+        "UPDATE notices SET delivered_at = ?3 WHERE holder = ?1 AND delivered_at IS NULL \
+         AND returned_at IS NOT NULL AND notice_id IN (SELECT value FROM json_each(?2))",
+        rusqlite::params![
+            serde_json::to_string(holder)?,
+            serde_json::to_string(&ids)?,
+            now_ms
+        ],
+    )?)
+}
+
+/// `(row_id, payload)` of up to `limit` undelivered notices of `holder`,
+/// oldest first; with `filter`, only those it matches. The filter runs in
+/// SQL on the stored payload, so only the rows selected are read.
+fn select_pending(
+    tx: &Tx,
+    holder: &HolderRef,
+    filter: Option<&NoticeFilter>,
+    limit: u32,
+) -> Result<Vec<(i64, String)>, StoreError> {
     let holder = serde_json::to_string(holder)?;
-    let rows = match filter {
+    Ok(match filter {
         None => {
             let mut stmt = tx.conn().prepare(
                 "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
@@ -213,16 +286,7 @@ pub fn take_matching(
             )?
             .collect::<Result<Vec<_>, _>>()?
         }
-    };
-    let mut mark = tx
-        .conn()
-        .prepare("UPDATE notices SET delivered_at = ?2 WHERE row_id = ?1")?;
-    rows.iter()
-        .map(|(row, payload)| {
-            mark.execute(rusqlite::params![row, now_ms])?;
-            serde_json::from_str(payload).map_err(StoreError::from)
-        })
-        .collect()
+    })
 }
 
 /// The highest notice row written so far; 0 when there are none. Rows only

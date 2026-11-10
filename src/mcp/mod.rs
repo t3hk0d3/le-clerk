@@ -15,9 +15,11 @@
 //!   A request without `X-Clerk-Session`, or with a malformed `X-Clerk-*`
 //!   header, is refused with HTTP 400 and a JSON-RPC `-32600` error before
 //!   rmcp sees it.
-//! - Tools live in [`tools`].
+//! - Tools live in [`tools`]; waiting, tasks and open-wait tracking in
+//!   [`wait`].
 
 pub mod tools;
+pub mod wait;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -33,8 +35,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerConfig,
+    CallToolRequestParams, CallToolResponse, CancelTaskParams, GetTaskParams, GetTaskResult,
+    Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -45,6 +47,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::engine::EngineHandle;
+use crate::mcp::wait::{Live, Tasks};
 use crate::model::{Caller, HolderRef, ProjectKey};
 use crate::scope::{ProjectResolver, ScopeError};
 
@@ -351,6 +354,7 @@ struct Identifier {
 pub fn router(engine: EngineHandle) -> Router {
     let handler = ClerkMcp {
         engine: engine.clone(),
+        tasks: Tasks::default(),
     };
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
@@ -407,10 +411,12 @@ fn identity_of(context: &RequestContext<RoleServer>) -> Result<McpIdentity, McpE
         .ok_or_else(|| McpError::invalid_request(IdentityError::MissingSession.to_string(), None))
 }
 
-/// The rmcp handler: tools only.
+/// The rmcp handler: tools, and tasks for the waiting ones. One per
+/// request (stateless), all sharing the engine and the task store.
 #[derive(Clone)]
 struct ClerkMcp {
     engine: EngineHandle,
+    tasks: Tasks,
 }
 
 impl ServerHandler for ClerkMcp {
@@ -443,12 +449,32 @@ impl ServerHandler for ClerkMcp {
     ) -> Result<CallToolResponse, McpError> {
         let identity = identity_of(&context)?;
         let args = request.arguments.map_or_else(|| json!({}), Value::Object);
-        tools::call(&self.engine, &identity, &request.name, args)
+        let live = Live::new(context, &self.tasks);
+        tools::call(&self.engine, &identity, &live, &request.name, args)
             .await
-            .map(CallToolResponse::Complete)
             .ok_or_else(|| {
                 McpError::invalid_params(format!("there is no tool named {:?}", request.name), None)
             })
+    }
+
+    // The trait method is async; the task store answers at once.
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.tasks.get(&identity_of(&context)?, &request.task_id)
+    }
+
+    // The trait method is async; the task store answers at once.
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel(&identity_of(&context)?, &request.task_id)
     }
 }
 

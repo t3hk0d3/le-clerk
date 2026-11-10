@@ -9,6 +9,7 @@ pub mod clock;
 pub mod config;
 pub mod daemon;
 pub mod dedup;
+pub mod duration;
 pub mod engine;
 pub mod error;
 pub mod health;

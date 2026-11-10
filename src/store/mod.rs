@@ -64,6 +64,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0009_override_reason.sql")),
         M::up(include_str!("migrations/0010_description_usage.sql")),
         M::up(include_str!("migrations/0011_resource_tags.sql")),
+        M::up(include_str!("migrations/0012_notice_returned.sql")),
     ])
 }
 

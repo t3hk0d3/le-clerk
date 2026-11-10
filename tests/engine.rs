@@ -9,7 +9,7 @@ use leclerk::daemon::server as http;
 use leclerk::engine::{ApiError, Command, Engine, EngineHandle, EngineOptions, MAX_WAIT};
 use leclerk::health::HealthResult;
 use leclerk::model::{
-    Caller, HealthSpec, HolderRef, LeaseId, ProjectKey, ResourceId, UnitId, UnitSettings,
+    Caller, HealthSpec, HolderRef, LeaseId, NoticeId, ProjectKey, ResourceId, UnitId, UnitSettings,
 };
 use leclerk::scheduler::HealthProbe;
 use leclerk::store::Store;
@@ -421,6 +421,105 @@ mod engine {
                 let got = waiter.await.unwrap().unwrap();
                 assert_eq!(kinds(&got), vec![]);
             }
+        }
+    }
+
+    /// Acknowledged delivery (MCP): `return_notices` and `ack_notices`.
+    mod acknowledged_delivery {
+        use super::*;
+
+        /// `a` holds the only unit, `b` queues, `a` hands it over: `b` has
+        /// an offer pending.
+        async fn offered_to_b() -> EngineHandle {
+            let (h, _clock) = spawn();
+            seed_board(&h, &["u1"]).await;
+            let lease = acquire(&h, &user("a"), 60_000).await;
+            assert_eq!(acquire(&h, &user("b"), 60_000).await["outcome"], "queued");
+            let id = lease["lease_id"].clone();
+            ok(&h, "release", &user("a"), json!({"lease_id": id})).await;
+            ok(&h, "confirm", &user("a"), json!({"lease_id": id})).await;
+            h
+        }
+
+        fn ids(notices: &[Notice]) -> Vec<NoticeId> {
+            notices.iter().map(|n| n.id.clone()).collect()
+        }
+
+        mod return_notices {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_pending_notices_without_delivering_them() {
+                let h = offered_to_b().await;
+                let first = h.return_notices(holder("b"), None).await.unwrap();
+                assert!(kinds(&first).contains(&NoticeKind::Offered));
+                let again = h.return_notices(holder("b"), None).await.unwrap();
+                assert_eq!(ids(&again), ids(&first));
+                assert_eq!(
+                    ids(&h.pending_notices(holder("b")).await.unwrap()),
+                    ids(&first)
+                );
+            }
+        }
+
+        mod ack_notices {
+            use super::*;
+
+            #[tokio::test]
+            async fn marks_returned_notices_delivered() {
+                let h = offered_to_b().await;
+                let returned = h.return_notices(holder("b"), None).await.unwrap();
+                let marked = h.ack_notices(holder("b"), ids(&returned)).await.unwrap();
+                assert_eq!(marked, returned.len());
+                assert_eq!(h.pending_notices(holder("b")).await.unwrap(), vec![]);
+            }
+
+            #[tokio::test]
+            async fn ignores_notices_never_returned() {
+                let h = offered_to_b().await;
+                let pending = h.pending_notices(holder("b")).await.unwrap();
+                assert_eq!(h.ack_notices(holder("b"), ids(&pending)).await.unwrap(), 0);
+                assert_eq!(h.pending_notices(holder("b")).await.unwrap(), pending);
+            }
+
+            #[tokio::test]
+            async fn ignores_another_holders_notices() {
+                let h = offered_to_b().await;
+                let returned = h.return_notices(holder("b"), None).await.unwrap();
+                assert_eq!(h.ack_notices(holder("a"), ids(&returned)).await.unwrap(), 0);
+                assert_eq!(h.pending_notices(holder("b")).await.unwrap(), returned);
+            }
+
+            #[tokio::test]
+            async fn leaves_the_take_path_unchanged() {
+                let h = offered_to_b().await;
+                h.return_notices(holder("b"), None).await.unwrap();
+                let taken = h.wait_notices(holder("b"), Duration::ZERO).await.unwrap();
+                assert!(kinds(&taken).contains(&NoticeKind::Offered));
+                assert_eq!(h.pending_notices(holder("b")).await.unwrap(), vec![]);
+            }
+        }
+    }
+
+    mod open_waits {
+        use super::*;
+
+        #[tokio::test]
+        async fn counts_each_open_wait_of_a_holder() {
+            let (h, _clock) = spawn();
+            let first = h.open_wait(&holder("a"));
+            let _second = h.open_wait(&holder("a"));
+            assert_eq!(h.open_waits(&holder("a")), 2);
+            assert_eq!(h.open_waits(&holder("b")), 0);
+            drop(first);
+            assert_eq!(h.open_waits(&holder("a")), 1);
+        }
+
+        #[tokio::test]
+        async fn drops_to_zero_when_every_wait_closes() {
+            let (h, _clock) = spawn();
+            drop(h.open_wait(&holder("a")));
+            assert_eq!(h.open_waits(&holder("a")), 0);
         }
     }
 

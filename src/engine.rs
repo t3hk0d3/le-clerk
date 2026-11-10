@@ -17,6 +17,7 @@ mod command;
 pub mod wire;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -33,7 +34,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::ErrorCode;
 use crate::inventory::{Inventory, InventoryError, PromotionError, Promotions};
-use crate::model::HolderRef;
+use crate::model::{HolderRef, NoticeId};
 use crate::scheduler::{HealthProbe, Scheduler, SchedulerError, liveness};
 use crate::store::notices::{self, Notice, NoticeFilter};
 use crate::store::{Store, StoreError};
@@ -257,6 +258,14 @@ enum Job {
     /// Deliver up to [`NOTICE_BATCH`] pending notices of a holder (with a
     /// filter, only those it matches).
     TakeNotices(HolderRef, Option<NoticeFilter>, Reply<Vec<Notice>>),
+    /// Return up to [`NOTICE_BATCH`] pending notices of a holder without
+    /// delivering them (acknowledged delivery; with a filter, only those it
+    /// matches).
+    ReturnNotices(HolderRef, Option<NoticeFilter>, Reply<Vec<Notice>>),
+    /// Mark returned notices of a holder delivered.
+    AckNotices(HolderRef, Vec<NoticeId>, Reply<usize>),
+    /// Every pending notice of a holder, changing nothing.
+    PendingNotices(HolderRef, Reply<Vec<Notice>>),
 }
 
 /// The canonical key of a holder: its JSON encoding, as stored with its
@@ -366,12 +375,49 @@ impl Drop for Parked<'_> {
     }
 }
 
+/// Open waits (blocking `lease_wait` calls and open MCP tasks), by holder
+/// key: what the Stop hook asks through `session_brief`.
+#[derive(Default)]
+struct OpenWaits {
+    counts: Mutex<HashMap<String, usize>>,
+}
+
+impl OpenWaits {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, usize>> {
+        // Counters only; a panic while locked leaves nothing to repair.
+        self.counts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One open wait of a holder, counted while alive (see
+/// [`EngineHandle::open_wait`]); dropping it, also on cancellation, closes
+/// the wait.
+pub struct OpenWait {
+    waits: Arc<OpenWaits>,
+    key: String,
+}
+
+impl Drop for OpenWait {
+    fn drop(&mut self) {
+        let mut counts = self.waits.lock();
+        if let Some(n) = counts.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// A cheap, cloneable handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
     jobs: mpsc::Sender<Job>,
     waiters: Arc<Waiters>,
     stopped: watch::Receiver<bool>,
+    open_waits: Arc<OpenWaits>,
+    config: Arc<Config>,
+    clock: Arc<dyn Clock>,
 }
 
 impl EngineHandle {
@@ -419,23 +465,123 @@ impl EngineHandle {
         filter: Option<NoticeFilter>,
         timeout: Duration,
     ) -> Result<Vec<Notice>, ApiError> {
-        let deadline = tokio::time::Instant::now() + timeout.min(MAX_WAIT);
-        // Registered before the first take, so a notice published between
-        // the take and the wait is never missed.
-        let registration = self.waiters.register(holder_key(&holder));
+        let got = self
+            .wait_until(&holder, timeout.min(MAX_WAIT), || async {
+                let got = self.take(holder.clone(), filter.clone()).await?;
+                Ok((!got.is_empty()).then_some(got))
+            })
+            .await?;
+        Ok(got.unwrap_or_default())
+    }
+
+    /// Run `check` now and again whenever `holder` gets a notice, until it
+    /// answers `Some`, for at most `timeout`; `None` on timeout (after one
+    /// last check). Dropping the future (a client gone) ends the wait.
+    ///
+    /// # Errors
+    /// The first error `check` returns.
+    pub async fn wait_until<T, F, Fut>(
+        &self,
+        holder: &HolderRef,
+        timeout: Duration,
+        mut check: F,
+    ) -> Result<Option<T>, ApiError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<Option<T>, ApiError>>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Registered before the first check, so a notice published between
+        // the check and the wait is never missed.
+        let registration = self.waiters.register(holder_key(holder));
         loop {
             let notified = registration.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let got = self.take(holder.clone(), filter.clone()).await?;
-            if !got.is_empty() || tokio::time::Instant::now() >= deadline {
-                return Ok(got);
+            if let Some(found) = check().await? {
+                return Ok(Some(found));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
             }
             let _parked = registration.park();
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return Ok(Vec::new());
+                return Ok(None);
             }
         }
+    }
+
+    /// Up to [`NOTICE_BATCH`] pending notices of `holder`, oldest first,
+    /// returned **without** delivering them: they stay pending until
+    /// [`EngineHandle::ack_notices`] names them (acknowledged delivery, for
+    /// MCP). With `filter`, only the notices it matches.
+    ///
+    /// # Errors
+    /// A storage failure, or `engine_unavailable`.
+    pub async fn return_notices(
+        &self,
+        holder: HolderRef,
+        filter: Option<NoticeFilter>,
+    ) -> Result<Vec<Notice>, ApiError> {
+        self.ask(|reply| Job::ReturnNotices(holder, filter, reply))
+            .await
+    }
+
+    /// Mark delivered those of `ids` that `holder` was returned; the others
+    /// are ignored. Returns how many were marked.
+    ///
+    /// # Errors
+    /// A storage failure, or `engine_unavailable`.
+    pub async fn ack_notices(
+        &self,
+        holder: HolderRef,
+        ids: Vec<NoticeId>,
+    ) -> Result<usize, ApiError> {
+        self.ask(|reply| Job::AckNotices(holder, ids, reply)).await
+    }
+
+    /// Every pending (undelivered) notice of `holder`, oldest first,
+    /// changing nothing.
+    ///
+    /// # Errors
+    /// A storage failure, or `engine_unavailable`.
+    pub async fn pending_notices(&self, holder: HolderRef) -> Result<Vec<Notice>, ApiError> {
+        self.ask(|reply| Job::PendingNotices(holder, reply)).await
+    }
+
+    /// Count an open wait of `holder` (a blocking `lease_wait`, or an open
+    /// MCP task) until the returned guard is dropped.
+    #[must_use]
+    pub fn open_wait(&self, holder: &HolderRef) -> OpenWait {
+        let key = holder_key(holder);
+        *self.open_waits.lock().entry(key.clone()).or_insert(0) += 1;
+        OpenWait {
+            waits: self.open_waits.clone(),
+            key,
+        }
+    }
+
+    /// How many waits of `holder` are open now (see
+    /// [`EngineHandle::open_wait`]).
+    #[must_use]
+    pub fn open_waits(&self, holder: &HolderRef) -> usize {
+        self.open_waits
+            .lock()
+            .get(&holder_key(holder))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The configuration the engine runs with.
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// The engine's clock, unix milliseconds.
+    #[must_use]
+    pub fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
     }
 
     /// True while a [`EngineHandle::wait_notices`] for `holder` is parked,
@@ -458,9 +604,15 @@ impl EngineHandle {
         holder: HolderRef,
         filter: Option<NoticeFilter>,
     ) -> Result<Vec<Notice>, ApiError> {
+        self.ask(|reply| Job::TakeNotices(holder, filter, reply))
+            .await
+    }
+
+    /// Send the job `make` builds around a reply sender; its answer.
+    async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> Job) -> Result<T, ApiError> {
         let (reply, answer) = oneshot::channel();
         self.jobs
-            .send(Job::TakeNotices(holder, filter, reply))
+            .send(make(reply))
             .map_err(|_| ApiError::unavailable())?;
         answer.await.map_err(|_| ApiError::unavailable())?
     }
@@ -525,6 +677,8 @@ impl Engine {
         let (jobs, inbox) = mpsc::channel();
         let (stop_tx, stopped) = watch::channel(false);
         let waiters = Arc::new(Waiters::default());
+        let handle_config = Arc::new(config.clone());
+        let handle_clock = clock.clone();
         let engine = Self {
             store,
             inventory: Inventory::new(clock.clone()),
@@ -551,6 +705,9 @@ impl Engine {
             jobs,
             waiters,
             stopped,
+            open_waits: Arc::new(OpenWaits::default()),
+            config: handle_config,
+            clock: handle_clock,
         })
     }
 
@@ -629,6 +786,28 @@ impl Engine {
                     Ok(engine.store.tx(|tx| {
                         notices::take_matching(tx, &holder, filter.as_ref(), NOTICE_BATCH, now)
                     })?)
+                });
+                let _ = reply.send(result);
+            }
+            Job::ReturnNotices(holder, filter, reply) => {
+                let result = self.guarded("return_notices", |engine| {
+                    let now = engine.clock.now_ms();
+                    Ok(engine.store.tx(|tx| {
+                        notices::returned(tx, &holder, filter.as_ref(), NOTICE_BATCH, now)
+                    })?)
+                });
+                let _ = reply.send(result);
+            }
+            Job::AckNotices(holder, ids, reply) => {
+                let result = self.guarded("ack_notices", |engine| {
+                    let now = engine.clock.now_ms();
+                    Ok(engine.store.tx(|tx| notices::ack(tx, &holder, &ids, now))?)
+                });
+                let _ = reply.send(result);
+            }
+            Job::PendingNotices(holder, reply) => {
+                let result = self.guarded("pending_notices", |engine| {
+                    Ok(engine.store.tx(|tx| notices::pending(tx, &holder))?)
                 });
                 let _ = reply.send(result);
             }
