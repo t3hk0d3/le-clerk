@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use leclerk::client::{ApiError, DaemonError};
 use leclerk::error::ErrorCode;
+use leclerk::scope::ScopeError;
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -184,6 +185,17 @@ impl From<anyhow::Error> for Failure {
             Ok(gate) => return gate.into(),
             Err(e) => e,
         };
+        let e = match e.downcast::<ScopeError>() {
+            Ok(scope) => {
+                return Self {
+                    code: scope.code().to_owned(),
+                    message: scope.to_string(),
+                    details: None,
+                    exit: exit_for(scope.code()),
+                };
+            }
+            Err(e) => e,
+        };
         Self {
             code: "internal_error".to_owned(),
             message: format!("{e:#}"),
@@ -221,7 +233,7 @@ fn exit_for(code: &str) -> u8 {
         | "extend_not_later"
         | "no_such_directory" => EXIT_USAGE,
         "internal_error" | "database_error" | "corrupt_database" | "migration_error"
-        | "io_error" | "json_error" | "bad_response" => EXIT_INTERNAL,
+        | "io_error" | "json_error" | "bad_response" | "git_failed" => EXIT_INTERNAL,
         // Conflicts and refusals: busy, already_held, no_units, ...
         _ => EXIT_REFUSED,
     }

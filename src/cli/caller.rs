@@ -4,7 +4,7 @@ use std::path::Path;
 
 use leclerk::model::{Caller, HolderRef, ProjectKey};
 use leclerk::scheduler::liveness;
-use leclerk::scope::ProjectResolver;
+use leclerk::scope::{ProjectResolver, ScopeError};
 use ulid::Ulid;
 
 use super::UsageError;
@@ -28,12 +28,14 @@ pub enum CallerKind {
 /// the working directory.
 ///
 /// # Errors
-/// [`UsageError`] when `override_reason` is given but blank.
+/// [`UsageError`] when `override_reason` is given but blank;
+/// [`ScopeError::Git`] when git fails in the working directory's checkout.
 pub fn current(kind: CallerKind, override_reason: Option<String>) -> anyhow::Result<Caller> {
     let session = std::env::var(SESSION_VAR).ok();
-    let project = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| project_of(&cwd));
+    let project = match std::env::current_dir() {
+        Ok(cwd) => project_of(&cwd)?,
+        Err(_) => None,
+    };
     Ok(resolve(
         kind,
         session,
@@ -49,12 +51,18 @@ pub fn is_agent(caller: &Caller) -> bool {
     matches!(caller.holder, HolderRef::AgentSession { .. })
 }
 
-fn project_of(cwd: &Path) -> Option<ProjectKey> {
+/// The project of `cwd`; none when `cwd` is gone.
+///
+/// # Errors
+/// [`ScopeError::Git`] when git fails inside a git checkout: the project
+/// is unknown, and guessing could file this work under another project.
+fn project_of(cwd: &Path) -> Result<Option<ProjectKey>, ScopeError> {
     match ProjectResolver::resolve(cwd) {
-        Ok(project) => Some(project),
-        Err(e) => {
+        Ok(project) => Ok(Some(project)),
+        Err(e @ ScopeError::Git { .. }) => Err(e),
+        Err(e @ ScopeError::NoSuchDirectory(_)) => {
             tracing::debug!(error = %e, "no project for the working directory");
-            None
+            Ok(None)
         }
     }
 }

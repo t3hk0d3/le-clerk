@@ -126,6 +126,10 @@ pub enum IdentityError {
         /// The directory the header names.
         dir: PathBuf,
     },
+    /// `X-Clerk-Project` names a directory inside a git checkout where git
+    /// fails, and no project of it is known yet.
+    #[error("{0}")]
+    ProjectFailed(ScopeError),
 }
 
 /// The identity a request claims, before the project and any session alias
@@ -286,9 +290,10 @@ impl ProjectCache {
             }
             Ok(Err(e)) => {
                 tracing::debug!(error = %e, "the MCP client's directory does not resolve");
-                known
-                    .map(|(_, key)| key)
-                    .ok_or(IdentityError::UnresolvedProject { dir })
+                known.map(|(_, key)| key).ok_or(match e {
+                    ScopeError::Git { .. } => IdentityError::ProjectFailed(e),
+                    ScopeError::NoSuchDirectory(_) => IdentityError::UnresolvedProject { dir },
+                })
             }
             Err(e) => {
                 tracing::warn!(error = %e, "project resolution did not finish");
@@ -647,6 +652,42 @@ mod tests {
             let first = cache.project("/e", PathBuf::from("/e")).await.unwrap();
             let again = cache.project("/e", PathBuf::from("/e")).await.unwrap();
             assert_ne!(again, first);
+        }
+
+        fn git_failing(dir: &Path) -> Result<ProjectKey, ScopeError> {
+            Err(ScopeError::Git {
+                dir: dir.to_owned(),
+                reason: "git could not be run".into(),
+            })
+        }
+
+        #[tokio::test]
+        async fn refuses_a_directory_whose_git_fails_naming_git() {
+            let cache = ProjectCache::new(git_failing, PROJECT_TTL);
+            let err = cache
+                .project("/repo", PathBuf::from("/repo"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, IdentityError::ProjectFailed { .. }),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains("git could not be run"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn keeps_the_last_project_when_git_later_fails() {
+            static FAIL: AtomicBool = AtomicBool::new(false);
+            fn once(dir: &Path) -> Result<ProjectKey, ScopeError> {
+                if FAIL.swap(true, Ordering::SeqCst) {
+                    git_failing(dir)
+                } else {
+                    Ok(key(8))
+                }
+            }
+            let cache = ProjectCache::new(once, Duration::ZERO);
+            cache.project("/r", PathBuf::from("/r")).await.unwrap();
+            assert_eq!(cache.project("/r", PathBuf::from("/r")).await, Ok(key(8)));
         }
 
         #[tokio::test]

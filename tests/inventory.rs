@@ -244,6 +244,57 @@ mod project_resolver {
             }
         }
 
+        /// A `git` that cannot be run, and one that runs but fails (as
+        /// git does on a repository it distrusts).
+        fn broken_gits(tmp: &TempDir) -> Vec<PathBuf> {
+            use std::os::unix::fs::PermissionsExt;
+            let failing = tmp.path().join("failing-git");
+            std::fs::write(
+                &failing,
+                "#!/bin/sh\necho 'fatal: detected dubious ownership' >&2\nexit 128\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+            vec![tmp.path().join("no-such-git"), failing]
+        }
+
+        mod on_git_failing_inside_a_git_repo {
+            use super::*;
+
+            #[test]
+            fn returns_a_git_error() {
+                let (tmp, root) = repo();
+                for git in broken_gits(&tmp) {
+                    let err = ProjectResolver::resolve_with_git(&root, &git).unwrap_err();
+                    assert!(matches!(err, ScopeError::Git { .. }), "{git:?}: {err:?}");
+                }
+            }
+
+            #[test]
+            fn the_error_code_is_git_failed() {
+                use leclerk::error::ErrorCode;
+                let (tmp, root) = repo();
+                let git = &broken_gits(&tmp)[0];
+                let err = ProjectResolver::resolve_with_git(&root, git).unwrap_err();
+                assert_eq!(err.code(), "git_failed");
+            }
+        }
+
+        mod on_git_failing_outside_any_git_repo {
+            use super::*;
+
+            #[test]
+            fn returns_the_canonical_cwd() {
+                let tmp = TempDir::new().unwrap();
+                let dir = tmp.path().canonicalize().unwrap().join("plain");
+                std::fs::create_dir_all(&dir).unwrap();
+                for git in broken_gits(&tmp) {
+                    let key = ProjectResolver::resolve_with_git(&dir, &git).unwrap();
+                    assert_eq!(key, ProjectKey(dir.clone()), "{git:?}");
+                }
+            }
+        }
+
         mod on_nonexistent_cwd {
             use super::*;
 
