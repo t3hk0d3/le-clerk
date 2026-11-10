@@ -11,10 +11,11 @@ registering resources).
 
 **Architecture:**
 - **Daemon MCP endpoint (`src/mcp/`):** `rmcp`'s Streamable HTTP server mounted
-  at `/mcp` on the existing axum router. Identity is bound once, at MCP
-  `initialize`, from headers the proxy sets; tool arguments never carry
-  identity. Each tool is a thin mapping onto an existing engine command, run as
-  the bound `Caller` with view `caller`.
+  at `/mcp` on the existing axum router. Claude Code speaks MCP 2026-07-28
+  (no `initialize`, no MCP session), so identity comes from headers the proxy
+  sets on every request; tool arguments never carry identity. Each tool is a
+  thin mapping onto an existing engine command, run as the request's `Caller`
+  with view `caller`.
 - **Proxy (`clerk mcp`, `src/cli/mcp.rs`):** a meaning-preserving JSON-RPC relay
   between stdio and the daemon's `/mcp`, plus one long-lived liveness stream.
   It never interprets tool calls, so progress notifications and Tasks pass
@@ -23,9 +24,10 @@ registering resources).
   streams per session. When the last one closes, a reconnect grace starts; a
   new stream with the same session ID cancels it and takes over. Expiry ends
   the session's leases and requests through the existing holder-gone path.
-- **Hooks (`clerk hook …`, `src/cli/hook.rs`):** Stop, PreToolUse and
-  SessionEnd handlers. They read Claude Code's hook JSON from stdin, never
-  start the daemon, finish within 2 s, and fail open.
+- **Hooks (`clerk hook …`, `src/cli/hook.rs`):** SessionStart, Stop,
+  PreToolUse and SessionEnd handlers. They read Claude Code's hook JSON from
+  stdin, resolve the session by `CLAUDE_PID`, never start the daemon, finish
+  within their budget (2 s; SessionEnd 1.5 s), and fail open.
 - **Plugin (`integrations/claude-code/`):** plugin manifest, `.mcp.json`,
   `hooks/hooks.json`, `skills/leasing/SKILL.md`,
   `skills/registering-resources/SKILL.md`, and a local marketplace manifest so
@@ -53,13 +55,19 @@ Conventional Commits). Builds use
   and documented hook input/output. Never the session inbox socket or forged
   envelopes.
 - **Identity:**
-  - The proxy sets `X-Clerk-Session` (`CLAUDE_CODE_SESSION_ID`, or
-    `conn:<ULID>` when unset), `X-Clerk-Connection` (a ULID per proxy process)
-    and `X-Clerk-Project` (the proxy's start working directory, absolute,
-    percent-encoded).
-  - The daemon binds them to the MCP session at `initialize`; later headers
-    are ignored. Holder: `AgentSession { session_id }`; project from
-    `ProjectResolver::resolve`.
+  - The proxy sets, on **every** request, `X-Clerk-Session`
+    (`CLAUDE_CODE_SESSION_ID`, or `conn:<ULID>` when unset),
+    `X-Clerk-Connection` (a ULID per proxy process), `X-Clerk-Project` (the
+    proxy's start working directory, absolute, percent-encoded) and
+    `X-Clerk-Claude-Pid` (the proxy's parent PID, i.e. the Claude Code
+    process).
+  - Claude Code speaks MCP 2026-07-28: no `initialize`, no MCP session (spec
+    Appendix B). The daemon builds the identity per request from these
+    headers; a request without `X-Clerk-Session` is refused. Holder:
+    `AgentSession { session_id }` (after resolving any SessionStart alias);
+    project from `ProjectResolver::resolve`.
+  - The daemon also serves clients that negotiate 2025-11-25 through
+    `initialize` (rmcp's default client, used in tests).
   - No tool takes a holder, session or project argument.
 - **Agent visibility:** every tool runs with view `caller`. MCP never exposes
   `view: all`, admin operations, `list_audit`, `list_promotions`,
@@ -84,25 +92,45 @@ Conventional Commits). Builds use
   - `lease_wait` returns one batch of the session's notices. With none
     pending it blocks, sending a progress notification every 30 s, for at most
     20 min, then returns an empty batch. Every result ends with "Call
-    lease_wait again while you hold or wait for anything."
+    lease_wait again with ack=[…] while you hold or wait for anything."
+  - **Acknowledged delivery** (user decision, Appendix B item 5): Claude Code
+    never cancels a call it dropped, so returning a notice does not mark it
+    delivered. `lease_wait` takes `ack: [notice id]` (the ids from the previous
+    result); only acknowledged notices are marked delivered. Notices returned
+    but not acknowledged are returned again by the next `lease_wait`.
+    Notice ids in a result are listed in the text block as well as the
+    structured content.
   - An `offered` notice delivered by `lease_wait` (or by a completed
     `lease_acquire` task) is claimed in the same call; the result carries the
     grant brief.
   - `lease_acquire` returns a grant, or a queued result whose next step is
-    `lease_wait`. If Task 1 finds `rmcp`'s Tasks matching Claude Code's,
-    `lease_acquire` and `lease_wait` declare optional task support; the
-    blocking path stays fully usable on its own (spec §11 fallback).
+    `lease_wait`.
+  - **Tasks** (verified compatible, SEP-2663 `io.modelcontextprotocol/tasks`):
+    `lease_acquire` (when queued) and `lease_wait` return a task only when the
+    request's client capabilities declare the extension, with
+    `pollIntervalMs` 5000. Otherwise the blocking path; it stays primary
+    (subagents, `claude -p`, desktop and VS Code never get tasks). An open
+    task counts as an open wait for the Stop hook.
 - **Liveness:** a session is alive while at least one of its liveness streams
   is open. When the last closes, `reconnect_grace` (config, 60 s) starts. After
   a daemon restart every `AgentSession` holder gets the same grace from boot.
   Expiry ends leases with cause `holder_gone` and drops requests, as for CLI
   processes.
 - **Hooks:**
-  - `clerk hook stop|pre-tool-use|session-end` read one JSON document from
-    stdin (Claude Code's documented hook input; this is the only stdin read
-    besides `-f -` and TTY prompts).
-  - Never start the daemon (probe only). Total budget 2 s. On any error,
-    timeout or missing daemon: exit 0 with no output.
+  - `clerk hook session-start|stop|pre-tool-use|session-end` read one JSON
+    document from stdin (Claude Code's documented hook input; this is the
+    only stdin read besides `-f -` and TTY prompts).
+  - Never start the daemon (probe only). Budget: 2 s total for session-start,
+    stop and pre-tool-use; 1.5 s total for session-end (Claude Code's limit),
+    so its RPC must finish within 1 s. On any error, timeout or missing
+    daemon: exit 0 with no output.
+  - **Session resolution:** hooks send the hook input's `session_id` and
+    `CLAUDE_PID` (the hook's Claude Code process). The daemon resolves the
+    session as the live proxy session whose `X-Clerk-Claude-Pid` matches, and
+    falls back to `session_id`.
+  - SessionStart with `source: "resume"`: alias the proxy's start-up session
+    id to the resumed id, so `--continue` takes over the resumed session's
+    leases inside the grace. Other sources: nothing.
   - Stop: when the session holds a live lease or a queued request, has no open
     `lease_wait`, and `stop_hook_active` is false, output a block decision
     whose reason tells the agent to call `lease_wait`. Otherwise output
@@ -110,7 +138,9 @@ Conventional Commits). Builds use
   - PreToolUse: inject the session's pending notices that no hook has shown
     yet as `additionalContext`, and mark them shown. They stay pending for
     `lease_wait`.
-  - SessionEnd: end the session's liveness now (no grace).
+  - SessionEnd: end the session's liveness now (no grace), except when
+    `reason` is `clear` or `resume` and the session's proxy is still
+    connected (the Claude Code process lives on): then nothing.
 - **Plugin:** installable from the repo with Claude Code's documented plugin
   commands; installs at user or project scope at the user's choice. `clerk`
   must be on `PATH`.
@@ -124,15 +154,21 @@ Conventional Commits). Builds use
    gets the unit; a resumed session reconnecting inside the grace keeps them.
    → Tests in Task 4.
 2. **A hook blocks the agent:** daemon down, wedged or slow; malformed hook
-   input. The hook must exit 0 within 2 s with no output. → Tests in Task 5.
+   input. The hook must exit 0 within its budget (2 s; SessionEnd 1.5 s) with
+   no output. → Tests in Task 5.
 3. **Stop-hook loop:** the reminder must never fire twice in a row
    (`stop_hook_active`), and never when a `lease_wait` is open. → Tests in
    Task 5.
 4. **Agent identity spoofing through arguments:** a tool call with extra
    `holder`/`session`/`project` arguments is refused as an unknown field; two
    sessions never see each other's leases or notices. → Tests in Tasks 2 and 3.
-5. **`lease_wait` outliving the client:** the proxy dies mid-wait; the daemon
-   must drop the wait without losing undelivered notices. → Test in Task 3.
+5. **`lease_wait` outliving the client:** the proxy dies mid-wait, or Claude
+   Code drops a call whose result already carried notices; no notice is
+   lost — unacknowledged notices come back on the next `lease_wait`. → Tests
+   in Task 3.
+6. **`--continue` loses its boards:** the resumed session gets a new MCP
+   session id; the SessionStart alias must keep its leases. → Test in
+   Tasks 4–5.
 
 ---
 
@@ -140,13 +176,15 @@ Conventional Commits). Builds use
 
 ```
 mcp::server (daemon /mcp)
-    initialize
-        On proxy headers with a session id
-            - binds AgentSession(session id) and the resolved project
+    any request
+        On X-Clerk-* headers
+            - acts as AgentSession(session id, after alias resolution) with the resolved project
         On missing X-Clerk-Session
-            - refuses initialize with an MCP error
-        On later requests with different headers
-            - keeps the identity bound at initialize
+            - refuses the request with an MCP error; nothing changes
+    server/discover (2026-07-28)
+        - answers with the server's tools capability and the tasks extension
+    initialize (2025-11-25 clients)
+        - succeeds; later requests still take identity from their own headers
     tools/list
         - lists exactly the tool names in Global Constraints, each with an input schema
         - lists no admin, audit, promotion-list or holder-lookup tool
@@ -184,35 +222,45 @@ mcp::tools leasing
             - tool error no_units
     lease_wait
         On pending notices
-            - returns them at once and marks them delivered
+            - returns them at once, listing their ids in the text block
+            - does not mark them delivered
+        On ack with ids from the previous result
+            - marks exactly those delivered; they are not returned again
+        On a previous result never acknowledged
+            - returns its notices again
         On an offered notice
             - claims it in the same call and returns the grant brief
         On none pending
             - sends a progress notification every 30 s
             - returns an empty batch after 20 min
         On the proxy disconnecting mid-wait
-            - the wait ends; undelivered notices stay pending
+            - the wait ends; unacknowledged notices stay pending
         - every result ends with the re-arm sentence
     lease_status
         - returns this session's leases, queue positions and pending notice count only
     lease_extend / lease_release / lease_confirm / lease_set_interruptible / lease_yield_refuse / lease_reclaim / lease_cancel / lease_claim
         - map 1:1 to the engine; the next step text matches the resulting state
-    Tasks (only if Task 1 confirms compatibility)
-        On a task-capable client calling lease_acquire on a held pool
-            - returns a task handle at once; the task completes with the grant
-        On a client without tasks
+    Tasks
+        On a request whose client capabilities declare io.modelcontextprotocol/tasks
+            - lease_acquire on a held pool returns a task handle at once with pollIntervalMs 5000; the task completes with the grant
+            - an open task counts as an open wait (session_brief)
+        On a request without the capability
             - behaves exactly as the blocking path
 
 proxy (clerk mcp)
     On start
-        - opens the liveness stream with the identity headers
+        - opens the liveness stream with the identity headers (incl. X-Clerk-Claude-Pid)
         - relays stdin JSON-RPC to /mcp and responses/notifications to stdout unchanged in meaning
+    On each message (2026-07-28 framing)
+        - sets MCP-Protocol-Version, Mcp-Method and Mcp-Name from the message, plus the X-Clerk-* headers
+        - relays JSON and SSE responses
+        - sends requests concurrently; a slow lease_wait never blocks other calls
     On CLAUDE_CODE_SESSION_ID unset
         - uses conn:<ULID> as the session id
     On stdin EOF
         - closes the liveness stream and exits 0
     On the daemon restarting
-        - reconnects the liveness stream and keeps relaying (re-initialising the MCP session if the daemon lost it)
+        - reconnects the liveness stream and keeps relaying
     On the daemon not running
         - starts it (ensure_running), as every clerk invocation does
 
@@ -233,11 +281,24 @@ scheduler::session
         - every AgentSession holder with live leases or requests gets reconnect_grace from boot
     end_now(session) (SessionEnd)
         - ends the session's leases and requests without grace
+    alias(from start-up id, to resumed id) (SessionStart resume)
+        - leases and requests of the resumed id are now held by the live proxy session; its grace is cancelled
+    resolve(claude_pid, session_id)
+        On a live proxy session with that Claude PID
+            - returns it
+        On none
+            - returns session_id
 
 cli::hook
     any hook
         On no daemon / daemon unresponsive / malformed input / slow daemon
-            - exits 0 with no output within 2 s; never starts a daemon
+            - exits 0 with no output within its budget (2 s; session-end 1.5 s); never starts a daemon
+        - resolves the session by CLAUDE_PID first, then session_id
+    session-start
+        On source resume
+            - aliases the proxy's start-up id to the resumed id
+        On any other source
+            - outputs nothing; changes nothing
     stop
         On a live lease or queued request, no open lease_wait, stop_hook_active false
             - outputs a block decision whose reason names lease_wait
@@ -254,12 +315,15 @@ cli::hook
         On none
             - outputs nothing
     session-end
-        - ends the session's liveness now
+        On reason clear or resume with the proxy still connected
+            - changes nothing
+        On any other reason
+            - ends the session's liveness now
 
 plugin (integrations/claude-code)
     - manifest, .mcp.json, hooks.json and both SKILL.md files validate against the documented schemas (Task 1)
     - .mcp.json launches `clerk mcp` over stdio
-    - hooks.json wires Stop, PreToolUse and SessionEnd to `clerk hook …` with a timeout of at most 5 s
+    - hooks.json wires SessionStart, Stop, PreToolUse and SessionEnd to `clerk hook …` with a timeout of at most 5 s
 ```
 
 The two `SKILL.md` files are prose; their contract is the content list in
@@ -274,7 +338,7 @@ src/mcp/wait.rs         lease_wait blocking/progress/auto-claim (and Tasks if ad
 src/scheduler/session.rs  session liveness: connections, grace, takeover, end
 src/daemon/server.rs    (modify) mount /mcp and /v1/session/live
 src/cli/mcp.rs          clerk mcp proxy
-src/cli/hook.rs         clerk hook stop|pre-tool-use|session-end
+src/cli/hook.rs         clerk hook session-start|stop|pre-tool-use|session-end
 src/engine/command.rs   (modify) session_brief, mark_notices_shown, session_end RPCs
 integrations/claude-code/.claude-plugin/plugin.json
 integrations/claude-code/.mcp.json
@@ -474,7 +538,7 @@ cli JSON output
 - Consumes: Task 2's identity headers; `Config.reconnect_grace`; the
   existing holder-gone ending in `liveness.rs`; `Client::ensure_running`.
 - Produces:
-  - `Sessions::connect(session_id, connection) / disconnect(connection) / end_now(session_id)`
+  - `Sessions::connect(session_id, connection, claude_pid) / disconnect(connection) / end_now(session_id) / alias(from, to) / resolve(claude_pid, session_id)`
     and grace expiry driven by the engine's clock and timers;
   - `GET /v1/session/live` with the identity headers: holds the response open
     (periodic keep-alive chunks) for as long as the proxy lives;
@@ -508,7 +572,7 @@ cli JSON output
 **Files:**
 - Create: `src/cli/hook.rs`
 - Modify: `src/cli/mod.rs` (subcommand `hook`), `src/engine/command.rs`
-  (`session_brief`, `mark_notices_shown`, `session_end`), `src/store/notices.rs`
+  (`session_brief`, `mark_notices_shown`, `session_start`, `session_end`), `src/store/notices.rs`
   (a `shown_by_hook` mark that does not affect delivery)
 - Test: `tests/hook.rs`
 
@@ -517,16 +581,17 @@ cli JSON output
   tracking; Task 4's `Sessions::end_now`; `Client::probe` (never
   `ensure_running`).
 - Produces:
-  - RPC `session_brief { session_id }` →
-    `{ leases: n, requests: n, open_waits: n, unshown: [notice…] }`;
-    `mark_notices_shown { session_id, ids }`; `session_end { session_id }`.
-    All three answer only about the session named in the hook input; they are
-    not MCP tools.
-  - `clerk hook stop|pre-tool-use|session-end` per Global Constraints.
+  - RPCs, each taking `{ session_id, claude_pid }` from the hook and resolving
+    the session per Global Constraints: `session_brief` →
+    `{ leases: n, requests: n, open_waits: n, unshown: [notice…] }` (open
+    waits include open tasks); `mark_notices_shown { ids }`;
+    `session_start { source }` (alias on resume); `session_end { reason }`.
+    They answer only about the resolved session; they are not MCP tools.
+  - `clerk hook session-start|stop|pre-tool-use|session-end` per Global Constraints.
 
 - [ ] **Step 1:** Write the failing tests for the BDD subtree `cli::hook`,
   including Review Focus 2 (no daemon, wedged daemon via a socket that never
-  answers, malformed JSON: exit 0, empty stdout, within 2 s, no daemon
+  answers, malformed JSON: exit 0, empty stdout, within the budget, no daemon
   started) and Review Focus 3 (no double reminder).
 - [ ] **Step 2:** Run them; expected FAIL.
 - [ ] **Step 3:** Implement.
