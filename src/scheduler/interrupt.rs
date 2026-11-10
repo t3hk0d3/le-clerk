@@ -737,6 +737,7 @@ mod tests {
             created_at: 0,
             override_reason: None,
             override_lease: None,
+            skip_checks: false,
         }
     }
 

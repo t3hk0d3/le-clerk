@@ -353,7 +353,7 @@ impl Scheduler {
                     .collect();
                 candidates.sort_by(|a, b| a.id.cmp(&b.id));
                 for unit in candidates {
-                    if self.healthy(tx, cache, &resource, unit)? {
+                    if waiter.skip_checks || self.healthy(tx, cache, &resource, unit)? {
                         self.offer(tx, &resource, unit, waiter)?;
                         break 'waiters;
                     }

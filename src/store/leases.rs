@@ -635,6 +635,8 @@ pub struct RequestRow {
     pub override_reason: Option<String>,
     /// The lease this override request displaced; it is served first.
     pub override_lease: Option<i64>,
+    /// Granted without running the unit's health checks (`--skip-checks`).
+    pub skip_checks: bool,
 }
 
 /// Values for a new queued request.
@@ -652,10 +654,12 @@ pub struct NewRequest<'a> {
     pub created_at: i64,
     pub override_reason: Option<&'a str>,
     pub override_lease: Option<i64>,
+    pub skip_checks: bool,
 }
 
 const REQUEST_COLUMNS: &str = "row_id, request_id, resource_row, unit_row, holder, project_key, \
-     priority, interruptible, purpose, duration_ms, created_at, override_reason, override_lease";
+     priority, interruptible, purpose, duration_ms, created_at, override_reason, override_lease, \
+     skip_checks";
 
 fn request_from_row(r: &Row<'_>) -> rusqlite::Result<Result<RequestRow, StoreError>> {
     let row: i64 = r.get(0)?;
@@ -671,6 +675,7 @@ fn request_from_row(r: &Row<'_>) -> rusqlite::Result<Result<RequestRow, StoreErr
     let created_at: i64 = r.get(10)?;
     let override_reason: Option<String> = r.get(11)?;
     let override_lease: Option<i64> = r.get(12)?;
+    let skip_checks: bool = r.get(13)?;
     Ok((|| {
         Ok(RequestRow {
             row,
@@ -686,6 +691,7 @@ fn request_from_row(r: &Row<'_>) -> rusqlite::Result<Result<RequestRow, StoreErr
             created_at,
             override_reason,
             override_lease,
+            skip_checks,
         })
     })())
 }
@@ -698,8 +704,8 @@ pub fn insert_request(tx: &Tx, new: &NewRequest<'_>) -> Result<i64, StoreError> 
     tx.conn().execute(
         "INSERT INTO requests (request_id, resource_row, unit_row, state, holder, project_key, \
          priority, interruptible, purpose, duration_ms, created_at, override_reason, \
-         override_lease) \
-         VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         override_lease, skip_checks) \
+         VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             new.id.as_str(),
             new.resource_row,
@@ -713,6 +719,7 @@ pub fn insert_request(tx: &Tx, new: &NewRequest<'_>) -> Result<i64, StoreError> 
             new.created_at,
             new.override_reason,
             new.override_lease,
+            new.skip_checks,
         ],
     )?;
     Ok(tx.conn().last_insert_rowid())

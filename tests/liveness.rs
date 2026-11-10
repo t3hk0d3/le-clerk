@@ -55,6 +55,7 @@ fn req(resource: &str, priority: Priority) -> AcquireRequest {
         priority,
         purpose: format!("{priority:?} job"),
         override_reason: None,
+        skip_checks: false,
     }
 }
 

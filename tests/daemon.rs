@@ -1467,6 +1467,7 @@ mod restart_grace {
             priority: Priority::Normal,
             purpose: "test".into(),
             override_reason: None,
+            skip_checks: false,
         }
     }
 

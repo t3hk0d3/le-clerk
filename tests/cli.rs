@@ -3933,6 +3933,106 @@ mod cli {
         }
     }
 
+    mod skip_checks {
+        use super::*;
+
+        /// A device resource `dev` with unit `u1` at a file `holder` keeps
+        /// open (default health: exists and not open); the holder process.
+        fn busy_device(env: &Env) -> std::process::Child {
+            let path = env.home().join("tty-u1");
+            fs::write(&path, b"").unwrap();
+            env.ok(&["resource", "create", "dev", "--type", "device"]);
+            env.ok(&["unit", "add", "dev", "u1", "--path", path.to_str().unwrap()]);
+            let child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exec 3<\"$0\"; exec sleep 300")
+                .arg(&path)
+                .spawn()
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            child
+        }
+
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        #[test]
+        fn on_a_unit_open_by_a_process_a_normal_acquire_queues() {
+            let env = Env::new();
+            let _busy = Kill(busy_device(&env));
+            env.cmd()
+                .args(["acquire", "dev/u1", "--for", "10m"])
+                .assert()
+                .code(6);
+        }
+
+        #[test]
+        fn grants_the_unit_without_running_its_health_checks() {
+            let env = Env::new();
+            let _busy = Kill(busy_device(&env));
+            let body = env.ok(&["acquire", "dev/u1", "--for", "10m", "--skip-checks"]);
+            assert_eq!(body["outcome"], "granted", "{body}");
+        }
+
+        #[test]
+        fn is_recorded_in_the_audit_log() {
+            let env = Env::new();
+            let _busy = Kill(busy_device(&env));
+            env.ok(&["acquire", "dev/u1", "--for", "10m", "--skip-checks"]);
+            let log = env.ok(&["log", "--action", "granted", "--limit", "1"]);
+            assert_eq!(log[0]["detail"]["skip_checks"], true, "{log}");
+        }
+
+        #[test]
+        fn on_a_whole_resource_is_refused() {
+            let env = Env::new();
+            let _busy = Kill(busy_device(&env));
+            let error = error_of(
+                env.cmd()
+                    .args(["acquire", "dev", "--for", "10m", "--skip-checks"]),
+                2,
+            );
+            assert!(
+                error["message"].as_str().unwrap().contains("unit"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn never_takes_a_unit_from_its_lease_holder_and_skips_the_checks_when_offered() {
+            let env = Env::new();
+            let _busy = Kill(busy_device(&env));
+            let theirs = env
+                .rpc(
+                    "acquire",
+                    &user("x"),
+                    json!({"target": {"resource": "dev", "unit": "u1"}, "duration_ms": 600_000,
+                       "purpose": "theirs", "skip_checks": true}),
+                )
+                .unwrap();
+            assert_eq!(theirs["outcome"], "granted", "{theirs}");
+            let out = env
+                .cmd()
+                .args(["acquire", "dev/u1", "--for", "10m", "--skip-checks"])
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(6), "{out:?}");
+            env.rpc(
+                "admin_release",
+                &user("admin"),
+                json!({ "lease_id": theirs["lease_id"] }),
+            )
+            .unwrap();
+            let occupancy = unit_status(&env)["occupancy"].clone();
+            assert_eq!(occupancy["state"], "offered", "{occupancy}");
+        }
+    }
+
     mod socket_path_too_long {
         use super::*;
 

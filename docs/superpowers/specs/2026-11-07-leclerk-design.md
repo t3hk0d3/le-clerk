@@ -734,8 +734,13 @@ agent, a command acts for the agent (§7.3), never prompts, and prints JSON.
 
 **Leasing:**
 - `clerk acquire <resource|unit> --for --purpose [--interruptible]
-  [--priority]` (§5.1): prints a grant at once, or the queued request with
-  its position. A grant carries the descriptions, the rendered usage (§4.7)
+  [--priority] [--skip-checks]` (§5.1): prints a grant at once, or the
+  queued request with its position. `--skip-checks` (user decision,
+  2026-11-10) grants one specific unit without its health checks, for
+  something the caller's own running job already uses (a board it has open,
+  a port it listens on); it never takes a unit from a lease holder (it
+  queues as usual and skips the checks when offered), and the request and
+  its audit entries record it. A grant carries the descriptions, the rendered usage (§4.7)
   and the resource's tags. A grant printed by `acquire` is claimed at once.
 - `clerk status --mine`: the agent's leases, queue positions, pending notices
   and whether a wait is armed.

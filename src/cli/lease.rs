@@ -103,6 +103,11 @@ pub struct AcquireArgs {
     /// default).
     #[arg(long)]
     no_wait: bool,
+    /// Grant the unit without running its health checks: you vouch for it,
+    /// e.g. your own running job already has it open. A specific unit only
+    /// (<resource>/<unit>); never takes it from a lease holder; audited.
+    #[arg(long)]
+    skip_checks: bool,
 }
 
 /// `clerk extend`.
@@ -175,12 +180,13 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
         .into());
     }
     interruptible_needs_session(&args.lease, &caller)?;
-    let body = request_args(
+    let mut body = request_args(
         &target,
         &args.lease,
         "held from the command line".to_owned(),
         &caller,
     );
+    body["skip_checks"] = json!(args.skip_checks);
     let client = ctx.client().await?;
     if interactive {
         let _raw = RawMode::enable()?;

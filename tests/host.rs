@@ -53,6 +53,7 @@ fn req() -> AcquireRequest {
         priority: Priority::Normal,
         purpose: "test".into(),
         override_reason: None,
+        skip_checks: false,
     }
 }
 

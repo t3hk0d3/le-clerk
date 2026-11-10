@@ -101,6 +101,10 @@ pub struct AcquireRequest {
     /// Set when the user said to take the unit regardless; stored and
     /// audited (the override behaviour itself belongs to interruption).
     pub override_reason: Option<String>,
+    /// Grant the (specific) unit without running its health checks: the
+    /// caller vouches for it, e.g. its own job already has it open. Never
+    /// takes a unit from a lease holder.
+    pub skip_checks: bool,
 }
 
 /// What a holder is told about what it leases: the resource's description,
@@ -890,7 +894,7 @@ impl Scheduler {
             if unit.retiring || group_busy(tx, &group(tx, unit.row)?)? {
                 continue;
             }
-            if !self.healthy(tx, &mut cache, &resource, unit)? {
+            if !req.skip_checks && !self.healthy(tx, &mut cache, &resource, unit)? {
                 continue;
             }
             let handed = self.hand_over(tx, &resource, unit, &ask, LeaseState::Held)?;
@@ -906,6 +910,7 @@ impl Scheduler {
                     "purpose": req.purpose,
                     "override_reason": req.override_reason,
                     "dirty": handed.dirty,
+                    "skip_checks": req.skip_checks,
                 }),
             )?;
             let brief = brief(&resource, unit);
@@ -1013,6 +1018,7 @@ impl Scheduler {
                 created_at: self.now(),
                 override_reason: ask.override_reason,
                 override_lease,
+                skip_checks: req.skip_checks,
             },
         )?;
         let after = QueueSnapshot::load(tx)?;
@@ -1039,6 +1045,7 @@ impl Scheduler {
                 "purpose": req.purpose,
                 "position": position,
                 "override_reason": req.override_reason,
+                "skip_checks": req.skip_checks,
             }),
         )?;
         Ok(AcquireOutcome::Queued {

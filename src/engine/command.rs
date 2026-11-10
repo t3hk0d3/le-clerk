@@ -215,6 +215,9 @@ pub struct AcquireArgs {
     pub purpose: String,
     #[serde(default)]
     pub override_reason: Option<String>,
+    /// Grant the unit without its health checks (a specific unit only).
+    #[serde(default)]
+    pub skip_checks: bool,
 }
 
 /// `claim`, `release`, `refuse_yield`, `reclaim`.
@@ -581,6 +584,15 @@ impl Command {
         {
             return Err(ApiError::invalid_argument("duration_ms must be positive"));
         }
+        if let Self::Acquire(_, args) = self
+            && args.skip_checks
+            && args.target.unit.is_none()
+        {
+            return Err(ApiError::invalid_argument(
+                "skip_checks needs a specific unit (<resource>/<unit>): you vouch for that one \
+                 unit, not for any unit of the resource",
+            ));
+        }
         if matches!(self.caller().holder, HolderRef::AgentSession { .. })
             && let Some(what) = self.beyond_own_scopes()
         {
@@ -786,6 +798,7 @@ impl Command {
                     priority: a.priority,
                     purpose: a.purpose,
                     override_reason: a.override_reason,
+                    skip_checks: a.skip_checks,
                 };
                 encode(AcquireView::from(sched.acquire(tx, &who, req)?))
             }

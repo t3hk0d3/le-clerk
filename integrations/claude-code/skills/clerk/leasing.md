@@ -12,6 +12,14 @@ Read with the clerk skill's SKILL.md. Every command prints JSON with
   meanwhile.
 - `--priority low|normal|high`: leave it at normal unless the user asked.
 - `clerk cancel <request>` drops a queued request you no longer need.
+- **Something your own job already uses** (a board your running bench has
+  open, a port your server already listens on): the unit's health check
+  sees it busy and your request would wait forever. Lease that one unit
+  with `clerk acquire <resource>/<unit> --for <d> --skip-checks`: no gap,
+  no restart. Never stop the job to lease it (another agent could take the
+  unit in between), and never use `--skip-checks` to get past a check that
+  says something is wrong. It never takes a unit from a lease holder, and
+  it is audited.
 - `clerk claim <lease>` claims an offer by hand (the wait normally does).
 
 ## Notices and what to do

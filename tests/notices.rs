@@ -59,6 +59,7 @@ fn req(resource: &str, priority: Priority, interruptible: bool, purpose: &str) -
         priority,
         purpose: purpose.into(),
         override_reason: None,
+        skip_checks: false,
     }
 }
 

@@ -53,6 +53,9 @@ configs, asking the user) is your job: the clerk has no scan command.
      `--scope` out, so it lands in this project; `--scope user` only when
      the user says it is shared across projects.
 7. **Record the ids** in the project's docs or your memory.
+8. **Already using it?** If your own running job already uses a unit you
+   just registered, lease it now with `--skip-checks` (see
+   [leasing.md](leasing.md)); new long jobs start only after the grant.
 
 Later: `clerk resource update` (`--add-tag`, `--remove-tag`, `--usage`),
 `clerk unit update`, `clerk unit retire` for a unit that is going away,
