@@ -51,6 +51,8 @@ pub const MAX_WAIT: Duration = Duration::from_secs(60);
 pub const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 /// Most notices one take returns.
 pub const NOTICE_BATCH: u32 = 100;
+/// How much longer than `health_timeout` an acquire waits for a check.
+const CHECK_WAIT_SLACK: Duration = Duration::from_secs(2);
 /// How long the engine waits before retrying after a failed tick.
 const TICK_RETRY: Duration = Duration::from_secs(1);
 
@@ -275,10 +277,14 @@ impl Default for EngineOptions {
 
 type Reply<T> = oneshot::Sender<Result<T, ApiError>>;
 
+/// See [`Job::Command`].
+type DeferOnCheck = bool;
+
 /// Work for the engine thread.
 enum Job {
-    /// An RPC command.
-    Command(Box<Command>, Option<Host>, Reply<Value>),
+    /// An RPC command. With `DeferOnCheck`, an acquire answers `checking`
+    /// rather than queue behind a health check on its way.
+    Command(Box<Command>, Option<Host>, DeferOnCheck, Reply<Value>),
     /// Deliver up to [`NOTICE_BATCH`] pending notices of a holder (with a
     /// filter, only those it matches).
     TakeNotices(HolderRef, Option<NoticeFilter>, Reply<Vec<Notice>>),
@@ -553,16 +559,59 @@ impl EngineHandle {
             Command::DaemonStop(_, a) => self.mark_going(a.restart),
             _ => false,
         };
-        let (reply, answer) = oneshot::channel();
-        self.jobs
-            .send(Job::Command(Box::new(command), host, reply))
-            .map_err(|_| ApiError::unavailable())?;
-        let result = answer.await.map_err(|_| ApiError::unavailable())?;
+        let result = if matches!(command, Command::Acquire(..)) {
+            self.settled_acquire(command, host).await
+        } else {
+            self.send_command(command, host, false).await
+        };
         if marked && result.is_err() {
             // The stop failed, so the daemon goes on: waits must too.
             self.going.store(0, std::sync::atomic::Ordering::SeqCst);
         }
         result
+    }
+
+    async fn send_command(
+        &self,
+        command: Command,
+        host: Option<Host>,
+        defer: DeferOnCheck,
+    ) -> Result<Value, ApiError> {
+        let (reply, answer) = oneshot::channel();
+        self.jobs
+            .send(Job::Command(Box::new(command), host, defer, reply))
+            .map_err(|_| ApiError::unavailable())?;
+        answer.await.map_err(|_| ApiError::unavailable())?
+    }
+
+    /// Run an acquire, waiting here (never on the engine thread) while a
+    /// health check of a target unit is on its way, for `health_timeout`
+    /// plus [`CHECK_WAIT_SLACK`] at most: it then answers as if the check
+    /// had run in place, granted or queued with what really blocks it.
+    /// Nothing is queued meanwhile. Past the wait it queues, `blocked_by`
+    /// checking.
+    async fn settled_acquire(
+        &self,
+        command: Command,
+        host: Option<Host>,
+    ) -> Result<Value, ApiError> {
+        let first = self.send_command(command.clone(), host, true).await?;
+        if first["outcome"] != "checking" {
+            return Ok(first);
+        }
+        let limit = Duration::from_secs(self.config.health_timeout) + CHECK_WAIT_SLACK;
+        // The engine wakes every waiter when a check comes back.
+        let answer = self
+            .wait_until(&command.caller().holder, limit, || async {
+                let answer = self.send_command(command.clone(), host, true).await?;
+                Ok((answer["outcome"] != "checking").then_some(answer))
+            })
+            .await
+            .map_err(|e| self.announced(e))?;
+        match answer {
+            Some(answer) => Ok(answer),
+            None => self.send_command(command, host, false).await,
+        }
     }
 
     /// The daemon starts going away, for good or (`restart`) to come back:
@@ -1120,7 +1169,9 @@ impl Engine {
 
     fn handle(&mut self, job: Job) {
         match job {
-            Job::Command(command, host, reply) => self.handle_command(*command, host, reply),
+            Job::Command(command, host, defer, reply) => {
+                self.handle_command(*command, host, defer, reply);
+            }
             Job::TakeNotices(holder, filter, reply) => {
                 let result = self.guarded("take_notices", |engine| {
                     let now = engine.clock.now_ms();
@@ -1203,12 +1254,20 @@ impl Engine {
                     tracing::error!(error = %e, "cannot record a health check");
                 }
                 self.maintain();
+                // Acquires waiting for this result ask again.
+                self.waiters.notify_all();
             }
         }
     }
 
     /// Run an RPC command for its caller and answer `reply`.
-    fn handle_command(&mut self, command: Command, host: Option<Host>, reply: Reply<Value>) {
+    fn handle_command(
+        &mut self,
+        command: Command,
+        host: Option<Host>,
+        defer: DeferOnCheck,
+        reply: Reply<Value>,
+    ) {
         // Reads see overdue deadlines processed.
         if self.deadline_due() {
             self.maintain();
@@ -1216,7 +1275,7 @@ impl Engine {
         let method = command.method();
         let mutating = !command.read_only();
         let stop = matches!(command, Command::DaemonStop(..));
-        let result = self.guarded(method, |engine| engine.execute(command, host));
+        let result = self.guarded(method, |engine| engine.execute(command, host, defer));
         if stop && result.is_ok() {
             self.stopping = true;
         }
@@ -1240,7 +1299,12 @@ impl Engine {
         })
     }
 
-    fn execute(&mut self, command: Command, host: Option<Host>) -> Result<Value, ApiError> {
+    fn execute(
+        &mut self,
+        command: Command,
+        host: Option<Host>,
+        defer_on_check: DeferOnCheck,
+    ) -> Result<Value, ApiError> {
         let hosting = self.touch_caller(&command, host)?;
         command.validate_hosting(hosting.as_ref(), &self.sessions)?;
         let services = Services {
@@ -1248,6 +1312,7 @@ impl Engine {
             promotions: &self.promotions,
             scheduler: &self.scheduler,
             now_ms: self.clock.now_ms(),
+            defer_on_check,
         };
         self.store.tx(|tx| command.run(tx, &services))
     }

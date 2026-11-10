@@ -475,6 +475,40 @@ mod custom_command {
     }
 }
 
+mod blocks {
+    use super::*;
+
+    fn blocks(checks: Vec<Check>) -> bool {
+        HealthProbe::blocks(&checker(), &spec(checks))
+    }
+
+    #[test]
+    fn is_false_for_local_checks() {
+        assert!(!blocks(vec![
+            builtin(BuiltinCheck::None),
+            builtin(BuiltinCheck::Exists),
+            builtin(BuiltinCheck::Accessible),
+            builtin(BuiltinCheck::NotOpen),
+            builtin(BuiltinCheck::PortFree),
+        ]));
+    }
+
+    #[test]
+    fn is_true_for_tcp_connect() {
+        assert!(blocks(vec![builtin(BuiltinCheck::TcpConnect)]));
+    }
+
+    #[test]
+    fn is_true_for_http() {
+        assert!(blocks(vec![builtin(BuiltinCheck::Http)]));
+    }
+
+    #[test]
+    fn is_true_for_a_custom_command_among_local_checks() {
+        assert!(blocks(vec![builtin(BuiltinCheck::Exists), custom("true")]));
+    }
+}
+
 mod http_check {
     use super::*;
 

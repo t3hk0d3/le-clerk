@@ -574,6 +574,9 @@ pub(crate) struct Services<'a> {
     pub promotions: &'a Promotions,
     pub scheduler: &'a Scheduler,
     pub now_ms: i64,
+    /// An acquire answers `checking` rather than queue behind a check on
+    /// its way.
+    pub defer_on_check: bool,
 }
 
 impl Command {
@@ -844,7 +847,12 @@ impl Command {
                     override_reason: a.override_reason,
                     skip_checks: a.skip_checks,
                 };
-                encode(AcquireView::from(sched.acquire(tx, &who, req)?))
+                let outcome = if s.defer_on_check {
+                    sched.acquire_unless_checking(tx, &who, req)?
+                } else {
+                    sched.acquire(tx, &who, req)?
+                };
+                encode(AcquireView::from(outcome))
             }
             Self::Claim(who, a) => encode(LeaseView::from(sched.claim(tx, &who, &a.lease_id)?)),
             Self::Cancel(who, a) => {

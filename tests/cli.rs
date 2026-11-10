@@ -5163,38 +5163,124 @@ mod cli {
         }
     }
 
-    /// Run `target`'s first health check to a failure, leaving no request
-    /// behind: checks run off the engine, so only after this does an
-    /// acquire find the unit unhealthy.
-    fn fail_first_check(env: &Env, target: &str) {
-        let out = env
-            .cmd()
-            .args(["acquire", target, "--for", "10m"])
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(6), "{out:?}");
-        let body: Value = serde_json::from_slice(&out.stdout).unwrap();
-        env.ok(&["cancel", body["request_id"].as_str().unwrap()]);
-        let resource = target.split('/').next().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let status = env.ok(&["status"]);
-            let failed = status["resources"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|r| r["id"] == resource)
-                .flat_map(|r| r["units"].as_array().unwrap())
-                .any(|u| {
-                    u["last_health"]
-                        .as_str()
-                        .is_some_and(|h| h.starts_with("unhealthy"))
-                });
-            if failed {
-                return;
+    mod cold_acquire {
+        use super::*;
+
+        /// A generic resource `job` with unit `u1` and health command `cmd`.
+        fn custom_check(env: &Env, cmd: &str) {
+            env.ok(&[
+                "resource",
+                "create",
+                "job",
+                "--type",
+                "generic",
+                "--health-command",
+                cmd,
+            ]);
+            env.ok(&["unit", "add", "job", "u1", "--key", "k1"]);
+        }
+
+        mod on_a_device_with_local_checks {
+            use super::*;
+
+            #[test]
+            fn grants_at_once_with_exit_0() {
+                let env = Env::new();
+                let path = env.home().join("tty-u1");
+                fs::write(&path, b"").unwrap();
+                env.ok(&["resource", "create", "dev", "--type", "device"]);
+                env.ok(&["unit", "add", "dev", "u1", "--path", path.to_str().unwrap()]);
+                let body = env.ok(&["acquire", "dev/u1", "--for", "10m"]);
+                assert_eq!(body["outcome"], "granted", "{body}");
             }
-            assert!(Instant::now() < deadline, "no failed check: {status}");
-            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        mod on_a_custom_check_that_passes_in_about_1_s {
+            use super::*;
+
+            #[test]
+            fn answers_granted() {
+                let env = Env::new();
+                custom_check(&env, "sleep 1");
+                let body = env.ok(&["acquire", "job", "--for", "10m"]);
+                assert_eq!(body["outcome"], "granted", "{body}");
+            }
+
+            #[test]
+            fn leaves_no_offer_notice_behind() {
+                let env = Env::new();
+                custom_check(&env, "sleep 1");
+                let body = env.ok(&["acquire", "job", "--for", "10m"]);
+                let log = env.ok(&["log", "--action", "offered", "--limit", "1"]);
+                assert_eq!(log, json!([]), "{body}");
+            }
+        }
+
+        mod on_a_custom_check_that_fails {
+            use super::*;
+
+            #[test]
+            fn answers_queued_with_blocked_by_unhealthy() {
+                let env = Env::new();
+                custom_check(&env, "echo broken >&2; exit 1");
+                let out = env
+                    .cmd()
+                    .args(["acquire", "job", "--for", "10m"])
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.code(), Some(6), "{out:?}");
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(body["blocked_by"]["kind"], "unhealthy", "{body}");
+                assert_eq!(
+                    body["blocked_by"]["units"][0]["message"], "broken",
+                    "{body}"
+                );
+            }
+        }
+
+        mod on_daemon_exit_during_a_custom_check {
+            use super::*;
+
+            fn running(pid: &str) -> bool {
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|stat| !stat.rsplit(") ").next().unwrap().starts_with('Z'))
+            }
+
+            #[test]
+            fn kills_the_check_and_its_process_group() {
+                let env = Env::new();
+                let marker = env.home().join("pids");
+                // The shell and a child in its process group.
+                custom_check(
+                    &env,
+                    &format!(
+                        "sleep 300 & echo \"$$ $!\" > {}.tmp; mv {0}.tmp {0}; wait",
+                        marker.display()
+                    ),
+                );
+                let mut acquire = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"))
+                    .env("CLERK_HOME", env.home())
+                    .env_remove(SESSION_VAR)
+                    .env_remove(CLAUDE_PID)
+                    .args(["acquire", "job", "--for", "10m"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !marker.exists() {
+                    assert!(Instant::now() < deadline, "the check never started");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let pids = fs::read_to_string(&marker).unwrap();
+                env.ok(&["daemon", "stop"]);
+                let _ = acquire.wait();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while pids.split_whitespace().any(running) {
+                    assert!(Instant::now() < deadline, "still running: {pids}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
         }
     }
 
@@ -5259,7 +5345,6 @@ mod cli {
         fn a_queued_agent_blocked_by_a_health_check_is_told_about_skip_checks() {
             let env = Env::new();
             let _busy = Kill(busy_device(&env));
-            fail_first_check(&env, "dev/u1");
             let dir = env.dir("alpha");
             let out = env
                 .agent("sess-1", &dir)
@@ -5940,7 +6025,6 @@ mod cli {
                 fn names_the_units_and_their_check_message_and_the_recheck() {
                     let env = Env::new();
                     bench(&env);
-                    fail_first_check(&env, "otbr");
                     let shown = human_detached(&env, "acquire otbr --for 10m");
                     assert!(
                         shown.contains("Queued: position 1 on otbr · req_"),
@@ -5959,36 +6043,11 @@ mod cli {
                 fn json_carries_blocked_by() {
                     let env = Env::new();
                     bench(&env);
-                    fail_first_check(&env, "otbr");
                     let body = queue_on(&env, "otbr");
                     let blocked = &body["blocked_by"];
                     assert_eq!(blocked["kind"], "unhealthy", "{body}");
                     assert_eq!(blocked["units"][0]["unit"], "main", "{body}");
                     assert_eq!(blocked["units"][0]["message"], "connect failed", "{body}");
-                }
-            }
-
-            mod on_a_free_unit_with_no_fresh_check {
-                use super::*;
-
-                #[test]
-                fn says_it_is_being_checked() {
-                    let env = Env::new();
-                    bench(&env);
-                    let shown = human_detached(&env, "acquire otbr --for 10m");
-                    assert!(
-                        shown.contains("\n  main is free and being health-checked; "),
-                        "{shown}"
-                    );
-                }
-
-                #[test]
-                fn json_carries_blocked_by_checking() {
-                    let env = Env::new();
-                    bench(&env);
-                    let body = queue_on(&env, "otbr");
-                    assert_eq!(body["blocked_by"]["kind"], "checking", "{body}");
-                    assert_eq!(body["blocked_by"]["units"][0], "main", "{body}");
                 }
             }
 
@@ -6253,7 +6312,6 @@ mod cli {
                 fn colours_stderr_on_a_tty_when_stdout_is_not() {
                     let env = Env::new();
                     bench(&env);
-                    fail_first_check(&env, "otbr");
                     let shown = env.tty(&format!(
                         "{COLOURED} timeout 2 \"$CLERK\" acquire otbr --for 10m --wait \
                          < /dev/null > /dev/null"
@@ -6266,7 +6324,6 @@ mod cli {
                 fn does_not_colour_stderr_that_is_not_a_tty() {
                     let env = Env::new();
                     bench(&env);
-                    fail_first_check(&env, "otbr");
                     let err = env.home().join("err.txt");
                     let shown = env.tty(&format!(
                         "{COLOURED} timeout 2 \"$CLERK\" acquire otbr --for 10m --wait \

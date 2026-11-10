@@ -181,7 +181,10 @@ fn start_and_serve(
         tracing::info!(leases = graced, "restart grace applied");
     }
     let engine = Engine::spawn(store, clock, config, health).map_err(RunError::Start)?;
-    runtime.block_on(serve(listener, engine, info, signals, paths.stop_marker()))
+    let served = runtime.block_on(serve(listener, engine, info, signals, paths.stop_marker()));
+    // A custom check still running would outlive the daemon.
+    crate::health::stop_checks();
+    served
 }
 
 /// SIGTERM and SIGINT streams.

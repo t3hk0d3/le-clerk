@@ -11,10 +11,12 @@
 //! that group, and only while the paused lease is the group's sole live
 //! lease.
 //!
-//! Health checks that can block never run inside a transaction: scheduling
-//! reads a cached state and queues a check job for a unit with no fresh
-//! result (see `checks`). A request that needs such a unit stays queued
-//! until the result comes back. A healthy result stands for
+//! Health checks that can block (network and custom ones) never run inside
+//! a transaction: scheduling reads a cached state and queues a check job for
+//! a unit with no fresh result (see `checks`). A request that needs such a
+//! unit stays queued until the result comes back; the engine's callers wait
+//! for it first ([`Scheduler::acquire_unless_checking`]). Local checks run
+//! in place. A healthy result stands for
 //! [`checks::HEALTHY_TTL`], an unhealthy one for [`HEALTH_RECHECK_BACKOFF`].
 
 pub mod checks;
@@ -87,13 +89,16 @@ impl HealthProbe for HealthChecker {
         self.check_unit(spec, resource, unit, settings)
     }
 
-    /// A spec of only `none` checks has nothing to run; every other check
-    /// does I/O.
+    /// Network and custom checks can take up to the timeout; the local
+    /// builtins are a few syscalls and run in place.
     fn blocks(&self, spec: &HealthSpec) -> bool {
-        !spec
-            .checks
-            .iter()
-            .all(|c| matches!(c, Check::Builtin(BuiltinCheck::None)))
+        spec.checks.iter().any(|c| {
+            matches!(
+                c,
+                Check::Custom { .. }
+                    | Check::Builtin(BuiltinCheck::TcpConnect | BuiltinCheck::Http)
+            )
+        })
     }
 }
 
@@ -211,6 +216,10 @@ pub enum AcquireOutcome {
         /// The caller's paused lease, which gets the unit back.
         lease_id: LeaseId,
     },
+    /// Nothing was done: a check of a free target unit is on its way, so
+    /// ask again when it is back. Only
+    /// [`Scheduler::acquire_unless_checking`] answers this.
+    Checking,
 }
 
 /// What keeps a queued request from a unit when it is queued.
@@ -935,6 +944,34 @@ impl Scheduler {
         who: &Caller,
         req: AcquireRequest,
     ) -> Result<AcquireOutcome, SchedulerError> {
+        self.acquire_with(tx, who, &req, false)
+    }
+
+    /// [`Scheduler::acquire`], except that while no unit can be granted and
+    /// a check of a free target unit is on its way it changes nothing and
+    /// answers [`AcquireOutcome::Checking`]: asked again once the check is
+    /// back, it answers as if the check had run in place.
+    ///
+    /// # Errors
+    /// As [`Scheduler::acquire`].
+    // By value: as `acquire`.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn acquire_unless_checking(
+        &self,
+        tx: &Tx,
+        who: &Caller,
+        req: AcquireRequest,
+    ) -> Result<AcquireOutcome, SchedulerError> {
+        self.acquire_with(tx, who, &req, true)
+    }
+
+    fn acquire_with(
+        &self,
+        tx: &Tx,
+        who: &Caller,
+        req: &AcquireRequest,
+        defer_on_check: bool,
+    ) -> Result<AcquireOutcome, SchedulerError> {
         let (resource_id, unit_id) = match &req.target {
             Target::Resource(r) => (r, None),
             Target::Unit(r, u) => (r, Some(u)),
@@ -988,14 +1025,20 @@ impl Scheduler {
             Some(u) => vec![u],
             None => resource.units.iter().collect(),
         };
+        let mut checking = false;
         for unit in candidates {
             if unit.retiring || group_busy(tx, &group(tx, unit.row)?)? {
                 continue;
             }
-            if !req.skip_checks
-                && self.healthy(tx, &mut cache, &resource, unit)? != Verdict::Healthy
-            {
-                continue;
+            if !req.skip_checks {
+                match self.healthy(tx, &mut cache, &resource, unit)? {
+                    Verdict::Healthy => {}
+                    Verdict::Unhealthy => continue,
+                    Verdict::Checking => {
+                        checking = true;
+                        continue;
+                    }
+                }
             }
             let handed = self.hand_over(tx, &resource, unit, &ask, LeaseState::Held)?;
             audit::record(
@@ -1028,7 +1071,10 @@ impl Scheduler {
                 dirty: handed.dirty,
             }));
         }
-        self.queue_request(tx, who, &req, &resource, pinned, &ask)
+        if checking && defer_on_check {
+            return Ok(AcquireOutcome::Checking);
+        }
+        self.queue_request(tx, who, req, &resource, pinned, &ask)
     }
 
     /// Queue an acquire that found no free unit, then either override the

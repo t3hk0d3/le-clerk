@@ -167,6 +167,9 @@ pub enum AcquireView {
     },
     /// A paused holder's override of its own borrower: the unit comes back.
     Reclaiming { lease_id: LeaseId },
+    /// Between the engine and its handle only: ask again when the check of
+    /// a target unit is back. Never reaches a client.
+    Checking,
 }
 
 impl From<AcquireOutcome> for AcquireView {
@@ -185,6 +188,7 @@ impl From<AcquireOutcome> for AcquireView {
                 blocked_by,
             },
             AcquireOutcome::Reclaiming { lease_id } => Self::Reclaiming { lease_id },
+            AcquireOutcome::Checking => Self::Checking,
         }
     }
 }

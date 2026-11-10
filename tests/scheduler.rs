@@ -2048,6 +2048,90 @@ mod dispatch {
         }
     }
 
+    mod acquire_unless_checking {
+        use super::*;
+
+        impl Fixture {
+            fn try_ask(&mut self, r: AcquireRequest, who: &str) -> AcquireOutcome {
+                let who = caller(who);
+                let sched = &self.sched;
+                self.store
+                    .tx(|tx| sched.acquire_unless_checking(tx, &who, r))
+                    .unwrap()
+            }
+        }
+
+        fn any() -> AcquireRequest {
+            req(on("board"), MIN, Priority::Normal, "a")
+        }
+
+        mod on_a_check_on_its_way {
+            use super::*;
+
+            #[test]
+            fn answers_checking() {
+                let mut f = blocking();
+                assert_eq!(f.try_ask(any(), "a"), AcquireOutcome::Checking);
+            }
+
+            #[test]
+            fn queues_nothing() {
+                let mut f = blocking();
+                f.try_ask(any(), "a");
+                let jobs = f.jobs();
+                f.finish(jobs);
+                assert_eq!(f.count(&holder("a"), NoticeKind::Offered), 0);
+            }
+
+            #[test]
+            fn displaces_no_lease_on_an_override() {
+                let mut f = fixture();
+                f.seed("board", &["u1", "u2"]);
+                f.grant(
+                    &caller("h"),
+                    req(on_unit("board", "u1"), MIN, Priority::Normal, "h"),
+                );
+                f.probe.blocking.store(true, Ordering::SeqCst);
+                let mut r = any();
+                r.override_reason = Some("mine".into());
+                assert_eq!(f.try_ask(r, "a"), AcquireOutcome::Checking);
+                assert_eq!(f.count(&holder("h"), NoticeKind::Overridden), 0);
+            }
+        }
+
+        mod once_the_check_passed {
+            use super::*;
+
+            #[test]
+            fn answers_granted() {
+                let mut f = blocking();
+                f.try_ask(any(), "a");
+                let jobs = f.jobs();
+                f.finish(jobs);
+                let out = f.try_ask(any(), "a");
+                assert!(matches!(out, AcquireOutcome::Granted(_)), "{out:?}");
+            }
+        }
+
+        mod once_the_check_failed {
+            use super::*;
+
+            #[test]
+            fn answers_queued_with_blocked_by_unhealthy() {
+                let mut f = blocking();
+                f.probe.fail("u1");
+                f.try_ask(any(), "a");
+                let jobs = f.jobs();
+                f.finish(jobs);
+                let out = f.try_ask(any(), "a");
+                assert!(
+                    matches!(blocked_by(&out), BlockedBy::Unhealthy { .. }),
+                    "{out:?}"
+                );
+            }
+        }
+    }
+
     mod on_a_result_for_a_forgotten_check {
         use super::*;
 

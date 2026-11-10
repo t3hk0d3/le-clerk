@@ -245,6 +245,22 @@ impl HealthProbe for Hanging {
 
 const FAST: Duration = Duration::from_secs(1);
 
+/// An engine with a `health_timeout` of 1 s whose checks hang.
+fn hanging_engine(held: mpsc::Receiver<()>) -> EngineHandle {
+    Engine::spawn(
+        Store::open_in_memory().unwrap(),
+        Arc::new(ManualClock::new(T0)),
+        Config {
+            health_timeout: 1,
+            ..Config::default()
+        },
+        Arc::new(Hanging {
+            release: Mutex::new(held),
+        }),
+    )
+    .unwrap()
+}
+
 mod engine {
     use super::*;
 
@@ -282,31 +298,13 @@ mod engine {
                 .unwrap();
             assert_eq!(second, AgentWait::Armed);
         }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn the_acquire_answers_queued_with_blocked_by_checking() {
-            let dir = tempfile::tempdir().unwrap();
-            let marker = dir.path().join("started");
-            let h = slow_check(&marker).await;
-            let started = Instant::now();
-            let out = ok(
-                &h,
-                "acquire",
-                &user("a"),
-                json!({"target": {"resource": "slow"}, "duration_ms": 60_000, "purpose": "t"}),
-            )
-            .await;
-            assert!(started.elapsed() < FAST, "took {:?}", started.elapsed());
-            assert_eq!(out["outcome"], "queued", "{out}");
-            assert_eq!(out["blocked_by"]["kind"], "checking", "{out}");
-        }
     }
 
-    mod on_a_check_that_passes {
+    mod acquire_during_a_check {
         use super::*;
 
-        /// Every check passes, off the engine thread.
-        struct OffThread;
+        /// Checks run off the engine thread and answer `result` at once.
+        struct OffThread(HealthResult);
 
         impl HealthProbe for OffThread {
             fn check(
@@ -316,7 +314,7 @@ mod engine {
                 _unit: &UnitId,
                 _settings: &UnitSettings,
             ) -> HealthResult {
-                HealthResult::Healthy
+                self.0.clone()
             }
 
             fn blocks(&self, _spec: &HealthSpec) -> bool {
@@ -324,24 +322,82 @@ mod engine {
             }
         }
 
-        #[tokio::test(flavor = "multi_thread")]
-        async fn the_queued_request_gets_an_offer() {
-            let h = Engine::spawn(
+        fn engine_with(result: HealthResult) -> EngineHandle {
+            Engine::spawn(
                 Store::open_in_memory().unwrap(),
                 Arc::new(ManualClock::new(T0)),
                 Config::default(),
-                Arc::new(OffThread),
+                Arc::new(OffThread(result)),
             )
-            .unwrap();
-            seed_board(&h, &["u1"]).await;
-            let who = user("a");
-            let out = acquire(&h, &who, 60_000).await;
-            assert_eq!(out["outcome"], "queued", "{out}");
-            let notices = h.wait_notices(who.holder.clone(), PATIENCE).await.unwrap();
-            assert!(
-                kinds(&notices).contains(&NoticeKind::Offered),
-                "{notices:?}"
-            );
+            .unwrap()
+        }
+
+        mod on_a_check_that_passes {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn answers_granted() {
+                let h = engine_with(HealthResult::Healthy);
+                seed_board(&h, &["u1"]).await;
+                let out = acquire(&h, &user("a"), 60_000).await;
+                assert_eq!(out["outcome"], "granted", "{out}");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn leaves_no_notice_pending() {
+                let h = engine_with(HealthResult::Healthy);
+                seed_board(&h, &["u1"]).await;
+                let who = user("a");
+                acquire(&h, &who, 60_000).await;
+                assert_eq!(h.pending_notices(who.holder).await.unwrap(), vec![]);
+            }
+        }
+
+        mod on_a_check_that_fails {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn answers_queued_with_blocked_by_unhealthy() {
+                let h = engine_with(HealthResult::Unhealthy("no".into()));
+                seed_board(&h, &["u1"]).await;
+                let out = acquire(&h, &user("a"), 60_000).await;
+                assert_eq!(out["outcome"], "queued", "{out}");
+                assert_eq!(out["blocked_by"]["kind"], "unhealthy", "{out}");
+            }
+        }
+
+        mod on_a_check_that_outlasts_the_wait {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn answers_queued_with_blocked_by_checking_after_timeout_plus_2_s() {
+                let (_release, held) = mpsc::channel();
+                let h = hanging_engine(held);
+                let admin = user("admin");
+                // Four checks: the pool gives them 4 s, the acquire waits 3 s.
+                let checks: Vec<Value> = (0..4).map(|_| json!({"custom": "x"})).collect();
+                ok(
+                    &h,
+                    "create_resource",
+                    &admin,
+                    json!({"id": "board", "type": "generic", "scope": "user", "health": checks}),
+                )
+                .await;
+                ok(
+                    &h,
+                    "add_unit",
+                    &admin,
+                    json!({"resource": "board", "id": "u1",
+                           "settings": {"type": "generic", "identity_key": "k"}}),
+                )
+                .await;
+                let started = Instant::now();
+                let out = acquire(&h, &user("a"), 60_000).await;
+                let took = started.elapsed();
+                assert_eq!(out["blocked_by"]["kind"], "checking", "{out}");
+                assert!(took >= Duration::from_secs(3), "took {took:?}");
+                assert!(took < Duration::from_secs(4), "took {took:?}");
+            }
         }
     }
 
@@ -351,59 +407,30 @@ mod engine {
         #[tokio::test(flavor = "multi_thread")]
         async fn other_engine_jobs_complete_within_1_s_meanwhile() {
             let (_release, held) = mpsc::channel();
-            let config = Config {
-                health_timeout: 1,
-                ..Config::default()
-            };
-            let h = Engine::spawn(
-                Store::open_in_memory().unwrap(),
-                Arc::new(ManualClock::new(T0)),
-                config,
-                Arc::new(Hanging {
-                    release: Mutex::new(held),
-                }),
-            )
-            .unwrap();
+            let h = hanging_engine(held);
             seed_board(&h, &["u1"]).await;
             let who = user("a");
-            let out = acquire(&h, &who, 60_000).await;
-            assert_eq!(out["blocked_by"]["kind"], "checking", "{out}");
+            let engine = h.clone();
+            let caller = who.clone();
+            let waiting = tokio::spawn(async move { acquire(&engine, &caller, 60_000).await });
+            until_parked(&h, &who.holder).await;
+            assert!(!waiting.is_finished());
             let started = Instant::now();
             ok(&h, "status", &who, json!({})).await;
             assert!(started.elapsed() < FAST, "took {:?}", started.elapsed());
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn the_unit_reads_unhealthy_timed_out() {
+        async fn the_acquire_answers_unhealthy_timed_out() {
             let (_release, held) = mpsc::channel();
-            let config = Config {
-                health_timeout: 1,
-                ..Config::default()
-            };
-            let h = Engine::spawn(
-                Store::open_in_memory().unwrap(),
-                Arc::new(ManualClock::new(T0)),
-                config,
-                Arc::new(Hanging {
-                    release: Mutex::new(held),
-                }),
-            )
-            .unwrap();
+            let h = hanging_engine(held);
             seed_board(&h, &["u1"]).await;
-            let who = user("a");
-            acquire(&h, &who, 60_000).await;
-            tokio::time::timeout(PATIENCE, async {
-                loop {
-                    let status = ok(&h, "status", &who, json!({})).await;
-                    let health = status["resources"][0]["units"][0]["last_health"].clone();
-                    if health == "unhealthy: timed out" {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("the check never reported");
+            let out = acquire(&h, &user("a"), 60_000).await;
+            assert_eq!(out["blocked_by"]["kind"], "unhealthy", "{out}");
+            assert_eq!(
+                out["blocked_by"]["units"][0]["message"], "timed out",
+                "{out}"
+            );
         }
     }
 

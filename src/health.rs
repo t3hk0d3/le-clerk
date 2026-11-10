@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError, mpsc};
+use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,60 @@ pub fn runtime() -> io::Result<Handle> {
 #[must_use]
 pub fn runtimes_built() -> usize {
     RUNTIMES_BUILT.load(Ordering::Relaxed)
+}
+
+/// The custom commands running now, by process group.
+static RUNNING: Mutex<Running> = Mutex::new(Running {
+    groups: Vec::new(),
+    stopped: false,
+});
+
+struct Running {
+    groups: Vec<libc::pid_t>,
+    /// Set by [`stop_checks`]: no command starts any more.
+    stopped: bool,
+}
+
+fn running() -> MutexGuard<'static, Running> {
+    // A list of ids and a flag; a panic leaves nothing to repair.
+    RUNNING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The process is going away: kill the process group of every custom
+/// command still running, and start no more.
+pub fn stop_checks() {
+    let mut running = running();
+    running.stopped = true;
+    for group in &running.groups {
+        // SAFETY: `kill` has no memory-safety preconditions. The negative
+        // pid addresses a group created via `process_group(0)`, listed
+        // only until its command has been waited for.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    }
+}
+
+/// A custom command's place in [`RUNNING`], until dropped.
+struct Tracked(libc::pid_t);
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        running().groups.retain(|g| *g != self.0);
+    }
+}
+
+/// Spawn `cmd` (in its own process group) and list it in [`RUNNING`], under
+/// one lock, so that [`stop_checks`] misses no command.
+fn spawn_tracked(cmd: &mut Command) -> io::Result<(Child, Tracked)> {
+    let mut running = running();
+    if running.stopped {
+        return Err(io::Error::other("the daemon is stopping"));
+    }
+    let child = cmd.spawn()?;
+    let group = libc::pid_t::try_from(child.id()).map_err(io::Error::other)?;
+    running.groups.push(group);
+    Ok((child, Tracked(group)))
 }
 
 /// Outcome of a health check run.
@@ -210,8 +264,8 @@ impl HealthChecker {
             cmd.env("CLERK_RESOURCE", ids.resource.as_str())
                 .env("CLERK_UNIT", ids.unit.as_str());
         }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+        let (mut child, _tracked) = match spawn_tracked(&mut cmd) {
+            Ok(spawned) => spawned,
             Err(e) => return unhealthy(format!("cannot run command: {e}")),
         };
         let stderr_rx = capture_stderr(&mut child);

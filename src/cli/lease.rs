@@ -1119,6 +1119,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_unit_being_checked_reads_as_free_and_being_checked() {
+        let style = Style {
+            color: false,
+            unicode: false,
+        };
+        let shown = blocked_text(&json!({"kind": "checking", "units": ["main"]}), style).unwrap();
+        assert!(
+            shown.starts_with("main is free and being health-checked; "),
+            "{shown}"
+        );
+    }
+
+    #[test]
     fn targets_are_a_resource_or_a_unit() {
         assert_eq!(target_arg("b").unwrap(), json!({"resource": "b"}));
         assert_eq!(
