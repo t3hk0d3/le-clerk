@@ -2,116 +2,115 @@
 
 *"Un moment, s'il vous plaît… your esp32 is being prepared."*
 
-Le Clerk (`clerk`) is a local broker that hands out shared resources to AI
-coding agents one holder at a time: dev boards and serial ports, network
-ports, services, API tokens, licence seats. Agents lease what they need
-instead of messaging each other "is board X free?", and identical units are
-all used before anyone queues.
+Le Clerk (`clerk`) gives each of your coding agents its own turn with the
+things they share: dev boards, serial ports, network ports, test services,
+API tokens.
 
-It is built for [Claude Code](https://code.claude.com): agents use the
-`clerk` command from their Bash tool, guided by one skill and a few hooks
-that ship as a Claude Code plugin. People and scripts use the same CLI.
+## The problem
 
-> Status: early and local. One machine, one OS user, Linux first (macOS
-> should work). Built and used daily, but expect rough edges.
+Run a few Claude Code sessions on one machine and they start tripping over
+each other. Two agents flash the same board at once. One agent asks another
+"are you done with /dev/ttyACM0?" and waits for an answer that never comes.
+Three identical boards sit on the hub while every agent queues for the
+first one it found. A session crashes and the board it held stays "taken"
+in everyone's notes.
 
-## What it does
+Le Clerk replaces the chat with a lease. An agent asks for "a C6 board for
+20 minutes", gets a specific free one with instructions on how to use it,
+or a place in the queue, and is told when its turn comes. When it is done,
+or dies, the board goes to whoever is next.
 
-- **Inventory:** a *resource* (`c6-boards`) has interchangeable *units*
-  (`c6-a`, `c6-b`). Three types: `device` (a path such as
-  `/dev/serial/by-id/…`), `service` (host and port, connect or listen) and
-  `generic` (anything named by a key). Resources carry a description, tags
-  and Markdown usage instructions with `{unit.*}` placeholders, handed to
-  the holder on grant. Duplicates are detected per type, so the same board
-  registered twice is never leased twice.
-- **Scopes:** user scope (shared by every project, the place for hardware)
-  and project scope (invisible to other projects).
-- **Leasing:** ask for any free unit or a specific one, with an honest
-  duration and a purpose others can read. Free healthy units are granted at
-  once; otherwise you queue, with your position and an estimated turn.
-  Leases warn before they expire, can be extended, and go through a cleanup
-  window on hand-back; unconfirmed cleanup is reported to the next holder.
-- **Cooperation:** interruptible leases let urgent short work borrow a unit
-  and give it back; a user-directed `--override` takes a unit anyway; health
-  checks run before every grant (e.g. "the serial port is not open").
-- **Agents stay reachable:** notices (your turn, expiry soon, please yield,
-  your unit is back) reach an idle agent through Claude Code's Monitor tool
-  on `clerk wait --follow`. A dead Claude Code frees its leases after a
-  short grace; `/clear` releases them at once; `--continue` keeps them.
-- **Audit log** of every inventory change, grant, hand-over and override.
+## What it feels like
+
+You register your boards once (or ask an agent to: "register the boards on
+my hub"). After that, an agent that needs one just leases it:
+
+```text
+$ clerk acquire c6-boards --for 20m --purpose "flash and test the OTA path"
+(what the agent reads, abridged)
+
+## Granted: c6-boards/c6-b
+- ends_at: 2026-11-10 14:52 (in 20m)
+- lease_id: lse_01M72…
+- settings:
+  - path: /dev/serial/by-id/usb-Espressif_…_CC-if00
+
+### usage
+Flash with `idf.py -p /dev/serial/by-id/…_CC-if00 flash`.
+Hold BOOT while plugging in if the port does not appear.
+Clean = erase flash and close the monitor.
+
+Next: Use the unit, then `clerk release lse_01M72…` when you are done.
+```
+
+If every board is busy, it gets its place in the queue instead and arms a
+wait. When the board comes back, the clerk wakes the idle session, hands it
+the board, and the agent carries on. No polling, no messages between agents.
+
+## Highlights
+
+- **One command to a working unit.** Interchangeable units are pooled, so
+  every free board is used before anyone queues. The grant carries the
+  unit's path or address, its description, and your own usage notes, with
+  `{unit.path}`-style placeholders filled in.
+- **Agents are woken, not polled.** Notices (your turn, expiry soon, please
+  yield, your board is back) reach an idle Claude Code session through its
+  Monitor tool. Nothing for the agent to remember to check.
+- **Crashes don't leak boards.** A lease lives as long as the Claude Code
+  process holding it. Kill the session and the board is free a minute
+  later; `claude --continue` within that minute keeps it; `/clear` releases
+  it at once.
+- **The same thing is never leased twice.** Duplicate registrations of one
+  physical board (by canonical path, device number and USB identity, even
+  across projects) are detected and linked, so a lease on either blocks the other.
+- **Fair, polite sharing.** Honest durations, warnings before expiry,
+  extension, a cleanup step on every hand-back, and a "dirty" flag passed to
+  the next holder when cleanup wasn't confirmed. Long, pausable work can be
+  marked interruptible so an urgent short job can borrow the board and give
+  it back. And when you say so, an agent can take a board anyway, with the
+  reason in the audit log.
+- **Health checks before every grant.** "The device exists and nobody has
+  the port open", "something listens on this port", or your own script. A
+  board stuck in a bootloader is skipped, not handed out.
+- **Works for people and scripts too.** `clerk run c6-boards --for 15m --
+  ./flash.sh` holds a board exactly as long as the command runs; `clerk
+  acquire` on a terminal shows a live view; `clerk status` shows who holds
+  what and who waits.
+
+## How it fits together
+
+One `clerk` binary is everything: it starts a small local daemon on first
+use (a Unix socket in your runtime directory, SQLite for state), and talks
+to it from the CLI. The Claude Code plugin adds one skill that teaches
+agents the lease loop and four hooks that keep them informed. There is no
+server to run, no account, and no network access.
 
 ## Install
 
-Needs Rust (stable) and, for agents, Claude Code 2.1.214 or later.
-
 ```sh
 cargo build --release
-install -m 755 target/release/clerk ~/.local/bin/clerk   # anywhere on PATH
-clerk --version
-```
+install -m 755 target/release/clerk ~/.local/bin/clerk
 
-The first `clerk` command starts the daemon. After upgrading `clerk`, run
-`clerk daemon restart`; leases and queues survive it.
-
-### Claude Code plugin
-
-The repository is also a Claude Code plugin marketplace:
-
-```sh
 claude plugin marketplace add t3hk0d3/le-clerk
 claude plugin install leclerk@leclerk --scope user
 ```
 
-(For development, add your checkout instead: `claude plugin marketplace add
-/path/to/le-clerk`; Claude Code then reads the plugin in place.)
+Then restart Claude Code. Agents need Claude Code 2.1.214 or later.
 
-Restart Claude Code. The plugin adds the `clerk` skill and four hooks. Optional:
-add `"Bash(clerk:*)"` and `"Monitor"` to `permissions.allow` to skip
-permission prompts. Details, what the hooks do and a manual checklist are in
-[docs/claude-code.md](docs/claude-code.md).
+## Documentation
 
-## Quick start
+- [Concepts](docs/concepts.md): resources and units, scopes, the lease
+  lifecycle, health checks, duplicates, notices.
+- [CLI reference](docs/cli.md): every command, output formats, exit codes,
+  files and configuration.
+- [Claude Code](docs/claude-code.md): installing the plugin, what the hooks
+  do, how sessions map to leases, and a manual test checklist.
+- [Output format](docs/cli-output.md): what people and agents see.
 
-Register two boards (user scope, since hardware is shared by every project):
+## Status
 
-```sh
-clerk resource create c6-boards --type device --scope user \
-  --description "ESP32-C6 dev boards on the USB hub" --tag esp32c6 \
-  --usage 'Flash with `idf.py -p {unit.path} flash`. Clean = erase flash.'
-clerk unit add c6-boards c6-a --path /dev/serial/by-id/usb-Espressif_…-if00
-clerk unit add c6-boards c6-b --path /dev/serial/by-id/usb-Espressif_…-if00
-```
-
-Use one from a script, held exactly as long as the command runs:
-
-```sh
-clerk run c6-boards --for 15m -- sh -c 'idf.py -p "$CLERK_UNIT_PATH" flash'
-```
-
-Or hold one from a terminal (Ctrl+C releases, Ctrl+] detaches):
-
-```sh
-clerk acquire c6-boards --for 1h --purpose "manual testing"
-```
-
-See what is going on:
-
-```sh
-clerk status        # units, holders, queues, health, dirty flags
-clerk leases        # live leases
-clerk log           # the audit log
-```
-
-Agents in Claude Code need nothing more: ask one to "flash the firmware on
-a C6 board" and the `clerk` skill has it find, lease, wait for and release
-a board. Ask "register the boards on my hub" and it registers them.
-
-## Output
-
-On a terminal, people get block lists and colour ([docs/cli-output.md](docs/cli-output.md)).
-Scripts get JSON (`--json`, or any non-terminal stdout). Agent sessions get
-labelled Markdown that ends with a `Next:` line; `CLERK_AGENT_FORMAT=json`
-switches agents back to JSON.
+Early, and local by design: one machine, one OS user. Linux first; macOS
+should work. Used daily on a bench of ESP32 boards, but expect rough edges.
 
 ## Development
 
@@ -121,9 +120,8 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Conventions are in [STYLEGUIDE.md](STYLEGUIDE.md). `CLERK_HOME` points every
-clerk path (socket, database, config) at one directory, which keeps tests
-and experiments away from your real state.
+Conventions are in [STYLEGUIDE.md](STYLEGUIDE.md). Set `CLERK_HOME` to a
+scratch directory to keep experiments away from your real state.
 
 ## License
 
