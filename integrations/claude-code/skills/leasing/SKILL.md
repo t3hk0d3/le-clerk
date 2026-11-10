@@ -6,8 +6,10 @@ description: Lease shared resources through the clerk before using them. Use whe
 # Leasing shared resources
 
 The clerk hands out shared things (boards, ports, services, tokens) one holder
-at a time. Its tools tell you the next step in every result; follow them. This
-skill is the etiquette around them.
+at a time. Every clerk result names the next step the clerk expects: in its
+`next` field, or, for an error, as the error text's last sentence. Follow it.
+A result's `summary` says in words what happened, including things to tell
+the user. This skill is the etiquette around them.
 
 **Never coordinate resources by messaging other agents.** No "are you done
 with the board?" messages, no claiming in chat or files. The clerk is the only
@@ -49,21 +51,33 @@ you call it matters:
 - **Interactive session:** call it right after a grant or a queued result. It
   runs as a background task, so you keep working, and its result reaches you
   when a notice arrives. Call it again after each result.
-- **Where it blocks** (subagents, headless `claude -p`): do the work first.
-  Call `lease_wait` when you are about to idle or end your turn while you still
-  hold or wait for something. If you are queued with nothing else to do, call
-  it at once: waiting is the work. Mid-turn notices reach you through context
-  added before your tool calls.
+- **Subagents:** `lease_wait` blocks there. Do the work first; call
+  `lease_wait` when you are about to idle while you still hold or wait for
+  something. If you are queued with nothing else to do, call it at once:
+  waiting is the work. Notices are **not** added to a subagent's context
+  before its tool calls, so a subagent hears of them only through
+  `lease_wait`; keep leases short there.
+- **Headless `claude -p`:** the run ends when you finish, so do not leave
+  anything behind: use `lease_wait` only while you are queued (to get your
+  offer), and before you finish, `lease_release` and `lease_confirm` every
+  lease you hold (`lease_status` lists them). Mid-turn notices reach you
+  through context added before your tool calls.
 
 Either way:
 
 - It returns a batch of notices: offers (already claimed for you, with the
   grant), expiry warnings, yield requests, cleanup reminders, "your unit is
-  back". Handle each, then call `lease_wait` again with `ack` set to that
-  result's notice ids. Unacknowledged notices come back on the next call.
+  back". Handle each, then call `lease_wait` again with `ack` set to the
+  result's `ack` field (the ids of exactly the notices it returned).
+  Unacknowledged notices come back on the next call.
+- A `lease_acquire` that queued may finish later with the grant; its result
+  has an `ack` field too. Pass it to your next `lease_wait`.
 - An empty batch after a long quiet wait is normal: call it again.
-- Notices may also appear in your context before a tool call. Act on them;
-  they stay pending until a `lease_wait` acknowledges them.
+- In the main agent, notices may also appear in your context before a tool
+  call. Act on them; they stay pending until a `lease_wait` acknowledges
+  them.
+- Use the clerk's MCP tools, not `clerk wait` from the shell: it refuses to
+  run in an agent session, because `lease_wait` owns your notices.
 - If you end a turn holding or queued without a wait running, a Stop hook
   reminds you. Arm `lease_wait` before then.
 - `lease_status` shows what you hold, your queue positions and pending
@@ -117,9 +131,10 @@ lease_acquire {"target": {"resource": "c6-boards"}, "for": "30m",
   -> granted unit c6-a, /dev/serial/by-id/usb-Espressif_..., usage: flash with
      `idf.py -p /dev/serial/by-id/... flash`; clean = erase flash
 lease_wait {}                      # interactive: runs as a background task
-... work; lease_wait returns an expiry warning notice n1 ...
+... work; lease_wait returns an expiry warning, with "ack": ["n1"] and
+    "next": "Call lease_wait again with ack=[\"n1\"] ..." ...
 lease_extend {"lease_id": "<id>", "for": "15m"}
-lease_wait {"ack": ["n1"]}         # re-arm, acknowledging n1
+lease_wait {"ack": ["n1"]}         # re-arm with the result's ack
 ... done ...
 lease_release {"lease_id": "<id>"}; erase flash as the usage says
 lease_confirm {"lease_id": "<id>"}

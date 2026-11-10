@@ -88,6 +88,11 @@ Conventional Commits). Builds use
   block whose last sentence is the next step the clerk expects (e.g. "Call
   lease_confirm when the unit is clean."). Errors are MCP tool errors carrying
   the engine's `code`, `message` and `details`.
+  - Final-review amendment: Claude Code shows the model only the structured
+    content, so every result, task result and tool error also carries
+    `next` (the text's last sentence) and `summary` (its other lines) there;
+    `lease_wait` results and completed `lease_acquire` task results carry
+    `ack` (the notice ids to pass to the next `lease_wait`).
 - **Waiting:**
   - `lease_wait` returns one batch of the session's notices. With none
     pending it blocks, sending a progress notification every 30 s, for at most
@@ -99,7 +104,8 @@ Conventional Commits). Builds use
     result); only acknowledged notices are marked delivered. Notices returned
     but not acknowledged are returned again by the next `lease_wait`.
     Notice ids in a result are listed in the text block as well as the
-    structured content.
+    structured content (its `notices` and its `ack`). An `ack` entry that is
+    not a notice id is ignored and reported in the `summary`.
   - An `offered` notice delivered by `lease_wait` (or by a completed
     `lease_acquire` task) is claimed in the same call; the result carries the
     grant brief.
@@ -195,6 +201,9 @@ mcp::server (daemon /mcp)
             - returns a tool error carrying code, message and details
         On success
             - returns structured content plus a text block ending in the next step
+        On any result (every tool, a tool error, a task result)
+            - structured content carries next equal to the text's last sentence
+            - structured content carries summary: the text's other lines
 
 mcp::tools inventory (type_list, resource_*, unit_*)
     resource_create
@@ -212,6 +221,7 @@ mcp::tools inventory (type_list, resource_*, unit_*)
     unit_add
         On a similar unit in another project
             - result carries the similar_in_other_project warning and says to tell the user
+            - its structured summary says to tell the user (clerk approve)
     unit_add / unit_update
         On an unknown key inside settings
             - returns a tool error; nothing changes
@@ -232,6 +242,11 @@ mcp::tools leasing
             - marks exactly those delivered; they are not returned again
         On a previous result never acknowledged
             - returns its notices again
+        On any result
+            - structured ack lists exactly its notice ids
+        On a malformed ack id
+            - ignores it and acknowledges the valid ones
+            - reports it in the summary
         On an offered notice
             - claims it in the same call and returns the grant brief
         On none pending
@@ -248,6 +263,9 @@ mcp::tools leasing
         On a request whose client capabilities declare io.modelcontextprotocol/tasks
             - lease_acquire on a held pool returns a task handle at once with pollIntervalMs 5000; the task completes with the grant
             - an open task counts as an open wait (session_brief)
+        On a lease_acquire task completed by an offer
+            - structured ack names the offered notice
+            - passing that ack to lease_wait returns no second grant
         On a request without the capability
             - behaves exactly as the blocking path
 
@@ -267,6 +285,18 @@ proxy (clerk mcp)
         - reconnects the liveness stream and keeps relaying
     On the daemon not running
         - starts it (ensure_running), as every clerk invocation does
+    On a daemon of another version or protocol (an older build still running)
+        - answers each request with an error naming `clerk daemon restart`
+        - relays nothing to it
+        - opens no liveness stream while it stays
+        - opens the liveness stream and relays once it changes
+
+client (every clerk client: CLI, proxy, hooks)
+    connect
+        On a daemon of the same version without protocol 3
+            - returns protocol_mismatch (code version_mismatch) naming `clerk daemon restart`
+    GET /v1/version
+        - reports version, protocol 3 and pid
 
 scheduler::session
     connect(session, connection)
@@ -292,6 +322,41 @@ scheduler::session
             - returns it
         On none
             - returns session_id
+    transact(store, f) (alias, start_resume, end_now, expiry, boot, hooks)
+        On the transaction failing after an alias
+            - the resumed id still resolves to itself; its grace stands; a later alias still takes it over
+        On the transaction committing
+            - keeps the changes
+
+engine
+    any command of an aliased agent session (CLI from Bash after --continue, RPC, MCP)
+        - acts on the live session's leases
+        - a new lease is held by the live session
+        - reads the live session's notices
+
+cli (agent sessions, CLAUDE_CODE_SESSION_ID set)
+    acquire --wait / attach
+        On an offer the session already claimed (e.g. through lease_wait)
+            - exits 0 and prints the held lease
+    wait
+        - exits 2 naming the MCP lease_wait tool; takes no notice
+    any command
+        On git failing inside a git checkout
+            - exits 1 with git_failed
+        On git missing outside any git checkout
+            - uses the working directory as the project
+
+scope::ProjectResolver
+    resolve
+        On git failing (missing or erroring) inside a git repo
+            - returns ScopeError::Git (code git_failed)
+        On git failing outside any git repo
+            - returns the canonical cwd
+mcp::ProjectCache
+    On git failing for a directory never resolved
+        - refuses the request naming git
+    On git failing for a directory resolved before
+        - keeps its last project
 
 cli::hook
     any hook
@@ -301,6 +366,8 @@ cli::hook
     session-start
         On source resume
             - aliases the proxy's start-up id to the resumed id
+        On source resume with the daemon not answering yet (the proxy starting it)
+            - retries the connection within its budget, never starting a daemon, then aliases
         On any other source
             - outputs nothing; changes nothing
     stop
