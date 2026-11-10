@@ -312,7 +312,9 @@ pub enum SchedulerError {
         waiting_purpose: Option<String>,
     },
     /// An extension must move the end later than it is now.
-    #[error("an extension must end later than the lease does now ({ends_at})")]
+    #[error(
+        "an extension must end later than the lease does now (its current end is in the details)"
+    )]
     ExtendNotLater {
         /// The lease's current end, unix milliseconds.
         ends_at: i64,
@@ -368,6 +370,7 @@ impl ErrorCode for SchedulerError {
                 Some(json!({ "waiting_purpose": waiting_purpose }))
             }
             SchedulerError::BorrowerNotOverrun { due_at } => Some(json!({ "due_at": due_at })),
+            SchedulerError::ExtendNotLater { ends_at } => Some(json!({ "ends_at": ends_at })),
             _ => None,
         }
     }
