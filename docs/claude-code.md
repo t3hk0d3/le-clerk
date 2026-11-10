@@ -151,7 +151,7 @@ the JSON instead (with `summary` and `next`). The format is described in
 
 These checks drive real Claude Code sessions; they are not in CI. Run them in
 isolation so they never touch your real clerk state or Claude Code settings.
-The helper scripts are in `docs/superpowers/spikes/2026-11-10-p3/task7/`
+The helper scripts are in `scripts/e2e/`
 (`T7` below). They take every path from the environment (`env.sh` lists the
 variables and their defaults):
 
@@ -171,7 +171,7 @@ Set-up, once, in the shell you run the checks from:
 
 ```sh
 cargo build --release
-export LECLERK_REPO=$PWD T7=$PWD/docs/superpowers/spikes/2026-11-10-p3/task7
+export LECLERK_REPO=$PWD T7=$PWD/scripts/e2e
 export CLERK_BIN_DIR=${CARGO_TARGET_DIR:-$PWD/target}/release
 export CLERK_HOME=/tmp/clerk-t7          # short: the socket path must stay under 107 bytes
 export T7_SCRATCH=/tmp/clerk-t7-scratch T7_TMUX=t7
@@ -229,6 +229,7 @@ Afterwards: exit the sessions, `$T7/clerk-user.sh daemon stop`,
 
 ### Results
 
-See the spec, Appendix C (CLI-only interface, 2026-11-10) for the latest
-run. Left for you: installing into your real Claude Code setup, real
-hardware, and the desktop app and VS Code.
+Last run 2026-11-10 (Claude Code 2.1.321, Haiku, isolated): items 1, 3, 4,
+5 and 6 passed. Items 2 (an idle session woken by an expiry warning) and 7
+(plugin load) were not re-run since the agent interface moved to the CLI.
+Not covered: the desktop app, VS Code and real hardware.

@@ -1,6 +1,0 @@
-2026-11-10T04:54:46.426Z [DEBUG] MCP server "plugin:leclerk:clerk": Starting connection with timeout of 30000ms
-2026-11-10T04:54:46.514Z [DEBUG] MCP server "plugin:leclerk:clerk": Successfully connected (transport: stdio) in 98ms
-2026-11-10T04:54:46.515Z [DEBUG] MCP server "plugin:leclerk:clerk": no auto-opened subscriptions/listen on a modern connection; running the listen open through the reopen machinery (no-op if the server advertises no listChanged capability)
-2026-11-10T04:54:46.515Z [DEBUG] MCP server "plugin:leclerk:clerk": Connection established with capabilities: {"hasTools":true,"hasPrompts":false,"hasResources":false,"hasResourceSubscribe":false,"serverVersion":{"name":"clerk","version":"0.1.0"},"pr
-2026-11-10T04:54:46.578Z [DEBUG] MCP server "plugin:leclerk:clerk": Channel notifications skipped: server did not declare claude/channel capability
-2026-11-10T04:54:46.579Z [DEBUG] Hooks: SessionStart:resume [clerk hook session-start] (plugin leclerk@inline) finished with status 0 (380ms)

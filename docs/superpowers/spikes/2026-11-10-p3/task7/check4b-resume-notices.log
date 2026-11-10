@@ -1,3 +1,0 @@
-[{"occupancy":{"ends_at":1794286792507,"holder":{"kind":"agent_session","session_id":"55555555-5555-4555-8555-555555555555"},"kind":"held","lease_id":"lse_01M71X1W0VCZ5VX8J1HW2F9DPK","purpose":"check 4b: notices after resume","resource":"c6-boards","state":"held","unit":"c6-a"},"resource":"c6-boards","scope":"user","unit":"c6-a"}]
-kill -9 claude 1895674 at 04:57:02.578
-start --resume 5555 at 04:57:03.580

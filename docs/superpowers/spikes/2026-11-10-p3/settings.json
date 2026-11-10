@@ -1,7 +1,0 @@
-{"hooks":{
- "SessionStart":[{"hooks":[{"type":"command","command":"/home/tehkode/dev/leclerk/docs/superpowers/spikes/2026-11-10-p3/hook-log.sh SessionStart"}]}],
- "PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/home/tehkode/dev/leclerk/docs/superpowers/spikes/2026-11-10-p3/hook-log.sh PreToolUse"}]}],
- "Stop":[{"hooks":[{"type":"command","command":"/home/tehkode/dev/leclerk/docs/superpowers/spikes/2026-11-10-p3/hook-log.sh Stop"}]}],
- "SubagentStop":[{"hooks":[{"type":"command","command":"/home/tehkode/dev/leclerk/docs/superpowers/spikes/2026-11-10-p3/hook-log.sh SubagentStop"}]}],
- "SessionEnd":[{"hooks":[{"type":"command","command":"/home/tehkode/dev/leclerk/docs/superpowers/spikes/2026-11-10-p3/hook-log.sh SessionEnd"}]}]
-}}

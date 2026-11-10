@@ -1,4 +1,4 @@
-# Sourced by the Task 7 helpers: where things are. Every path can be set from
+# Sourced by the end-to-end helpers: where things are. Every path can be set from
 # the environment; the defaults need no particular user or machine.
 #   LECLERK_REPO   the repository checkout (default: found from this file)
 #   CLERK_BIN_DIR  the directory holding the release `clerk`
@@ -10,7 +10,7 @@
 #   T7_SUBJECT     the project directory sessions run in (default: $T7_SCRATCH/subject)
 #   T7_TMUX        the private tmux server and session name (default: t7)
 T7=$(cd "$(dirname "$0")" && pwd)
-LECLERK_REPO="${LECLERK_REPO:-$(cd "$T7/../../../../.." && pwd)}"
+LECLERK_REPO="${LECLERK_REPO:-$(cd "$T7/../.." && pwd)}"
 CLERK_BIN_DIR="${CLERK_BIN_DIR:-${CARGO_TARGET_DIR:-$LECLERK_REPO/target}/release}"
 CLERK_HOME="${CLERK_HOME:-/tmp/clerk-t7}"
 T7_SCRATCH="${T7_SCRATCH:-${TMPDIR:-/tmp}/clerk-t7-scratch}"

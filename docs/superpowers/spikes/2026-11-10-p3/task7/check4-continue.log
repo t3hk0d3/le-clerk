@@ -1,4 +1,0 @@
-kill -9 claude 1890762 (the --resume session) at 04:54:44.843
-start claude --continue at 04:54:45.845
-at 04:55:15.857 (grace 20 s passed since the kill):
-[{"occupancy":{"ends_at":1794287300580,"holder":{"kind":"agent_session","session_id":"33333333-3333-4333-8333-333333333333"},"kind":"held","lease_id":"lse_01M71WVD24RHXQ4YQSGXR7XVDK","purpose":"check 4: resume handover","resource":"c6-boards","state":"held","unit":"c6-a"},"resource":"c6-boards","scope":"user","unit":"c6-a"}]

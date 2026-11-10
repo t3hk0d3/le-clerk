@@ -1,6 +1,0 @@
-{"fmt": "md", "run": "1", "A_granted": true, "B_queued": true, "A_released": true, "B_woke_and_claimed": true, "B_screen_reports_hold": true, "registered_resources": 0, "registered_units": 0, "registration_user_scope": false}
-{"fmt": "json", "run": "1", "A_granted": true, "B_queued": true, "A_released": true, "B_woke_and_claimed": true, "B_screen_reports_hold": true, "registered_resources": 0, "registered_units": 0, "registration_user_scope": false}
-{"fmt": "md", "run": "2", "A_granted": true, "B_queued": true, "A_released": true, "B_woke_and_claimed": true, "B_screen_reports_hold": true, "registered_resources": 0, "registered_units": 0, "registration_user_scope": false}
-{"fmt": "json", "run": "2", "A_granted": true, "B_queued": true, "A_released": true, "B_woke_and_claimed": true, "B_screen_reports_hold": true, "registered_resources": 0, "registered_units": 0, "registration_user_scope": false}
-{"fmt": "md", "run": "3", "A_granted": true, "B_queued": true, "A_released": true, "B_woke_and_claimed": true, "B_screen_reports_hold": true, "registered_resources": 0, "registered_units": 0, "registration_user_scope": false}
-{"fmt": "json", "run": "3", "A_granted": true, "B_queued": true, "A_released": true, "B_woke_and_claimed": true, "B_screen_reports_hold": true, "registered_resources": 0, "registered_units": 0, "registration_user_scope": false}

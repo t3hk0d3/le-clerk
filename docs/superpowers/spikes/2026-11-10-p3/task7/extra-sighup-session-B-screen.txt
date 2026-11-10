@@ -1,5 +1,0 @@
-
-Resume this session with:
-claude --resume 22222222-2222-4222-8222-222222222222
-
-Pane is dead (status 129, Tue Nov 10 06:00:39 2026)

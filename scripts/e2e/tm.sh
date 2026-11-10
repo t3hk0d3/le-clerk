@@ -1,5 +1,5 @@
 #!/bin/sh
-# tmux helpers for the Task 7 checks, on a private tmux server (-L $T7_TMUX).
+# tmux helpers for the manual checklist (docs/claude-code.md), on a private tmux server (-L $T7_TMUX).
 # Paths: see env.sh.
 #   tm.sh init                                          make the subject project and the tmux session
 #   tm.sh start <name> <session-uuid|-> [claude args...]
