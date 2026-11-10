@@ -1,6 +1,6 @@
 ---
 name: leasing
-description: Lease shared resources through the clerk before using them. Use whenever you need a dev board, serial device, port, running service, API token or any other thing other agents might use at the same time; before flashing, opening, binding or spending it; and whenever a clerk notice (offer, expiry warning, yield request, cleanup window) reaches you.
+description: Lease shared resources through the clerk before using them. Use when you need a dev board, serial device, port, service, API token or other thing that other agents may use at the same time, or that the project's docs or your memory say is leased through the clerk; before flashing, opening, binding or spending it; and whenever a clerk notice (offer, expiry warning, yield request, cleanup window) reaches you. Not for ordinary local work nobody else shares.
 ---
 
 # Leasing shared resources
@@ -33,13 +33,29 @@ place leases are taken, queued, yielded and returned.
    and unit descriptions, the tags and the rendered usage: how to connect, the
    gotchas, what "clean" means. If it says the unit was handed over without
    confirmed cleanup, expect a messy state and check it first.
-4. Queued: the result gives your position. Call `lease_wait`; it claims the
-   offer for you when your turn comes. `lease_cancel` drops a request you no
-   longer need.
+4. Queued: the result gives your position and a `request_id`. Call
+   `lease_wait`; it claims the offer for you when your turn comes.
+   `lease_cancel` with that `request_id` drops a request you no longer need.
+
+Every lease call after the grant (`lease_extend`, `lease_release`,
+`lease_confirm`, ...) takes the grant's `lease_id`.
 
 ## 2. Keep `lease_wait` armed
 
 While you hold a lease or wait in a queue, keep one `lease_wait` running.
+**`lease_wait` can block** (up to 20 minutes) until a notice arrives, so when
+you call it matters:
+
+- **Interactive session:** call it right after a grant or a queued result. It
+  runs as a background task, so you keep working, and its result reaches you
+  when a notice arrives. Call it again after each result.
+- **Where it blocks** (subagents, headless `claude -p`): do the work first.
+  Call `lease_wait` when you are about to idle or end your turn while you still
+  hold or wait for something. If you are queued with nothing else to do, call
+  it at once: waiting is the work. Mid-turn notices reach you through context
+  added before your tool calls.
+
+Either way:
 
 - It returns a batch of notices: offers (already claimed for you, with the
   grant), expiry warnings, yield requests, cleanup reminders, "your unit is
@@ -100,8 +116,11 @@ lease_acquire {"target": {"resource": "c6-boards"}, "for": "30m",
                "purpose": "flash and test the OTA update path"}
   -> granted unit c6-a, /dev/serial/by-id/usb-Espressif_..., usage: flash with
      `idf.py -p /dev/serial/by-id/... flash`; clean = erase flash
-... work; an expiry warning arrives ...
-lease_extend with the lease id and {"for": "15m"}
+lease_wait {}                      # interactive: runs as a background task
+... work; lease_wait returns an expiry warning notice n1 ...
+lease_extend {"lease_id": "<id>", "for": "15m"}
+lease_wait {"ack": ["n1"]}         # re-arm, acknowledging n1
 ... done ...
-lease_release; erase flash as the usage says; lease_confirm
+lease_release {"lease_id": "<id>"}; erase flash as the usage says
+lease_confirm {"lease_id": "<id>"}
 ```

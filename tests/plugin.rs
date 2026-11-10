@@ -38,6 +38,19 @@ const TOOLS: [&str; 21] = [
     "lease_claim",
     "lease_wait",
 ];
+/// Argument, result and notice field names that share a tool prefix but
+/// are not tools; the skills may name them.
+const FIELDS: [&str; 9] = [
+    "lease_id",
+    "request_id",
+    "unit_description",
+    "resource_description",
+    "resource_tags",
+    "unit_links",
+    "lease_ended",
+    "unit_returned",
+    "resource_removed",
+];
 /// Each hook event with its `clerk hook` subcommand and the longest
 /// `timeout` (seconds) it may set.
 const HOOKS: [(&str, &str, f64); 4] = [
@@ -106,15 +119,16 @@ fn is_kebab(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Every word in `text` that looks like a clerk tool name.
-fn tool_like_tokens(text: &str) -> Vec<String> {
+/// Every word in `text` that looks like a clerk tool name but is neither a
+/// tool nor a known field name.
+fn unknown_tool_names(text: &str) -> Vec<String> {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|w| {
-            ["lease_", "resource_", "unit_"]
+            ["lease_", "resource_", "unit_", "type_"]
                 .iter()
                 .any(|p| w.starts_with(p))
-                || *w == "type_list"
         })
+        .filter(|w| !TOOLS.contains(w) && !FIELDS.contains(w))
         .map(str::to_owned)
         .collect()
 }
@@ -252,15 +266,29 @@ mod plugin {
         #[test]
         fn skills_mention_only_tool_names_the_clerk_serves() {
             for skill in SKILLS {
-                let unknown: Vec<String> = tool_like_tokens(&skill_text(skill))
-                    .into_iter()
-                    .filter(|t| !TOOLS.contains(&t.as_str()))
-                    .collect();
+                let unknown = unknown_tool_names(&skill_text(skill));
                 assert!(
                     unknown.is_empty(),
                     "{skill} names unknown tools {unknown:?}"
                 );
             }
+        }
+    }
+
+    mod tool_name_check {
+        use super::*;
+
+        #[test]
+        fn flags_a_misspelled_tool() {
+            let text = "Call `lease_aquire`, then `lease_wait` and `type_lists`.";
+            assert_eq!(unknown_tool_names(text), ["lease_aquire", "type_lists"]);
+        }
+
+        #[test]
+        fn accepts_tools_and_field_names() {
+            let text =
+                "lease_extend {\"lease_id\": \"x\"}; lease_cancel with request_id; type_list";
+            assert_eq!(unknown_tool_names(text), Vec::<String>::new());
         }
     }
 

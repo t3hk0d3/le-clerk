@@ -27,13 +27,15 @@ registered, agents lease them with the `leasing` skill.
    identical boards are one resource with two units, not two resources. Things
    an agent must tell apart are separate resources.
 4. **Fill in the context.** Agents only know what you write here.
-   - **ID**: lowercase letters, digits and dashes (`c6-boards`, `dev-ports`).
+   - **ID**: lowercase letters, digits and dashes (`.` and `_` also work),
+     starting with a letter or digit, at most 63 characters (`c6-boards`,
+     `dev-ports`).
    - **Description**: one line, at most 200 characters, saying what it is; one
      per unit saying which instance it is.
    - **Tags**: what it is, its capabilities and its kind (`esp32`,
      `esp32c6`, `thread`, `zigbee`, `devboard`). Lowercase letters, digits and
-     `-`, at most 32 characters each, at most 16 per resource. Uppercase is
-     refused.
+     `-`, starting with a letter or digit, at most 32 characters each, at most
+     16 per resource. Uppercase is refused.
    - **Usage**: Markdown, at most 4 KiB: how to connect or use it, gotchas, and
      what "clean" means when handing it back. Placeholders are filled in on
      grant. Valid keys depend on the type, and unknown keys are refused:
@@ -48,14 +50,22 @@ registered, agents lease them with the `leasing` skill.
      unchanged.
 5. **Create and add units**: `resource_create`, then `unit_add` per unit
    (`settings` carries the type and its fields). Read every result:
-   - refused as a duplicate in the same scope: the thing is registered; use
-     the resource and unit the error names;
-   - it matches a user-scope unit: you are told which; prefer using that one.
-     If you go ahead, the clerk links the two so they are never leased at once;
-   - `similar_in_other_project`: another project registered the same thing. A
-     promotion to user scope has been filed. **Tell the user** (the result says
-     which project and the `clerk approve` command) and do not register it
-     again here.
+   - refused as a duplicate in the same scope (`duplicate_in_scope`): the
+     thing is registered; use the resource and unit the error names;
+   - refused as `ambiguous_duplicate`: the settings match several units, which
+     the error lists. Check which one is this thing and use it, or ask the
+     user;
+   - warned that it looks like a user-scope unit (`duplicate_of_user_unit`):
+     the unit was added and linked to that one, so the two are never leased at
+     once. Both are safe to lease; prefer the user-scope one;
+   - warned that it looks like another unit of this project
+     (`duplicate_of_project_unit`): it was added and linked the same way;
+     consider removing the redundant one with `unit_remove`;
+   - `similar_in_other_project`: the unit is registered here, and another
+     project has a similar one. A promotion to user scope was filed. **Tell the
+     user** (the result names the project and the `clerk approve` command), and
+     don't add it again or under another ID;
+   - any other warning: act on what the result states.
 6. **Scope**: leave `scope` out, so the resource lands in this project. Use
    `scope: "user"` only when the user says the thing is shared across their
    projects.
