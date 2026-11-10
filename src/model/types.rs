@@ -2,14 +2,13 @@
 
 use std::path::PathBuf;
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::error::ErrorCode;
 
 /// The kind of thing a resource leases out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceType {
     /// A device node.
@@ -33,9 +32,7 @@ impl ResourceType {
 }
 
 /// Request priority.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     /// Lowest.
@@ -61,7 +58,7 @@ pub enum Scope {
 }
 
 /// Whether a service unit is something to connect to or to listen as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceMode {
     /// A server already runs; the holder connects.
@@ -72,7 +69,7 @@ pub enum ServiceMode {
 
 /// Per-unit settings handed to the holder. Unknown keys are refused (the
 /// `type` tag excepted), so a misspelt field is an error, not a silent drop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UnitSettings {
     /// A device node.

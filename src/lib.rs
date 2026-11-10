@@ -6,7 +6,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The daemon protocol: what clients and the daemon must agree on beyond
 /// the version (routes, MCP endpoint, hook methods). `GET /v1/version`
 /// reports it; every client refuses a daemon reporting another, or none.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 pub mod admin;
 pub mod client;
@@ -19,7 +19,6 @@ pub mod engine;
 pub mod error;
 pub mod health;
 pub mod inventory;
-pub mod mcp;
 pub mod model;
 pub mod scheduler;
 pub mod scope;

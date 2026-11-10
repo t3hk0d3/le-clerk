@@ -83,10 +83,6 @@ fn marketplace() -> Value {
     read_json(&repo().join(".claude-plugin/marketplace.json"))
 }
 
-fn mcp() -> Value {
-    read_json(&plugin_path(".mcp.json"))
-}
-
 fn hooks() -> Value {
     read_json(&plugin_path("hooks/hooks.json"))
 }
@@ -215,24 +211,6 @@ mod plugin {
         }
 
         #[test]
-        fn mcp_json_wraps_servers_with_command_args_and_env() {
-            let servers = mcp()["mcpServers"]
-                .as_object()
-                .expect("mcpServers is an object")
-                .clone();
-            assert!(!servers.is_empty(), "at least one server");
-            for (name, s) in servers {
-                assert!(s["command"].is_string(), "{name}.command is a string");
-                let args = s["args"].as_array().expect("args is an array");
-                assert!(args.iter().all(Value::is_string), "{name}.args are strings");
-                assert!(
-                    s.get("env").is_none_or(Value::is_object),
-                    "{name}.env is an object when present"
-                );
-            }
-        }
-
-        #[test]
         fn hooks_json_wraps_events_in_matcher_groups_of_command_hooks() {
             let h = hooks();
             let events = h["hooks"].as_object().expect("top-level hooks object");
@@ -289,33 +267,6 @@ mod plugin {
             let text =
                 "lease_extend {\"lease_id\": \"x\"}; lease_cancel with request_id; type_list";
             assert_eq!(unknown_tool_names(text), Vec::<String>::new());
-        }
-    }
-
-    mod mcp_json_launches_clerk_mcp_over_stdio {
-        use super::*;
-
-        #[test]
-        fn runs_clerk_with_the_mcp_subcommand() {
-            let servers = mcp()["mcpServers"]
-                .as_object()
-                .expect("mcpServers is an object")
-                .clone();
-            assert_eq!(servers.len(), 1, "one server");
-            let s = servers.values().next().expect("one server");
-            assert_eq!(s["command"], "clerk");
-            assert_eq!(s["args"], serde_json::json!(["mcp"]));
-        }
-
-        #[test]
-        fn declares_no_remote_transport() {
-            for (name, s) in mcp()["mcpServers"].as_object().expect("object") {
-                assert!(s.get("url").is_none(), "{name} has no url");
-                assert!(
-                    s.get("type").is_none_or(|t| t == "stdio"),
-                    "{name} is a stdio server"
-                );
-            }
         }
     }
 

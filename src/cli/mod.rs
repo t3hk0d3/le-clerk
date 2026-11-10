@@ -13,7 +13,6 @@ mod input;
 mod inventory;
 mod lease;
 mod live;
-mod mcp;
 mod output;
 mod render;
 mod views;
@@ -133,9 +132,6 @@ enum Command {
     /// repairs, export and import. Each asks for confirmation (or
     /// `--yes`); agents also need `--override`.
     Admin(admin::AdminArgs),
-    /// The MCP server Claude Code runs: relays MCP between stdin/stdout and
-    /// the clerk daemon, keeping the agent session alive while it runs.
-    Mcp,
     /// A Claude Code hook: reads the hook input from stdin, never starts
     /// the daemon, always exits 0 and prints only the hook's output.
     Hook {
@@ -208,10 +204,6 @@ pub fn run() -> ExitCode {
         return hook::main(event);
     }
     init_logging();
-    if let Command::Mcp = cli.command {
-        // stdout belongs to MCP: failures go to stderr only.
-        return mcp::main();
-    }
     match execute(cli, out) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => match e.downcast::<Exit>() {
@@ -273,7 +265,7 @@ fn execute(cli: Cli, out: Output) -> anyhow::Result<()> {
 
 async fn dispatch(ctx: &Ctx, command: Command) -> anyhow::Result<()> {
     match command {
-        Command::Daemon { action: None } | Command::Mcp | Command::Hook { .. } => Ok(()),
+        Command::Daemon { action: None } | Command::Hook { .. } => Ok(()),
         Command::Daemon {
             action: Some(action),
         } => manage_daemon(ctx, action).await,

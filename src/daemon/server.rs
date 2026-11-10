@@ -6,44 +6,29 @@
 //!   `200 {"result": ...}` or an error status with
 //!   `{"error": {"code": "...", "message": "..."}}`. The hook methods
 //!   ([`HookCommand::METHODS`]) take the session from their arguments.
-//! - `POST /mcp`: the MCP endpoint (see [`crate::mcp`]).
 //! - `GET /v1/notices?holder=<url-encoded HolderRef JSON>&wait=<secs, max 60>`
 //!   → `200 {"result": [Notice, ...]}` (the long-poll). Optional
 //!   `leases=<id,id…>` and `requests=<id,id…>` narrow it to notices naming
 //!   one of those; the holder's other notices stay pending.
-//! - `GET /v1/session/live` with the `X-Clerk-*` identity headers (see
-//!   [`crate::mcp`]; `X-Clerk-Connection` required): an agent session's
-//!   liveness stream. The response stays open, a keep-alive newline every
-//!   [`LIVE_KEEPALIVE`], while the proxy lives; its end (the proxy gone, or
-//!   the daemon stopping) closes the stream (see
-//!   [`crate::scheduler::session`]). 400 on missing or malformed headers.
 //!
 //! Status mapping: 404 not found or unknown method, 409 conflict/refused,
 //! 422 invalid request or argument, 500 internal, 503 engine stopped.
 
-use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use http_body_util::Channel;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::engine::{ApiError, Command, EngineHandle, ErrorKind, HookCommand, MAX_WAIT};
-use crate::mcp;
 use crate::model::{Caller, HolderRef};
-use crate::scope::ProjectResolver;
 use crate::store::notices::NoticeFilter;
-
-/// Gap between the keep-alive chunks of a liveness stream; a proxy that is
-/// gone is noticed by the next one at the latest.
-pub const LIVE_KEEPALIVE: Duration = Duration::from_secs(1);
 
 /// What `GET /v1/version` reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,9 +76,7 @@ pub fn router_with(engine: EngineHandle, info: &ServerInfo) -> Router {
         )
         .route("/v1/rpc/{method}", post(rpc))
         .route("/v1/notices", get(notices))
-        .route("/v1/session/live", get(session_live))
-        .with_state(engine.clone())
-        .merge(crate::mcp::router(engine))
+        .with_state(engine)
 }
 
 impl IntoResponse for ApiError {
@@ -224,56 +207,4 @@ async fn notices(
         Ok(list) => ok(list),
         Err(e) => e.into_response(),
     }
-}
-
-/// `GET /v1/session/live`: hold the agent session alive while the response
-/// is being read.
-async fn session_live(State(engine): State<EngineHandle>, headers: HeaderMap) -> Response {
-    let identity = match mcp::live_identity(&headers) {
-        Ok(i) => i,
-        Err(e) => return ApiError::invalid_request(e.to_string()).into_response(),
-    };
-    let project = match identity.project_dir {
-        Some(dir) => tokio::task::spawn_blocking(move || ProjectResolver::resolve(&dir).ok())
-            .await
-            .ok()
-            .flatten(),
-        None => None,
-    };
-    let link = match engine
-        .session_connect(
-            identity.session_id,
-            identity.connection,
-            identity.claude_pid,
-            project,
-        )
-        .await
-    {
-        Ok(link) => link,
-        Err(e) => return e.into_response(),
-    };
-    let (mut sender, body) = Channel::<Bytes, Infallible>::new(1);
-    tokio::spawn(async move {
-        // Dropped when the loop ends: the stream closed.
-        let _link = link;
-        let mut keepalive = tokio::time::interval(LIVE_KEEPALIVE);
-        loop {
-            tokio::select! {
-                () = engine.stopped() => break,
-                _ = keepalive.tick() => {
-                    // An error means the response was dropped: the proxy
-                    // went away.
-                    if sender.send_data(Bytes::from_static(b"\n")).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        Body::new(body),
-    )
-        .into_response()
 }

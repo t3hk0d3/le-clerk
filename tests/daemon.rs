@@ -564,11 +564,11 @@ mod daemon {
             use super::*;
 
             #[tokio::test(flavor = "multi_thread")]
-            async fn version_reports_protocol_3() {
+            async fn version_reports_protocol_4() {
                 let h = Harness::new();
                 let client = h.start().await;
-                assert_eq!(client.daemon().protocol, Some(3));
-                assert_eq!(leclerk::PROTOCOL, 3);
+                assert_eq!(client.daemon().protocol, Some(4));
+                assert_eq!(leclerk::PROTOCOL, 4);
             }
         }
 

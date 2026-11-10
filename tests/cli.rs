@@ -340,6 +340,14 @@ mod cli {
     mod usage_errors {
         use super::*;
 
+        /// The MCP server was removed (agents use the CLI).
+        #[test]
+        fn mcp_is_not_a_command() {
+            let env = Env::new();
+            let error = error_of(env.cmd().arg("mcp"), 2);
+            assert_eq!(error["code"], "usage_error", "{error}");
+        }
+
         mod on_unknown_flag_without_a_tty {
             use super::*;
 
