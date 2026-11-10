@@ -44,8 +44,14 @@ configs, asking the user) is your job: the clerk has no scan command.
    - **similar in another project:** a promotion to user scope was filed.
      **Tell the user** (the result names the `clerk approve` command); do not
      register it again under another id.
-6. **Scope:** leave `--scope` out, so it lands in this project. Use
-   `--scope user` only when the user says it is shared across projects.
+6. **Scope:**
+   - **Hardware** (boards, serial devices, USB adapters, anything with a
+     `device` path or on the bench): `--scope user`. A physical thing is
+     shared by every project on this machine; registered in one project it
+     is invisible to the others, which then register it again.
+   - Everything else (ports, services, tokens of this project): leave
+     `--scope` out, so it lands in this project; `--scope user` only when
+     the user says it is shared across projects.
 7. **Record the ids** in the project's docs or your memory.
 
 Later: `clerk resource update` (`--add-tag`, `--remove-tag`, `--usage`),
@@ -55,7 +61,7 @@ Later: `clerk resource update` (`--add-tag`, `--remove-tag`, `--usage`),
 ## Example: two ESP32-C6 boards
 
 ```text
-clerk resource create c6-boards --type device \
+clerk resource create c6-boards --type device --scope user \
   --description "ESP32-C6 dev boards on the USB hub" \
   --tag esp32 --tag esp32c6 --tag thread --tag devboard \
   --usage "Flash: \`idf.py -p {unit.path} flash monitor\`. Clean: erase-flash, close the monitor."

@@ -725,8 +725,9 @@ agent, a command acts for the agent (§7.3), never prompts, and prints JSON.
 - No separate promotion command for agents (my call): a
   `similar_in_other_project` warning already files the promotion request for
   the user (§4.4).
-- `resource create` defaults to the agent's project scope; user scope only
-  when asked (my call, as for people).
+- `resource create` defaults to the agent's project scope; the skill asks
+  for user scope for hardware (user decision), and otherwise only when the
+  user says so.
 - Refused to agents (enforced by the daemon): `--view all`, the audit log, the
   promotion list and approval, holder lookups. `clerk admin …` needs
   `--override` (§8.4).
@@ -810,8 +811,10 @@ the clerk has no scan command (user decision). The steps:
 5. Create, add units, and act on duplicate warnings. A similar thing in another
    project means telling the user about the promotion, never re-registering
    it.
-6. Scope: the agent's project by default; user scope only when the user says
-   the thing is shared.
+6. Scope: hardware (boards, devices on the bench) in user scope (user
+   decision, 2026-11-10: a physical thing is shared by every project);
+   anything else in the agent's project by default, user scope only when the
+   user says the thing is shared.
 7. Record the IDs in project docs or memory.
 
 ### 8.4 CLI (for the user, scripts and agents)
