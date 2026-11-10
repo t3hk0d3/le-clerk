@@ -36,6 +36,7 @@ use serde_json::{Value, json};
 use crate::engine::{ApiError, Command, EngineHandle, ErrorKind, MAX_WAIT};
 use crate::mcp;
 use crate::model::{Caller, HolderRef};
+use crate::scope::ProjectResolver;
 use crate::store::notices::NoticeFilter;
 
 /// Gap between the keep-alive chunks of a liveness stream; a proxy that is
@@ -210,11 +211,19 @@ async fn session_live(State(engine): State<EngineHandle>, headers: HeaderMap) ->
         Ok(i) => i,
         Err(e) => return ApiError::invalid_request(e.to_string()).into_response(),
     };
+    let project = match identity.project_dir {
+        Some(dir) => tokio::task::spawn_blocking(move || ProjectResolver::resolve(&dir).ok())
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     let link = match engine
         .session_connect(
             identity.session_id,
             identity.connection,
             identity.claude_pid,
+            project,
         )
         .await
     {

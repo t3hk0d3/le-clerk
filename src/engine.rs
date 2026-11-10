@@ -35,8 +35,8 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::ErrorCode;
 use crate::inventory::{Inventory, InventoryError, PromotionError, Promotions};
-use crate::model::{HolderRef, NoticeId};
-use crate::scheduler::session::Sessions;
+use crate::model::{HolderRef, NoticeId, ProjectKey};
+use crate::scheduler::session::{Aliased, Sessions};
 use crate::scheduler::{HealthProbe, Scheduler, SchedulerError, liveness};
 use crate::store::notices::{self, Notice, NoticeFilter};
 use crate::store::{Store, StoreError};
@@ -275,7 +275,7 @@ enum Job {
     /// End an agent session's leases and requests now (`SessionEnd`).
     SessionEndNow(String, Reply<()>),
     /// A live proxy session (first) takes over a resumed one (second).
-    SessionAlias(String, String, Reply<()>),
+    SessionAlias(String, String, Reply<Aliased>),
     /// The session a hook or request acts for.
     SessionResolve(Option<u32>, String, Reply<String>),
     /// Whether an agent session has an open liveness stream.
@@ -287,6 +287,7 @@ struct SessionConnect {
     session_id: String,
     connection: Ulid,
     claude_pid: Option<u32>,
+    project: Option<ProjectKey>,
 }
 
 /// One open liveness stream of an agent session (see
@@ -610,8 +611,8 @@ impl EngineHandle {
 
     /// A liveness stream of agent session `session_id` opened on
     /// `connection` (a `clerk mcp` process) for Claude Code process
-    /// `claude_pid`: the session is alive and its grace, if any, cancelled,
-    /// until the returned link is dropped.
+    /// `claude_pid` in `project`: the session is alive and its grace, if
+    /// any, cancelled, until the returned link is dropped.
     ///
     /// # Errors
     /// `engine_unavailable`.
@@ -620,11 +621,13 @@ impl EngineHandle {
         session_id: String,
         connection: Ulid,
         claude_pid: Option<u32>,
+        project: Option<ProjectKey>,
     ) -> Result<SessionLink, ApiError> {
         let connect = SessionConnect {
             session_id,
             connection,
             claude_pid,
+            project,
         };
         self.ask(|reply| Job::SessionConnect(connect, reply))
             .await?;
@@ -646,11 +649,14 @@ impl EngineHandle {
 
     /// `SessionStart` resume: the live proxy session `from` takes over the
     /// resumed session `to` (its leases, requests and pending notices; its
-    /// grace is cancelled; `to` resolves to `from` from now on).
+    /// grace is cancelled; `to` resolves to `from` from now on, also after
+    /// a restart). Refused, moving nothing, when `from` has no open
+    /// liveness stream, `to` still has one, or their projects differ; the
+    /// answer says which, so a caller can retry once the proxy connected.
     ///
     /// # Errors
     /// A storage failure, or `engine_unavailable`.
-    pub async fn session_alias(&self, from: String, to: String) -> Result<(), ApiError> {
+    pub async fn session_alias(&self, from: String, to: String) -> Result<Aliased, ApiError> {
         self.ask(|reply| Job::SessionAlias(from, to, reply)).await
     }
 
@@ -966,7 +972,7 @@ impl Engine {
             }
             Job::SessionConnect(c, reply) => {
                 self.sessions
-                    .connect(&c.session_id, c.connection, c.claude_pid);
+                    .connect(&c.session_id, c.connection, c.claude_pid, c.project);
                 let _ = reply.send(Ok(()));
             }
             Job::SessionDisconnect(connection) => {

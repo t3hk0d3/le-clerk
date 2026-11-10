@@ -26,18 +26,46 @@
 //! maps a hook to the live proxy session with the same Claude Code PID, and
 //! [`Sessions::alias`] (the SessionStart-resume hook) hands a resumed
 //! session's leases, requests and pending notices to the live proxy session.
+//! Aliases are kept in the store (`session_aliases`) and loaded at boot, so
+//! a chain of resumes (`--continue` twice) resolves across daemon restarts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::json;
 use ulid::Ulid;
 
-use crate::model::{EndCause, HolderRef};
+use crate::model::{EndCause, HolderRef, ProjectKey};
 use crate::scheduler::liveness::HolderEnded;
 use crate::scheduler::{Scheduler, SchedulerError, clerk_actor};
-use crate::store::notices;
-use crate::store::{StoreError, Tx, audit, leases};
+use crate::store::{StoreError, Tx, audit, leases, notices, sessions as alias_store};
+
+/// What [`Sessions::alias`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome", content = "reason")]
+pub enum Aliased {
+    /// The live proxy session took the resumed session over.
+    TakenOver,
+    /// Both ids already stand for the same session.
+    Unchanged,
+    /// Nothing moved; a `session_alias_refused` audit entry says why.
+    Refused(AliasRefusal),
+}
+
+/// Why an alias was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasRefusal {
+    /// The new proxy session has no open liveness stream (yet): what it
+    /// took over would never get a grace.
+    NotConnected,
+    /// The resumed session still has an open liveness stream: another
+    /// Claude Code process is running it.
+    ResumedStillConnected,
+    /// The two sessions belong to different projects.
+    ProjectMismatch,
+}
 
 /// One agent session as the liveness record knows it.
 #[derive(Debug, Default)]
@@ -53,6 +81,10 @@ struct Session {
     /// Order of the latest connect, to prefer the newest proxy in
     /// [`Sessions::resolve`].
     connected: u64,
+    /// Whether a liveness stream of it ever opened (in this daemon).
+    streamed: bool,
+    /// The project of its latest liveness stream.
+    project: Option<ProjectKey>,
 }
 
 /// The liveness record of every agent session the engine has seen.
@@ -62,7 +94,8 @@ pub struct Sessions {
     known: HashMap<String, Session>,
     /// Which session each open connection belongs to.
     owners: HashMap<Ulid, String>,
-    /// Resumed session id → the live proxy session that took it over.
+    /// Resumed session id → the session that took it over (a mirror of
+    /// the store's `session_aliases`, loaded at boot).
     aliases: HashMap<String, String>,
     connects: u64,
 }
@@ -80,23 +113,31 @@ impl Sessions {
         }
     }
 
-    /// The id `session_id` stands for: itself, or the live proxy session a
-    /// resume aliased it to.
+    /// The id `session_id` stands for: the end of its chain of resume
+    /// aliases (itself when it has none).
     fn follow(&self, session_id: &str) -> String {
-        self.aliases
-            .get(session_id)
-            .cloned()
-            .unwrap_or_else(|| session_id.to_owned())
+        let mut id = session_id;
+        let mut seen = HashSet::new();
+        while let Some(next) = self.aliases.get(id) {
+            // Aliases only ever point at chain ends, so a cycle cannot be
+            // written; the guard keeps a damaged table from hanging us.
+            if !seen.insert(id) {
+                break;
+            }
+            id = next;
+        }
+        id.to_owned()
     }
 
     /// A liveness stream of `session_id` (after alias resolution) opened on
-    /// `connection`: the session is alive and any grace is cancelled.
-    /// Returns the session the stream counts for.
+    /// `connection` in `project`: the session is alive and any grace is
+    /// cancelled. Returns the session the stream counts for.
     pub fn connect(
         &mut self,
         session_id: &str,
         connection: Ulid,
         claude_pid: Option<u32>,
+        project: Option<ProjectKey>,
     ) -> String {
         let id = self.follow(session_id);
         self.connects += 1;
@@ -104,6 +145,8 @@ impl Sessions {
         *session.open.entry(connection).or_insert(0) += 1;
         session.grace_until = None;
         session.connected = self.connects;
+        session.streamed = true;
+        session.project = project;
         if claude_pid.is_some() {
             session.claude_pid = claude_pid;
         }
@@ -176,13 +219,15 @@ impl Sessions {
         live.last().map_or(own, |(id, _)| (*id).clone())
     }
 
-    /// Daemon start at `now_ms`: every `AgentSession` holder with a live
-    /// lease or a queued request gets the reconnect grace from now. Returns
-    /// the sessions graced.
+    /// Daemon start at `now_ms`: the resume aliases are loaded from the
+    /// store, and every `AgentSession` holder with a live lease or a queued
+    /// request gets the reconnect grace from now. Returns the sessions
+    /// graced.
     ///
     /// # Errors
     /// [`StoreError`] on storage failure.
     pub fn boot(&mut self, tx: &Tx, now_ms: i64) -> Result<Vec<String>, StoreError> {
+        self.aliases.extend(alias_store::aliases(tx)?);
         let until = now_ms.saturating_add(self.grace_ms);
         let mut graced = Vec::new();
         for id in agent_holders(tx)? {
@@ -244,10 +289,15 @@ impl Sessions {
     }
 
     /// `SessionStart` with `source: "resume"`: the live proxy session `from`
-    /// (Claude Code's start-up id) takes over the resumed session `to`. The
-    /// leases, queued requests and pending notices of `to` are handed to
-    /// `from`, `to`'s grace is cancelled, and `to` resolves to `from` from
-    /// now on. Nothing happens when they are the same session.
+    /// (Claude Code's start-up id) takes over the resumed session `to`,
+    /// both resolved through the alias chain. The leases, queued requests
+    /// and pending notices of `to` are handed to `from`, `to`'s grace is
+    /// cancelled, and `to` resolves to `from` from now on (persisted).
+    ///
+    /// Refused, moving nothing and auditing `session_alias_refused`, when
+    /// `from` has no open liveness stream, when `to` still has one, or when
+    /// they belong to different projects (as their streams, leases and
+    /// requests say).
     ///
     /// # Errors
     /// [`SchedulerError::Store`] on storage failure.
@@ -257,41 +307,75 @@ impl Sessions {
         sched: &Scheduler,
         from: &str,
         to: &str,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<Aliased, SchedulerError> {
         let live = self.follow(from);
-        if live == to {
-            return Ok(());
+        let resumed = self.follow(to);
+        if live == resumed {
+            return Ok(Aliased::Unchanged);
+        }
+        let resumed_holder = HolderRef::AgentSession {
+            session_id: resumed.clone(),
+        };
+        if let Some(reason) = self.refusal(tx, &live, &resumed, &resumed_holder)? {
+            tracing::info!(from = %live, to = %resumed, ?reason, "resume alias refused");
+            audit::record(
+                tx,
+                sched.now(),
+                &clerk_actor(),
+                "session_alias_refused",
+                &json!({ "from": from, "to": to, "session": live, "resumed": resumed,
+                         "reason": reason }),
+            )?;
+            return Ok(Aliased::Refused(reason));
         }
         sched.take_over_holder(
             tx,
-            &HolderRef::AgentSession {
-                session_id: to.to_owned(),
-            },
+            &resumed_holder,
             &HolderRef::AgentSession {
                 session_id: live.clone(),
             },
         )?;
-        if let Some(old) = self.known.remove(to) {
-            // Streams still open under the resumed id now count for the
-            // live session.
-            for (connection, n) in old.open {
-                *self
-                    .known
-                    .entry(live.clone())
-                    .or_default()
-                    .open
-                    .entry(connection)
-                    .or_insert(0) += n;
-                self.owners.insert(connection, live.clone());
-            }
+        alias_store::insert_alias(tx, &resumed, &live, sched.now())?;
+        self.known.remove(&resumed);
+        self.aliases.insert(resumed, live);
+        Ok(Aliased::TakenOver)
+    }
+
+    /// Why `live` may not take over `resumed`, if it may not.
+    fn refusal(
+        &self,
+        tx: &Tx,
+        live: &str,
+        resumed: &str,
+        resumed_holder: &HolderRef,
+    ) -> Result<Option<AliasRefusal>, StoreError> {
+        let Some(session) = self.known.get(live).filter(|s| !s.open.is_empty()) else {
+            return Ok(Some(AliasRefusal::NotConnected));
+        };
+        if self.is_alive(resumed) {
+            return Ok(Some(AliasRefusal::ResumedStillConnected));
         }
-        for target in self.aliases.values_mut() {
-            if target == to {
-                target.clone_from(&live);
-            }
+        let project = session.project.clone();
+        let mut theirs: Vec<Option<ProjectKey>> = Vec::new();
+        if let Some(recorded) = self.known.get(resumed).filter(|s| s.streamed) {
+            theirs.push(recorded.project.clone());
         }
-        self.aliases.insert(to.to_owned(), live);
-        Ok(())
+        theirs.extend(
+            leases::live_leases(tx)?
+                .into_iter()
+                .filter(|l| l.holder == *resumed_holder)
+                .map(|l| l.project),
+        );
+        theirs.extend(
+            leases::queued_requests(tx)?
+                .into_iter()
+                .filter(|r| r.holder == *resumed_holder)
+                .map(|r| r.project),
+        );
+        if theirs.iter().any(|p| *p != project) {
+            return Ok(Some(AliasRefusal::ProjectMismatch));
+        }
+        Ok(None)
     }
 
     /// Drop everything known about `session_id`.
@@ -301,7 +385,6 @@ impl Sessions {
                 self.owners.remove(connection);
             }
         }
-        self.aliases.retain(|_, target| target != session_id);
     }
 }
 

@@ -16,7 +16,8 @@
 //!   once it is open (or after [`LIVE_FIRST_WAIT`]), so nothing is leased
 //!   before the session counts as alive.
 //! - The daemon is started when needed, as every clerk command does.
-//! - stdin EOF ends the process (exit 0), closing the stream.
+//! - stdin EOF ends the process (exit 0), closing the stream, once the
+//!   answers in flight are written (for at most [`EOF_DRAIN`]).
 //! - stdout carries MCP JSON-RPC only; logs go to stderr.
 
 use std::os::unix::ffi::OsStrExt;
@@ -46,6 +47,9 @@ const LIVE_FIRST_WAIT: Duration = Duration::from_secs(5);
 /// First and longest pause between liveness reconnection attempts.
 const LIVE_BACKOFF_MIN: Duration = Duration::from_millis(100);
 const LIVE_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// How long answers still in flight may take to reach stdout after stdin
+/// ends.
+const EOF_DRAIN: Duration = Duration::from_secs(1);
 /// JSON-RPC: the line is not JSON.
 const PARSE_ERROR: i64 = -32700;
 /// JSON-RPC: the relay could not get an answer.
@@ -216,7 +220,13 @@ async fn relay(paths: Paths, identity: Identity) -> anyhow::Result<()> {
     }
     tracing::debug!("stdin ended; closing");
     stream.abort();
-    writer.abort();
+    // The writer ends once every relayed message is answered (each holds a
+    // sender); answers still on their way get [`EOF_DRAIN`], no more: a
+    // blocking `lease_wait` must not keep the process alive.
+    drop(relay);
+    if tokio::time::timeout(EOF_DRAIN, writer).await.is_err() {
+        tracing::debug!("answers still pending at exit are dropped");
+    }
     Ok(())
 }
 

@@ -13,11 +13,12 @@ use leclerk::engine::{Engine, EngineHandle, EngineOptions};
 use leclerk::health::HealthResult;
 use leclerk::inventory::{Inventory, NewResource, NewUnit};
 use leclerk::model::{
-    Caller, HealthSpec, HolderRef, LeaseId, Priority, RequestId, ResourceId, ResourceType, Scope,
-    UnitId, UnitSettings,
+    Caller, HealthSpec, HolderRef, LeaseId, Priority, ProjectKey, RequestId, ResourceId,
+    ResourceType, Scope, UnitId, UnitSettings,
 };
-use leclerk::scheduler::session::Sessions;
+use leclerk::scheduler::session::{AliasRefusal, Aliased, Sessions};
 use leclerk::scheduler::{AcquireOutcome, AcquireRequest, HealthProbe, Scheduler, Target};
+use leclerk::store::audit::{self, AuditEntry};
 use leclerk::store::notices::{self, NoticeKind};
 use leclerk::store::{Store, StoreError, Tx};
 use ulid::Ulid;
@@ -134,6 +135,10 @@ fn queued_holders(tx: &Tx) -> Vec<HolderRef> {
         .collect()
 }
 
+fn project_key(dir: &str) -> ProjectKey {
+    ProjectKey(std::path::PathBuf::from(dir))
+}
+
 // ---------------------------------------------------------------------------
 // Scheduler-level fixture
 // ---------------------------------------------------------------------------
@@ -195,7 +200,27 @@ impl Fixture {
     }
 
     fn connect(&mut self, session: &str, connection: Ulid, pid: Option<u32>) {
-        self.sessions.connect(session, connection, pid);
+        self.sessions.connect(session, connection, pid, None);
+    }
+
+    fn connect_in(&mut self, session: &str, connection: Ulid, project: &str) {
+        self.sessions
+            .connect(session, connection, None, Some(project_key(project)));
+    }
+
+    /// A daemon restart: the liveness record starts over from the store.
+    fn restart(&mut self) {
+        self.sessions = Sessions::new(GRACE);
+        self.boot();
+    }
+
+    fn audit(&mut self, action: &str) -> Vec<AuditEntry> {
+        self.store
+            .tx(audit::all)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == action)
+            .collect()
     }
 
     fn disconnect(&mut self, connection: Ulid) {
@@ -222,11 +247,11 @@ impl Fixture {
             .unwrap();
     }
 
-    fn alias(&mut self, from: &str, to: &str) {
+    fn alias(&mut self, from: &str, to: &str) -> Aliased {
         let (sessions, sched) = (&mut self.sessions, &self.sched);
         self.store
             .tx(|tx| sessions.alias(tx, sched, from, to))
-            .unwrap();
+            .unwrap()
     }
 
     fn lease(&mut self, lease: &LeaseId) -> (String, Option<String>, HolderRef) {
@@ -442,8 +467,170 @@ mod scheduler {
                 f.queue(agent("old"));
                 f.disconnect(c);
                 f.connect("new", Ulid::new(), Some(42));
-                f.alias("new", "old");
+                assert_eq!(f.alias("new", "old"), Aliased::TakenOver);
                 (f, lease)
+            }
+
+            /// `s1` holds `board/u1` and is gone; `s2` resumed it and is gone
+            /// too. Returns the lease.
+            fn resumed_once(f: &mut Fixture) -> LeaseId {
+                let c1 = Ulid::new();
+                f.connect("s1", c1, Some(41));
+                let lease = f.grant(agent("s1"));
+                f.disconnect(c1);
+                let c2 = Ulid::new();
+                f.connect("s2", c2, Some(42));
+                assert_eq!(f.alias("s2", "s1"), Aliased::TakenOver);
+                f.disconnect(c2);
+                lease
+            }
+
+            /// The reasons of the `session_alias_refused` audit entries.
+            fn refusals(f: &mut Fixture) -> Vec<serde_json::Value> {
+                f.audit("session_alias_refused")
+                    .into_iter()
+                    .map(|e| e.detail["reason"].clone())
+                    .collect()
+            }
+
+            mod on_two_resumes_in_a_row {
+                use super::*;
+
+                #[test]
+                fn the_latest_proxy_session_holds_the_leases() {
+                    let mut f = fixture();
+                    let lease = resumed_once(&mut f);
+                    f.connect("s3", Ulid::new(), Some(43));
+                    assert_eq!(f.alias("s3", "s1"), Aliased::TakenOver);
+                    assert_eq!(f.lease(&lease).2, agent("s3"));
+                }
+            }
+
+            mod on_a_daemon_restart_between_two_resumes {
+                use super::*;
+
+                #[test]
+                fn the_latest_proxy_session_holds_the_leases() {
+                    let mut f = fixture();
+                    let lease = resumed_once(&mut f);
+                    f.restart();
+                    f.connect("s3", Ulid::new(), Some(43));
+                    assert_eq!(f.alias("s3", "s1"), Aliased::TakenOver);
+                    assert_eq!(f.lease(&lease).2, agent("s3"));
+                }
+
+                #[test]
+                fn the_resumed_id_still_resolves_to_its_proxy_session() {
+                    let mut f = fixture();
+                    resumed_once(&mut f);
+                    f.restart();
+                    assert_eq!(f.sessions.resolve(None, "s1"), "s2");
+                }
+            }
+
+            mod on_the_resumed_session_still_connected {
+                use super::*;
+
+                fn refused() -> (Fixture, LeaseId, Aliased) {
+                    let mut f = fixture();
+                    f.connect("old", Ulid::new(), Some(41));
+                    let lease = f.grant(agent("old"));
+                    f.connect("new", Ulid::new(), Some(42));
+                    let got = f.alias("new", "old");
+                    (f, lease, got)
+                }
+
+                #[test]
+                fn refuses_and_moves_nothing() {
+                    let (mut f, lease, got) = refused();
+                    assert_eq!(got, Aliased::Refused(AliasRefusal::ResumedStillConnected));
+                    assert_eq!(f.lease(&lease).2, agent("old"));
+                    assert_eq!(f.sessions.resolve(None, "old"), "old");
+                }
+
+                #[test]
+                fn records_session_alias_refused_with_the_reason() {
+                    let (mut f, _, _) = refused();
+                    assert_eq!(
+                        refusals(&mut f),
+                        vec![serde_json::json!("resumed_still_connected")]
+                    );
+                }
+            }
+
+            mod on_the_new_proxy_not_connected {
+                use super::*;
+
+                fn refused() -> (Fixture, LeaseId, Aliased) {
+                    let mut f = fixture();
+                    let c = Ulid::new();
+                    f.connect("old", c, Some(41));
+                    let lease = f.grant(agent("old"));
+                    f.disconnect(c);
+                    let got = f.alias("new", "old");
+                    (f, lease, got)
+                }
+
+                #[test]
+                fn refuses_and_moves_nothing() {
+                    let (mut f, lease, got) = refused();
+                    assert_eq!(got, Aliased::Refused(AliasRefusal::NotConnected));
+                    assert_eq!(f.lease(&lease).2, agent("old"));
+                    assert_eq!(f.sessions.grace_ends("old"), Some(T0 + GRACE_MS));
+                }
+
+                #[test]
+                fn records_session_alias_refused_with_the_reason() {
+                    let (mut f, _, _) = refused();
+                    assert_eq!(refusals(&mut f), vec![serde_json::json!("not_connected")]);
+                }
+            }
+
+            mod on_sessions_of_different_projects {
+                use super::*;
+
+                fn refused() -> (Fixture, LeaseId, Aliased) {
+                    let mut f = fixture();
+                    let c = Ulid::new();
+                    f.connect_in("old", c, "/p/one");
+                    let lease = f.grant(agent("old"));
+                    f.disconnect(c);
+                    f.connect_in("new", Ulid::new(), "/p/two");
+                    let got = f.alias("new", "old");
+                    (f, lease, got)
+                }
+
+                #[test]
+                fn refuses_and_moves_nothing() {
+                    let (mut f, lease, got) = refused();
+                    assert_eq!(got, Aliased::Refused(AliasRefusal::ProjectMismatch));
+                    assert_eq!(f.lease(&lease).2, agent("old"));
+                }
+
+                #[test]
+                fn records_session_alias_refused_with_the_reason() {
+                    let (mut f, _, _) = refused();
+                    assert_eq!(
+                        refusals(&mut f),
+                        vec![serde_json::json!("project_mismatch")]
+                    );
+                }
+
+                #[test]
+                fn refuses_after_a_restart_by_the_project_of_the_resumed_leases() {
+                    let mut f = fixture();
+                    let who = Caller {
+                        project: Some(project_key("/p/one")),
+                        ..as_caller(agent("old"))
+                    };
+                    f.store.tx(|tx| f.sched.acquire(tx, &who, req())).unwrap();
+                    f.restart();
+                    f.connect_in("new", Ulid::new(), "/p/two");
+                    assert_eq!(
+                        f.alias("new", "old"),
+                        Aliased::Refused(AliasRefusal::ProjectMismatch)
+                    );
+                }
             }
 
             #[test]
@@ -587,7 +774,7 @@ mod engine {
                 let (store, clock) = seeded();
                 let engine = engine_on(store, clock.clone());
                 let link = engine
-                    .session_connect("s1".into(), Ulid::new(), Some(42))
+                    .session_connect("s1".into(), Ulid::new(), Some(42), None)
                     .await
                     .unwrap();
                 call(&engine, agent("s1"), "acquire").await;
@@ -615,7 +802,7 @@ mod engine {
                 let (store, clock) = seeded();
                 let engine = engine_on(store, clock.clone());
                 let link = engine
-                    .session_connect("s1".into(), Ulid::new(), Some(42))
+                    .session_connect("s1".into(), Ulid::new(), Some(42), None)
                     .await
                     .unwrap();
                 call(&engine, agent("s1"), "acquire").await;
@@ -623,7 +810,7 @@ mod engine {
                 assert!(!engine.session_alive("s1".into()).await.unwrap());
                 clock.advance(GRACE / 2);
                 let _again = engine
-                    .session_connect("s1".into(), Ulid::new(), Some(42))
+                    .session_connect("s1".into(), Ulid::new(), Some(42), None)
                     .await
                     .unwrap();
                 clock.advance(2 * GRACE);
@@ -665,7 +852,7 @@ mod engine {
                 .unwrap();
             let engine = engine_on(store, clock.clone());
             let _link = engine
-                .session_connect("s1".into(), Ulid::new(), None)
+                .session_connect("s1".into(), Ulid::new(), None, None)
                 .await
                 .unwrap();
             clock.advance(2 * GRACE);
@@ -685,7 +872,7 @@ mod engine {
             let (store, clock) = seeded();
             let engine = engine_on(store, clock);
             let _link = engine
-                .session_connect("s1".into(), Ulid::new(), None)
+                .session_connect("s1".into(), Ulid::new(), None, None)
                 .await
                 .unwrap();
             call(&engine, agent("s1"), "acquire").await;
@@ -702,14 +889,14 @@ mod engine {
             let (store, clock) = seeded();
             let engine = engine_on(store, clock.clone());
             let old = engine
-                .session_connect("old".into(), Ulid::new(), Some(41))
+                .session_connect("old".into(), Ulid::new(), Some(41), None)
                 .await
                 .unwrap();
             call(&engine, agent("old"), "acquire").await;
             drop(old);
             assert!(!engine.session_alive("old".into()).await.unwrap());
             let _new = engine
-                .session_connect("new".into(), Ulid::new(), Some(42))
+                .session_connect("new".into(), Ulid::new(), Some(42), None)
                 .await
                 .unwrap();
             engine
@@ -737,7 +924,7 @@ mod engine {
             let (store, clock) = seeded();
             let engine = engine_on(store, clock);
             let _link = engine
-                .session_connect("proxy".into(), Ulid::new(), Some(42))
+                .session_connect("proxy".into(), Ulid::new(), Some(42), None)
                 .await
                 .unwrap();
             assert_eq!(

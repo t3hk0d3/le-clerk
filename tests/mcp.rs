@@ -499,7 +499,7 @@ mod server {
                 let d = Daemon::start();
                 let _live = d
                     .engine
-                    .session_connect("new".into(), ulid::Ulid::new(), Some(4242))
+                    .session_connect("new".into(), ulid::Ulid::new(), Some(4242), None)
                     .await
                     .unwrap();
                 d.engine

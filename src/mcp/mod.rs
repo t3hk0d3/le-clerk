@@ -333,6 +333,8 @@ pub struct LiveIdentity {
     pub connection: Ulid,
     /// The Claude Code process, when the proxy said.
     pub claude_pid: Option<u32>,
+    /// The proxy's start directory, when it said.
+    pub project_dir: Option<PathBuf>,
 }
 
 /// Read a liveness stream's `X-Clerk-Session` and `X-Clerk-Connection`
@@ -347,6 +349,7 @@ pub fn live_identity(headers: &HeaderMap) -> Result<LiveIdentity, IdentityError>
         session_id: claimed.session_id,
         connection: claimed.connection.ok_or(IdentityError::MissingConnection)?,
         claude_pid: claimed.claude_pid,
+        project_dir: claimed.project.map(|(_, dir)| dir),
     })
 }
 

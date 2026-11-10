@@ -4,6 +4,7 @@ pub mod audit;
 pub mod inventory;
 pub mod leases;
 pub mod notices;
+pub mod sessions;
 
 use std::fs;
 use std::path::Path;
@@ -65,6 +66,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0010_description_usage.sql")),
         M::up(include_str!("migrations/0011_resource_tags.sql")),
         M::up(include_str!("migrations/0012_notice_returned.sql")),
+        M::up(include_str!("migrations/0013_session_aliases.sql")),
     ])
 }
 

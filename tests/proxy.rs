@@ -592,6 +592,22 @@ mod proxy {
             assert_eq!(status.code(), Some(0));
             eventually(|| fake.open_streams() == 0, "the stream closes").await;
         }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn writes_the_answer_to_a_request_sent_just_before() {
+            let fake = Fake::start();
+            let mut p = fake.proxy(Some("sess-1"));
+            eventually(|| fake.open_streams() == 1, "the stream opens").await;
+            let reply = tokio::task::spawn_blocking(move || {
+                let id = p.send("json/echo", json!({}));
+                p.close_stdin();
+                assert_eq!(p.wait_exit().code(), Some(0));
+                p.response(id)
+            })
+            .await
+            .unwrap();
+            assert_eq!(reply["result"]["method"], json!("json/echo"));
+        }
     }
 
     mod on_the_daemon_restarting {
