@@ -609,6 +609,7 @@ mod scheduler {
                     request_id,
                     position,
                     estimated_wait,
+                    ..
                 } = out
                 else {
                     panic!("expected queued, got {out:?}");

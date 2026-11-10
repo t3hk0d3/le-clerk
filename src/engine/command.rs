@@ -20,11 +20,11 @@ use crate::inventory::{
     Inventory, InventoryError, NewResource, NewUnit, Promotions, ResourcePatch, UnitPatch, View,
 };
 use crate::model::{
-    Caller, HealthSpec, HolderRef, LeaseId, Priority, PromotionId, RequestId, ResourceId,
-    ResourceType, Scope, UnitId, UnitSettings,
+    Caller, HealthSpec, HolderRef, LeaseId, Priority, ProjectKey, PromotionId, RequestId,
+    ResourceId, ResourceType, Scope, UnitId, UnitSettings,
 };
 use crate::scheduler::{AcquireRequest, Confirm, LeaseEdit, Scheduler, Target};
-use crate::store::inventory as inventory_sql;
+use crate::store::inventory::{self as inventory_sql, ScopeFilter};
 use crate::store::{Tx, audit};
 
 /// Which resources a listing or status covers.
@@ -602,6 +602,80 @@ impl Command {
         }
     }
 
+    /// Run the command in `tx` and encode its result; a `not_found` error
+    /// gains details naming the missing thing (`{"kind", "id"}`) when the
+    /// command names one.
+    pub(crate) fn run(self, tx: &Tx, s: &Services<'_>) -> Result<Value, ApiError> {
+        let subject = self.subject();
+        let project = self.caller().project.clone();
+        self.execute(tx, s).map_err(|mut e| {
+            if e.code == "not_found"
+                && e.details.is_none()
+                && let Some(subject) = subject
+            {
+                e.details = subject.missing(tx, project.as_ref()).ok();
+            }
+            e
+        })
+    }
+
+    /// What the command names, for `not_found` details.
+    fn subject(&self) -> Option<Subject> {
+        let resource = |id: &ResourceId| Some(Subject::Resource(id.clone()));
+        let unit = |r: &ResourceId, u: &UnitId, scope: &Option<ScopeSpec>, admin: bool| {
+            Some(Subject::Unit {
+                resource: r.clone(),
+                unit: u.clone(),
+                scope: scope.clone(),
+                admin,
+            })
+        };
+        let lease = |id: &LeaseId| Some(Subject::Other("lease", id.as_str().to_owned()));
+        let request = |id: &RequestId| Some(Subject::Other("request", id.as_str().to_owned()));
+        match self {
+            Self::UpdateResource(_, a) => resource(&a.id),
+            Self::DeleteResource(_, a) | Self::GetResource(_, a) => resource(&a.id),
+            Self::AddUnit(_, a) => resource(&a.resource),
+            Self::UpdateUnit(_, a) => unit(&a.resource, &a.unit, &a.scope, false),
+            Self::RemoveUnit(_, a) | Self::RetireUnit(_, a) => {
+                unit(&a.resource, &a.unit, &a.scope, false)
+            }
+            Self::ApprovePromotion(_, a) => {
+                Some(Subject::Other("promotion", a.id.as_str().to_owned()))
+            }
+            Self::Acquire(_, a) => match &a.target.unit {
+                Some(u) => unit(&a.target.resource, u, &None, false),
+                None => resource(&a.target.resource),
+            },
+            Self::Claim(_, a)
+            | Self::GetLease(_, a)
+            | Self::LeaseHolder(_, a)
+            | Self::RefuseYield(_, a)
+            | Self::Reclaim(_, a)
+            | Self::AdminRelease(_, a) => lease(&a.lease_id),
+            Self::Extend(_, a) => lease(&a.lease_id),
+            Self::Release(_, a) => lease(&a.lease_id),
+            Self::Confirm(_, a) => lease(&a.lease_id),
+            Self::RequestCleanupExtension(_, a) => lease(&a.lease_id),
+            Self::SetInterruptible(_, a) => lease(&a.lease_id),
+            Self::RehomeHolder(_, a) => lease(&a.lease_id),
+            Self::AdminEditLease(_, a) => lease(&a.lease_id),
+            Self::Cancel(_, a) | Self::RequestHolder(_, a) | Self::AdminDequeue(_, a) => {
+                request(&a.request_id)
+            }
+            Self::AdminClearQueue(_, a) | Self::AdminDeleteResource(_, a) => resource(&a.resource),
+            Self::AdminRemoveUnit(_, a) | Self::AdminClean(_, a) => {
+                unit(&a.resource, &a.unit, &a.scope, true)
+            }
+            Self::AdminMove(_, a) => resource(&a.resource),
+            Self::AdminRename(_, a) => match &a.unit {
+                Some(u) => unit(&a.resource, u, &a.scope, true),
+                None => resource(&a.resource),
+            },
+            _ => None,
+        }
+    }
+
     /// Run the command in `tx` and encode its result. `DaemonStop` only
     /// records the request; stopping is the engine's job.
     // One flat arm per command reads better than splitting the table.
@@ -868,6 +942,54 @@ impl Command {
                 other.method()
             ))),
         }
+    }
+}
+
+/// The thing a command names, for the details of a `not_found` error.
+enum Subject {
+    /// A resource.
+    Resource(ResourceId),
+    /// A unit of a resource; `admin` commands resolve ids in every scope.
+    Unit {
+        resource: ResourceId,
+        unit: UnitId,
+        scope: Option<ScopeSpec>,
+        admin: bool,
+    },
+    /// A lease, request or promotion: its kind and id.
+    Other(&'static str, String),
+}
+
+impl Subject {
+    /// `{"kind", "id"}` of what is missing: for a unit, the resource when
+    /// that is missing too, else `<resource>/<unit>`.
+    fn missing(self, tx: &Tx, project: Option<&ProjectKey>) -> Result<Value, ApiError> {
+        let resource_exists = |id: &ResourceId, scope: Option<&ScopeSpec>, admin: bool| {
+            let found = match scope {
+                Some(spec) => inventory_sql::find_in_scope(tx, &spec.scope(), id)?.is_some(),
+                None if admin => inventory_sql::list_resources(tx, ScopeFilter::All)?
+                    .iter()
+                    .any(|r| &r.id == id),
+                None => inventory_sql::find_visible(tx, project, id)?.is_some(),
+            };
+            Ok::<bool, ApiError>(found)
+        };
+        Ok(match self {
+            Self::Resource(id) => json!({"kind": "resource", "id": id}),
+            Self::Unit {
+                resource,
+                unit,
+                scope,
+                admin,
+            } => {
+                if resource_exists(&resource, scope.as_ref(), admin)? {
+                    json!({"kind": "unit", "id": format!("{resource}/{unit}")})
+                } else {
+                    json!({"kind": "resource", "id": resource})
+                }
+            }
+            Self::Other(kind, id) => json!({"kind": kind, "id": id}),
+        })
     }
 }
 

@@ -1039,6 +1039,8 @@ pub struct Promotion {
     pub id: PromotionId,
     /// The resource that would be promoted.
     pub resource: ResourceId,
+    /// Its scope now (a project).
+    pub scope: Scope,
     /// The promoted resource's description, as it is now.
     pub description: String,
     /// The project whose registration raised it, if any.
@@ -1088,17 +1090,19 @@ impl Promotions {
     /// # Errors
     /// [`PromotionError::Store`] on storage failure.
     pub fn list(&self, tx: &Tx) -> Result<Vec<Promotion>, PromotionError> {
-        Ok(sql::list_promotions(tx)?
-            .into_iter()
-            .map(|p| Promotion {
+        let mut out = Vec::new();
+        for p in sql::list_promotions(tx)? {
+            out.push(Promotion {
+                scope: sql::load_resource(tx, p.resource_row)?.scope,
                 id: p.id,
                 resource: p.resource_id,
                 description: p.resource_description,
                 requester: p.requester,
                 reason: p.reason,
                 created_at: p.created_at,
-            })
-            .collect())
+            });
+        }
+        Ok(out)
     }
 
     /// Move the promoted resource to user scope, under `new_id` when given.

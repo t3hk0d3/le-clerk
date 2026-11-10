@@ -655,7 +655,7 @@ impl Engine {
             scheduler: &self.scheduler,
             now_ms: self.clock.now_ms(),
         };
-        self.store.tx(|tx| command.execute(tx, &services))
+        self.store.tx(|tx| command.run(tx, &services))
     }
 
     /// Process due deadlines and dispatch, in one transaction, and remember

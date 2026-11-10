@@ -177,6 +177,9 @@ pub enum AcquireOutcome {
         /// check, nothing on the targets is leased, or a lease's remaining
         /// time is unknown (paused).
         estimated_wait: Option<Duration>,
+        /// What keeps the request from a unit now; `None` when nothing
+        /// specific does.
+        blocked_by: Option<BlockedBy>,
     },
     /// An override by a paused holder against its own borrower: the
     /// borrower is reclaimed and the unit returns to the paused lease.
@@ -184,6 +187,52 @@ pub enum AcquireOutcome {
         /// The caller's paused lease, which gets the unit back.
         lease_id: LeaseId,
     },
+}
+
+/// What keeps a queued request from a unit when it is queued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BlockedBy {
+    /// Every free target unit failed its last health check; each is checked
+    /// again after `recheck_ms`.
+    Unhealthy {
+        units: Vec<UnhealthyUnit>,
+        recheck_ms: u64,
+    },
+    /// Target units are held: the lease that ends first.
+    Held {
+        unit: UnitId,
+        holder: HolderRef,
+        lease_id: LeaseId,
+        purpose: String,
+        ends_at: Option<i64>,
+    },
+    /// A unit linked to a target unit (the same physical thing) is leased:
+    /// the lease that ends first. Its resource, unit, holder and purpose are
+    /// told only when the caller may see its resource.
+    Linked {
+        unit: UnitId,
+        held_resource: Option<ResourceId>,
+        held_unit: Option<UnitId>,
+        holder: Option<HolderRef>,
+        purpose: Option<String>,
+        ends_at: Option<i64>,
+    },
+    /// A target unit is free and healthy, but earlier requests come first.
+    Queue {
+        /// Requests ahead of this one.
+        ahead: u32,
+    },
+}
+
+/// A free unit whose last health check failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnhealthyUnit {
+    pub unit: UnitId,
+    /// The check's message, e.g. `connect failed`.
+    pub message: String,
+    /// When it was checked (unix ms).
+    pub checked_at: Option<i64>,
 }
 
 /// A lease as seen by its holder.
@@ -468,6 +517,103 @@ fn group(tx: &Tx, unit_row: i64) -> Result<Vec<i64>, SchedulerError> {
 /// True when any member of `group` has a live lease.
 fn group_busy(tx: &Tx, group: &[i64]) -> Result<bool, SchedulerError> {
     Ok(!leases::live_leases_on(tx, group)?.is_empty())
+}
+
+/// What keeps a request just queued (at `position`) on the resource at
+/// `resource_row` (only the unit at `pinned`, when set) from a unit: every
+/// free target unit unhealthy, else the held lease that ends first, else a
+/// leased linked unit, else the requests ahead.
+fn blocked_by(
+    tx: &Tx,
+    who: &Caller,
+    resource_row: i64,
+    pinned: Option<i64>,
+    position: u32,
+) -> Result<Option<BlockedBy>, SchedulerError> {
+    // Loaded afresh: the acquire's health checks have just been recorded.
+    let resource = inventory_sql::load_resource(tx, resource_row)?;
+    let mut unhealthy = Vec::new();
+    let mut free_healthy = false;
+    let mut held: Vec<(&Unit, LeaseRow)> = Vec::new();
+    let mut linked: Vec<(&Unit, LeaseRow)> = Vec::new();
+    for unit in resource
+        .units
+        .iter()
+        .filter(|u| !u.retiring && pinned.is_none_or(|p| p == u.row))
+    {
+        let live = leases::live_leases_on(tx, &group(tx, unit.row)?)?;
+        if live.is_empty() {
+            match unit
+                .last_health
+                .as_deref()
+                .and_then(|h| h.strip_prefix("unhealthy"))
+            {
+                Some(why) => unhealthy.push(UnhealthyUnit {
+                    unit: unit.id.clone(),
+                    message: why.trim_start_matches(':').trim().to_owned(),
+                    checked_at: unit.last_health_at,
+                }),
+                None => free_healthy = true,
+            }
+            continue;
+        }
+        for lease in live {
+            if lease.unit_row == unit.row {
+                held.push((unit, lease));
+            } else {
+                linked.push((unit, lease));
+            }
+        }
+    }
+    let ahead = position.saturating_sub(1);
+    if free_healthy {
+        return Ok(Some(BlockedBy::Queue { ahead }));
+    }
+    if !unhealthy.is_empty() {
+        return Ok(Some(BlockedBy::Unhealthy {
+            units: unhealthy,
+            recheck_ms: u64::try_from(HEALTH_RECHECK_BACKOFF.as_millis()).unwrap_or(u64::MAX),
+        }));
+    }
+    let ending = |l: &LeaseRow| l.ends_at.unwrap_or(i64::MAX);
+    if let Some((unit, lease)) = held.into_iter().min_by_key(|(_, l)| ending(l)) {
+        return Ok(Some(BlockedBy::Held {
+            unit: unit.id.clone(),
+            holder: lease.holder,
+            lease_id: lease.id,
+            purpose: lease.purpose,
+            ends_at: lease.ends_at,
+        }));
+    }
+    if let Some((unit, lease)) = linked.into_iter().min_by_key(|(_, l)| ending(l)) {
+        let held_on = inventory_sql::load_resource(tx, lease.resource_row)?;
+        let visible = can_see(who.project.as_ref(), &held_on.scope);
+        let held_unit = held_on
+            .units
+            .iter()
+            .find(|u| u.row == lease.unit_row)
+            .map(|u| u.id.clone());
+        return Ok(Some(if visible {
+            BlockedBy::Linked {
+                unit: unit.id.clone(),
+                held_resource: Some(held_on.id),
+                held_unit,
+                holder: Some(lease.holder),
+                purpose: Some(lease.purpose),
+                ends_at: lease.ends_at,
+            }
+        } else {
+            BlockedBy::Linked {
+                unit: unit.id.clone(),
+                held_resource: None,
+                held_unit: None,
+                holder: None,
+                purpose: None,
+                ends_at: lease.ends_at,
+            }
+        }));
+    }
+    Ok((ahead > 0).then_some(BlockedBy::Queue { ahead }))
 }
 
 /// The actor recorded for actions the scheduler takes on its own.
@@ -884,6 +1030,7 @@ impl Scheduler {
         .filter(|u| !u.retiring)
         .collect();
         let estimated_wait = self.estimate(tx, &after, row, &eligible)?;
+        let blocked_by = blocked_by(tx, who, resource.row, pinned.map(|u| u.row), position)?;
         audit::record(
             tx,
             self.now(),
@@ -902,6 +1049,7 @@ impl Scheduler {
             request_id,
             position,
             estimated_wait,
+            blocked_by,
         })
     }
 

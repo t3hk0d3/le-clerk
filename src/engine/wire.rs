@@ -15,7 +15,7 @@ use crate::model::{
     PromotionId, RequestId, Resource, ResourceId, ResourceType, Scope, TagSet, Unit, UnitId,
     UnitSettings,
 };
-use crate::scheduler::{AcquireOutcome, Grant, Lease, MyLeases, MyRequest};
+use crate::scheduler::{AcquireOutcome, BlockedBy, Grant, Lease, MyLeases, MyRequest};
 use crate::store::audit::AuditEntry;
 
 /// Milliseconds in `d`, saturating.
@@ -125,6 +125,8 @@ impl From<Created<Unit>> for CreatedUnit {
 pub struct PromotionView {
     pub id: PromotionId,
     pub resource: ResourceId,
+    /// The resource's scope now (a project).
+    pub scope: Scope,
     pub description: String,
     pub requester: Option<ProjectKey>,
     pub reason: String,
@@ -136,6 +138,7 @@ impl From<Promotion> for PromotionView {
         Self {
             id: p.id,
             resource: p.resource,
+            scope: p.scope,
             description: p.description,
             requester: p.requester,
             reason: p.reason,
@@ -158,6 +161,9 @@ pub enum AcquireView {
         position: u32,
         /// `null` when unknown.
         estimated_wait_ms: Option<u64>,
+        /// What keeps the request from a unit now; `null` when nothing
+        /// specific does.
+        blocked_by: Option<BlockedBy>,
     },
     /// A paused holder's override of its own borrower: the unit comes back.
     Reclaiming { lease_id: LeaseId },
@@ -171,10 +177,12 @@ impl From<AcquireOutcome> for AcquireView {
                 request_id,
                 position,
                 estimated_wait,
+                blocked_by,
             } => Self::Queued {
                 request_id,
                 position,
                 estimated_wait_ms: estimated_wait.map(millis),
+                blocked_by,
             },
             AcquireOutcome::Reclaiming { lease_id } => Self::Reclaiming { lease_id },
         }
