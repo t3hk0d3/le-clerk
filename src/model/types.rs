@@ -2,13 +2,14 @@
 
 use std::path::PathBuf;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::error::ErrorCode;
 
 /// The kind of thing a resource leases out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceType {
     /// A device node.
@@ -32,7 +33,9 @@ impl ResourceType {
 }
 
 /// Request priority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     /// Lowest.
@@ -58,7 +61,7 @@ pub enum Scope {
 }
 
 /// Whether a service unit is something to connect to or to listen as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceMode {
     /// A server already runs; the holder connects.
@@ -68,7 +71,7 @@ pub enum ServiceMode {
 }
 
 /// Per-unit settings handed to the holder.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UnitSettings {
     /// A device node.
@@ -410,7 +413,8 @@ impl ErrorCode for InvalidHealthSpec {
 }
 
 /// The built-in checks a resource type offers, in display order.
-fn allowed_builtins(resource_type: ResourceType) -> &'static [BuiltinCheck] {
+#[must_use]
+pub fn allowed_builtins(resource_type: ResourceType) -> &'static [BuiltinCheck] {
     use BuiltinCheck as B;
     match resource_type {
         ResourceType::Device => &[B::Exists, B::Accessible, B::NotOpen, B::None],

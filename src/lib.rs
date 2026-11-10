@@ -13,6 +13,7 @@ pub mod engine;
 pub mod error;
 pub mod health;
 pub mod inventory;
+pub mod mcp;
 pub mod model;
 pub mod scheduler;
 pub mod scope;

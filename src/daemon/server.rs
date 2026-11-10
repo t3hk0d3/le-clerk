@@ -4,6 +4,7 @@
 //! - `POST /v1/rpc/{method}` with `{"caller": Caller, "args": {...}}` →
 //!   `200 {"result": ...}` or an error status with
 //!   `{"error": {"code": "...", "message": "..."}}`
+//! - `POST /mcp`: the MCP endpoint (see [`crate::mcp`]).
 //! - `GET /v1/notices?holder=<url-encoded HolderRef JSON>&wait=<secs, max 60>`
 //!   → `200 {"result": [Notice, ...]}` (the long-poll). Optional
 //!   `leases=<id,id…>` and `requests=<id,id…>` narrow it to notices naming
@@ -67,7 +68,8 @@ pub fn router_with(engine: EngineHandle, info: &ServerInfo) -> Router {
         )
         .route("/v1/rpc/{method}", post(rpc))
         .route("/v1/notices", get(notices))
-        .with_state(engine)
+        .with_state(engine.clone())
+        .merge(crate::mcp::router(engine))
 }
 
 impl IntoResponse for ApiError {
