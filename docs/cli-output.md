@@ -31,11 +31,11 @@ with `--json`, every command prints JSON instead and none of this applies.
   - resource IDs: bold;
   - `⚠` and its text: yellow.
   - Nothing else is coloured.
-- **Glyphs**: `▮` free unit, `▯` busy unit, `⚠` unhealthy or dirty, box-drawing
-  tables and trees. When the locale isn't UTF-8, or with `--ascii`: `#`, `.`,
-  `!` and `+--+` tables.
-- **Tables** (lists) use `comfy-table`, sized to the terminal, with wrapped
-  cells. Detail views (`resource show`, grant, queued) are indented blocks.
+- **Glyphs**: `▮` free unit, `▯` busy unit, `⚠` unhealthy or dirty. When the
+  locale isn't UTF-8, or with `--ascii`: `#`, `.` and `!`.
+- **Layout**: no tables. Every view is a list of blocks: a header line with
+  the IDs and short facts, then indented lines for free text and details
+  (user decision).
 - **Errors**: the first sentence says what happened and names the missing thing
   (`not found: resource "nope"`); JSON error messages never carry clap's
   "try '--help'" tail.
@@ -44,47 +44,46 @@ with `--json`, every command prints JSON instead and none of this applies.
 
 `clerk resources`
 ```
-┌──────────┬─────────┬───────────────────┬──────────┬───────────────────────────────┐
-│ RESOURCE │ TYPE    │ SCOPE             │ FREE     │ DESCRIPTION · TAGS            │
-├──────────┼─────────┼───────────────────┼──────────┼───────────────────────────────┤
-│ esp32-c6 │ device  │ user              │ ▮▯ 1/2   │ ESP32-C6 devkits on the bench │
-│          │         │                   │          │ hub                           │
-│          │         │                   │          │ devboard esp32 esp32c6 thread │
-│ otbr     │ service │ user              │ ▯ 0/1 ⚠  │ Thread border router REST API │
-│          │         │                   │          │ otbr thread                   │
-│ nrf52    │ device  │ ~/dev/zigbee-fw   │ ▯ 0/1    │ nRF52840 dongles              │
-│          │         │                   │          │ nrf52 thread                  │
-└──────────┴─────────┴───────────────────┴──────────┴───────────────────────────────┘
+esp32-c6 ▮▯ 1/2 free · device · user
+  ESP32-C6 devkits on the bench hub
+  tags: devboard esp32 esp32c6 thread zigbee
+otbr ▯ 0/1 free ⚠ · service · user
+  Thread border router REST API
+  tags: otbr thread
+nrf52 ▯ 0/1 free · device · project ~/dev/zigbee-fw
+  nRF52840 dongles
+  tags: nrf52 thread
 ```
 
 `clerk status`
 ```
 esp32-c6 ▮▯ 1/2 free · device · user · devboard esp32 esp32c6 thread zigbee
-│ ESP32-C6 devkits on the bench hub
-├─ b1 ▯ held by cli · ends in 27m · lse_01M71FRGTW9BC1FSABQRDH7TZ1
-│     hub port 1 · "third"
-└─ b2 ▮ free · ⚠ dirty: command_failed 4m ago (pid 129293)
-      hub port 2, cracked antenna
+  ESP32-C6 devkits on the bench hub
+  b1 ▯ held by cli · ends in 27m · lse_01M71FRGTW9BC1FSABQRDH7TZ1
+     hub port 1 · "third"
+  b2 ▮ free · ⚠ dirty: command_failed 4m ago (pid 129293)
+     hub port 2, cracked antenna
+
 otbr ▯ 0/1 free ⚠ · service · user · otbr thread
-│ Thread border router REST API
-└─ main ▯ ⚠ unhealthy: connect failed (checked 12s ago)
-   queue: 1. pid 130150 · normal · "check api" · req_01M71FTC912KWSMGKC34CHWA9K
+  Thread border router REST API
+  main ▯ ⚠ unhealthy: connect failed (checked 12s ago)
+  queue:
+    1. pid 130150 · normal · "check api" · req_01M71FTC912KWSMGKC34CHWA9K
 ```
 
 `clerk leases`
 ```
-┌────────────────────────────────┬─────────────┬───────┬───────────┬────────────────┐
-│ LEASE                          │ UNIT        │ STATE │ ENDS      │ HOLDER         │
-├────────────────────────────────┼─────────────┼───────┼───────────┼────────────────┤
-│ lse_01M71FRGTW9BC1FSABQRDH7TZ1 │ esp32-c6/b1 │ held  │ in 27m    │ cli            │
-│                                │ "third"     │       │           │                │
-│ lse_01M71FSCFXS610PFPXM97CM6FX │ nrf52/d1    │ held  │ in 3m     │ agent 3f2a9c1e │
-│                                │ also blocks │       │           │                │
-│                                │ dongle/x    │       │           │                │
-└────────────────────────────────┴─────────────┴───────┴───────────┴────────────────┘
+lse_01M71FRGTW9BC1FSABQRDH7TZ1  esp32-c6/b1 · held · ends in 27m · cli
+  "third"
+lse_01M71FSCFXS610PFPXM97CM6FX  nrf52/d1 · held · ends in 3m · agent 3f2a9c1e
+  also blocks dongle/x (same device)
 ```
 
-`clerk queue <resource>`: table with POS, REQUEST, HOLDER, PRIORITY, PURPOSE.
+`clerk queue otbr`
+```
+1. req_01M71FTC912KWSMGKC34CHWA9K · pid 130150 · normal
+   "check api"
+```
 
 `clerk resource show esp32-c6`
 ```
@@ -128,18 +127,14 @@ or a linked unit busy.
 
 `clerk log`
 ```
-┌─────────┬──────────────┬──────────────────────────────────────────────┐
-│ WHEN    │ ACTION       │ WHAT                                         │
-├─────────┼──────────────┼──────────────────────────────────────────────┤
-│ 9s ago  │ offered      │ otbr/main → cli · lse_01M71FWE…              │
-│ 41s ago │ queued       │ otbr by cli · "late"                         │
-│ 43s ago │ lease_ended  │ tokens/t1 · released, cleanup confirmed      │
-└─────────┴──────────────┴──────────────────────────────────────────────┘
+9s ago   offered      otbr/main → cli · lse_01M71FWE…
+41s ago  queued       otbr by cli · "late"
+43s ago  lease_ended  tokens/t1 · released, cleanup confirmed
 ```
 
 `clerk promotions`
 ```
-prm_01M71FSCD807F5CX1J7EJ0TBA6  nrf52 (project ~/dev/zigbee-fw)
+prm_01M71FSCD807F5CX1J7EJ0TBA6  nrf52 · project ~/dev/zigbee-fw
   nRF52840 dongles
   requested by ~/dev/thread-app: a matching unit was registered there
 Approve with `clerk approve prm_01M71FSCD807F5CX1J7EJ0TBA6`.

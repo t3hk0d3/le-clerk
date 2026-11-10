@@ -296,8 +296,8 @@ and mock-ups are the contract for this task).
 
 **Files:**
 - Create: `src/cli/render.rs` (shared styling, glyphs, holder/project/time
-  formatting, tables via `comfy-table`)
-- Modify: `Cargo.toml` (add `comfy-table`), `src/cli/{output,views,inventory,lease,live,admin,mod}.rs`
+  formatting, block lists; no tables)
+- Modify: `src/cli/{output,views,inventory,lease,live,admin,mod}.rs`
 - Modify (daemon, only if needed): the queued `acquire` result gains a
   `blocked_by` field describing what blocks the request (unhealthy units with
   their check message, held units with the earliest-ending holder and purpose,
@@ -311,7 +311,7 @@ and mock-ups are the contract for this task).
   non-UTF-8 locale (`LC_ALL`/`LC_CTYPE`/`LANG`).
 - `render::holder(&Value) -> String`, `render::project(&ProjectKey) -> String`
   (repo folder, `~` for home), `render::when(ms) -> String`,
-  `render::tags(&[String], &Style) -> String`, `render::table(...)`.
+  `render::tags(&[String], &Style) -> String`.
 - Global flag `--ascii`; `clerk log --wide`.
 
 **BDD skeleton:**
@@ -331,9 +331,9 @@ cli human output (stdout is a TTY)
         On --ascii or a non-UTF-8 locale
             - no non-ASCII characters
     resources / leases / queue / log / promotions
-        - match the mock-ups in docs/cli-output.md (tables, columns, occupancy bar)
+        - match the mock-ups in docs/cli-output.md (block lists, occupancy bar; no tables)
     status
-        - matches the mock-up (header with bar, unit tree, queue line)
+        - matches the mock-up (header with bar, indented units, queue line)
     resource show / grant / queued
         - match the mock-ups; usage indented under its label
     queued acquire
