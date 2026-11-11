@@ -16,7 +16,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::Context;
-use leclerk::client::{ApiError, Client, DaemonError};
+use leclerk::client::{ApiError, Client, DaemonError, RECONNECT_FOR};
 use leclerk::model::{Caller, HolderRef};
 use leclerk::scheduler::liveness::host_alive;
 use serde_json::{Value, json};
@@ -83,6 +83,8 @@ async fn steps(
     let deadline = args.timeout.map(|t| Instant::now() + t);
     let started = Instant::now();
     let mut first = true;
+    // Since when steps go unanswered: the give-up budget outlives a step.
+    let mut unreached_since: Option<Instant> = None;
     loop {
         if !host_alive(&host) {
             return finish(
@@ -108,6 +110,9 @@ async fn steps(
         };
         let was_first = first;
         first = false;
+        if gave_up_waiting(&mut unreached_since, step["status"] == "unreached") {
+            return daemon_gone(md, args, daemon_never_came_back());
+        }
         match step["status"].as_str() {
             Some("timeout") => {}
             // Not answered in time (the daemon is away): the checks above
@@ -170,6 +175,25 @@ async fn steps(
             }
             other => anyhow::bail!("the daemon answered the wait with {other:?}"),
         }
+    }
+}
+
+/// Track `unreached` steps since `since`; whether they went on for
+/// [`RECONNECT_FOR`], the budget a reconnect has by itself.
+fn gave_up_waiting(since: &mut Option<Instant>, unreached: bool) -> bool {
+    if !unreached {
+        *since = None;
+        return false;
+    }
+    since.get_or_insert_with(Instant::now).elapsed() >= RECONNECT_FOR
+}
+
+/// The error of a daemon that did not come back in time.
+fn daemon_never_came_back() -> ApiError {
+    ApiError {
+        code: "daemon_unavailable".to_owned(),
+        message: "the clerk daemon did not come back; retry, or check the daemon log".to_owned(),
+        details: None,
     }
 }
 

@@ -4771,6 +4771,28 @@ mod cli {
             }
         }
 
+        /// A wait without --timeout still gives up on a daemon that never
+        /// comes back, as the reconnect budget says.
+        mod on_no_timeout_while_the_daemon_cannot_come_back {
+            use super::*;
+
+            #[test]
+            fn ends_with_daemon_unavailable_after_about_the_reconnect_budget() {
+                let s = Stopping::new();
+                let mut wait = s.armed_wait(&[]);
+                let started = Instant::now();
+                s.signal_daemon(libc::SIGKILL);
+                fs::remove_file(&s.clerk).unwrap();
+                let status = wait_within(&mut wait, Duration::from_secs(50));
+                let status = status.expect("the wait never gave up");
+                let took = started.elapsed();
+                assert!(!status.success(), "{status:?}");
+                assert!(took >= Duration::from_secs(25), "took {took:?}");
+                let out = stdout_of(&mut wait) + &stderr_of(&mut wait);
+                assert!(out.contains("daemon_unavailable"), "{out}");
+            }
+        }
+
         mod on_an_agent_wait_started_after_a_stop {
             use super::*;
 
