@@ -1,7 +1,10 @@
 # `clerk` human output
 
-The reference for what `clerk` prints on a terminal. Without a terminal, or
-with `--json`, every command prints JSON instead and none of this applies.
+The reference for what `clerk` prints on a terminal. Without a terminal,
+commands print JSON for scripts, or Markdown in an agent session (see
+[Agent sessions](#agent-sessions)); `--json` always prints JSON. None of the
+terminal rules below apply to either. (The serial numbers in the mock-ups are
+placeholders.)
 
 ## Rules
 
@@ -100,9 +103,9 @@ esp32-c6  device · user
   tags:   devboard esp32 esp32c6 thread zigbee
   health: type default (exists, not-open)
   units:
-  ◦ b1  /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_F0:F5:BD:01:02:03-if00
+  ◦ b1  /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_XX:XX:XX:XX:XX:01-if00
         hub port 1
-  ◦ b2  /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_F0:F5:BD:01:02:04-if00
+  ◦ b2  /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_XX:XX:XX:XX:XX:02-if00
         hub port 2, cracked antenna
   usage (template):
     Flash: `idf.py -p {unit.path} flash`
@@ -115,7 +118,7 @@ Granted: esp32-c6/b2 until 14:32 (in 2h) · lse_01M71FRZ5ATGAMR1GZB0MQF2XZ
   ESP32-C6 devkits on the bench hub
   b2: hub port 2, cracked antenna
   tags: devboard esp32 esp32c6 thread zigbee
-  path: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_F0:F5:BD:01:02:04-if00
+  path: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_XX:XX:XX:XX:XX:02-if00
   usage:
     Flash: `idf.py -p /dev/serial/by-id/usb-Espressif_…-if00 flash`
   ⚠ dirty: the last holder's command failed (command_failed); expect a messy state
@@ -171,6 +174,8 @@ person view.
 - A list is one `## <id>` block per item, without `Next:`.
 - An error is `## Error: <code>` and its message (ending with the next
   step), on stdout.
+- `clerk run` ends with `- child_exit: N` (the command's exit code; `{"child_exit":
+  N}` in JSON) once the command has run.
 
 ```text
 ## Granted: c6-boards/c6-a

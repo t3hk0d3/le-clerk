@@ -39,6 +39,15 @@ board" can be served by either.
   Other braces (`${PORT}`, JSON) pass through unchanged; an unknown
   `{resource.*}` or `{unit.*}` key is refused when you save the usage.
 
+## Limits
+
+- Resource and unit ids: `^[a-z0-9][a-z0-9._-]{0,62}$`.
+- Descriptions: one line, at most 200 characters.
+- Tags: at most 16 per resource, each 1 to 32 characters (lowercase letters,
+  digits and `-`, starting with a letter or digit).
+- Usage: at most 4096 bytes.
+- Durations (`--for`): `<n>s|m|h|d`, whole n of at least 1, up to 30 days.
+
 ## Scopes
 
 - **User scope:** visible from every project of your user. This is where
@@ -72,13 +81,21 @@ and the unit is checked again later).
 | Type | Built-in checks |
 |------|-----------------|
 | `device` | `exists`, `accessible`, `not-open` (no process has it open) |
-| `service` | `tcp-connect` (something listens), `port-free` (nothing does), `http` |
+| `service` | `tcp-connect` (something listens), `port-free` (nothing does), `http` (a plain `GET /` to the unit's host and port answers 2xx; `https` is not supported) |
 | `generic` | none |
 
 Every type also takes `custom`: your own command, given the unit's settings
 as `CLERK_UNIT_*` environment variables, healthy when it exits 0 within the
 timeout. `none` turns checks off. Devices default to `exists` and
-`not-open`.
+`not-open`; a service in `connect` mode defaults to `tcp-connect`, one in
+`listen` mode to `port-free`; a generic resource has none.
+
+The local checks (`exists`, `accessible`, `not-open`, `port-free`) run in
+place. `tcp-connect`, `http` and custom checks run off the daemon's engine
+thread, each limited by `health_timeout` (10 s by default), so a first
+acquire of a unit with no recent check result can take up to that plus 2 s.
+Custom checks run with only `HOME`, `PATH`, `XDG_*`, `CLERK_HOME`, `LANG`,
+`RUST_LOG` and the unit's `CLERK_*` variables in their environment.
 
 If a unit is busy because **your own** running job uses it (a bench that
 already has the port open), lease that unit with `--skip-checks` instead of
@@ -106,13 +123,26 @@ logged.
      **abandoned**, and the new owner is told.
 4. **Hand-back.** `clerk release` gives the unit back with its cleanup
    confirmed. `release --cleanup` opens a **cleanup window** (2 minutes)
-   ended by `clerk confirm <lease> clean`. A hand-over without
+   ended by `clerk confirm <lease> clean`; `clerk extend <lease> --cleanup`
+   adds one more window (`cleanup_extension`, 2 minutes), once. A hand-over without
    confirmed cleanup marks the unit **dirty**, and the next holder is told.
+
+### Priority
+
+A request has a priority, `low`, `normal` (the default) or `high`. A unit's
+queue is ordered by priority, then by arrival. A higher priority also lets a
+request ask an interruptible holder to yield (see below); a request of equal
+priority can do so only when it is shorter than the holder's remaining time.
+A holder's `clerk extend` is refused while a request of strictly higher
+priority waits for the unit, unless the lease is interruptible. Leave it at
+`normal` unless the user says otherwise.
 
 ### Interruptible leases
 
 Long work that can pause safely (soak tests, benchmarks) can be leased
-`--interruptible`. When a more urgent request waits, the holder gets a
+`--interruptible`. Only agent sessions can: a lease from the command line
+(`clerk acquire`, `clerk run`) is never interrupted, and asking for it there
+is a usage error. When a more urgent request waits, the holder gets a
 **yield request**: it pauses at a safe point and runs `clerk confirm <lease>
 yielded`, or refuses with `clerk yield <lease> --refuse`. The borrower uses
 the unit, gives it back, and the paused holder's clock resumes; if the
@@ -122,7 +152,10 @@ borrower overruns, the holder can `clerk reclaim` it.
 
 `--override "<reason>"` takes a unit even from a holder that cannot be
 interrupted. Agents use it only when the user tells them to; the reason goes
-into the audit log.
+into the audit log. The daemon refuses an agent's call to the `admin` tools,
+`daemon stop` and a few other commands without it (`override_required`; the
+list is in [cli.md](cli.md#the-daemon)). The reason is the caller's own
+word, so this stops mistakes, not a hostile process.
 
 ## Holders and liveness
 

@@ -1,7 +1,8 @@
 //! The `clerk` command line: argument parsing, dispatch and exit codes.
 //!
-//! Every command prints human text when stdout is a terminal and JSON
-//! otherwise (or with `--json`). Nothing but command output reaches stdout;
+//! Every command prints human text when stdout is a terminal, and JSON
+//! otherwise (or with `--json`), except in an agent session, where it is
+//! Markdown unless `--json` or `CLERK_AGENT_FORMAT=json`. Nothing but command output reaches stdout;
 //! logs go to stderr. Stdin is never read unless it is a terminal, except
 //! for `-f -` on the inventory commands and the hook input of `clerk hook`.
 

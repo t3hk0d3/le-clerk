@@ -41,8 +41,9 @@ Checked with Claude Code 2.1.321.
    the daemon runs the new build. A daemon of another version keeps serving
    clients as long as it speaks the same protocol; only a protocol change
    makes clients refuse it (`protocol_mismatch`, exit 5, saying to run
-   `clerk daemon restart`). Restarting keeps leases and queues; agents whose
-   Claude Code still runs keep theirs.
+   `clerk daemon restart`); waits that are running end with
+   `protocol_mismatch` too. The current protocol is 5. Restarting keeps leases
+   and queues; agents whose Claude Code still runs keep theirs.
 
 3. **Add the marketplace** (this GitHub repository), from a shell:
 
@@ -63,8 +64,9 @@ Checked with Claude Code 2.1.321.
    `--scope project` writes `"enabledPlugins": {"leclerk@leclerk": true}` to
    the project's `.claude/settings.json`; collaborators also need the
    marketplace added. Inside a session, `/plugin install leclerk@leclerk`
-   asks for the scope. `claude plugin marketplace update leclerk` fetches a
-   newer version from GitHub. A plugin from a local marketplace is read in place from
+   asks for the scope. To update the plugin, run
+   `claude plugin marketplace update leclerk` and then
+   `claude plugin update leclerk@leclerk`, and restart Claude Code. A plugin from a local marketplace is read in place from
    the checkout (`claude plugin list` shows `Read from: …/integrations/claude-code`),
    so skill and hook edits apply on the next session start.
 
@@ -97,13 +99,17 @@ until you delete it.
 
 ## What the hooks do
 
-All four hooks run `clerk hook <event>`. They do nothing unless Claude
-Code's variables (`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`) are set, read
+All four hooks run `clerk hook <event>` through
+`integrations/claude-code/hooks/clerk-hook.sh`, a small wrapper that runs
+`$CLERK_BIN` (default: `clerk` on `PATH`) and exits 0 without output when
+that binary is missing, so a hook never fails for want of it. They do nothing
+unless either of Claude Code's variables (`CLAUDE_CODE_SESSION_ID`,
+`CLAUDE_PID`) is set (the session itself comes from the hook input), read
 Claude Code's hook input from stdin, ask the daemon about the session, and
 **fail open**: if the daemon isn't running, is slow or answers with an error,
 the hook exits 0 with no output and the agent carries on. They never start
-the daemon. Budget: 2 s for the first three, 1.5 s for SessionEnd (Claude
-Code's limit).
+the daemon. Clerk keeps each hook under 2 s (1.5 s for SessionEnd, Claude
+Code's limit); `hooks.json` allows 3 s (1.5 s for SessionEnd).
 
 | Event | What it does |
 |-------|--------------|
@@ -137,8 +143,12 @@ Code's limit).
   new daemon (starting one themselves if it is not back within a few
   seconds) and carry on, so agents' waits, `acquire --wait` and the live
   view keep going. `clerk daemon stop` tells them it stopped: an agent's
-  wait ends cleanly saying so. A client keeps working with a daemon of
-  another version as long as both speak the same protocol.
+  wait ends cleanly saying so (a stopped daemon leaves a `stopped` marker, so
+  waits do not restart it; any other `clerk` command does). A crashed daemon
+  leaves no marker, so waits start a new one. A client keeps working with a
+  daemon of another version as long as both speak the same protocol; a
+  protocol change ends running waits with `protocol_mismatch` until you run
+  `clerk daemon restart`.
 
 ### Trust model
 
@@ -147,6 +157,18 @@ your user. Inside that boundary there is no further authentication: any
 process running as you can call the daemon's RPCs or run `clerk hook …` with
 a made-up session ID or `CLAUDE_PID`. The clerk protects agents from each
 other's mistakes, not from a hostile process under your account.
+
+**Agent policy.** In an agent session the daemon requires `--override
+"<reason>"` for `daemon stop` (but not `daemon restart`), the `admin` tools
+(except `export` and a `doctor` without `--fix`) and handing a lease to
+another holder; the CLI also asks for it for `approve`, `promotions`, `log`,
+`release --force` and taking a unit another holder has. Agents are told to
+use it only on the user's word. The reason is asserted by the client, so it
+is a speed bump against mistakes, not a security control. An auto-started
+daemon and custom health checks run with an allow-listed environment
+(`HOME`, `PATH`, `XDG_*`, `CLERK_HOME`, `LANG`, `RUST_LOG`; checks also get the
+unit's `CLERK_*` variables), so an agent's variables and your shell's tokens
+do not leak into them.
 
 ### What the model sees
 
@@ -160,89 +182,9 @@ with the next step, on stdout. `--json` or `CLERK_AGENT_FORMAT=json` prints
 the JSON instead (with `summary` and `next`). The format is described in
 `docs/cli-output.md`, "Agent sessions".
 
-## Manual checklist
+## Problems
 
-These checks drive real Claude Code sessions; they are not in CI. Run them in
-isolation so they never touch your real clerk state or Claude Code settings.
-The helper scripts are in `scripts/e2e/`
-(`T7` below). They take every path from the environment (`env.sh` lists the
-variables and their defaults):
-
-- `run-claude.sh`: runs `claude` with the release `clerk` (from
-  `CLERK_BIN_DIR`) first on `PATH`, the temp `CLERK_HOME`, the plugin loaded
-  for that run only (`--plugin-dir $LECLERK_REPO/integrations/claude-code`)
-  and user settings not read (`--setting-sources project`). Nothing is
-  installed.
-- `tm.sh`: `init` makes the subject project (`T7_SUBJECT`, a git repo) and
-  the tmux session; `start`, `send`, `cap` and `pid` drive interactive
-  sessions in a private tmux server (`tmux -L $T7_TMUX`), with `--model
-  haiku`, Bash and Monitor allowed (`--allowedTools=Bash,Monitor`)
-  and a `--debug-file` each in `T7_SCRATCH`; `stop` kills the server.
-- `clerk-user.sh`: runs that `clerk` as the user against `CLERK_HOME`.
-
-Set-up, once, in the shell you run the checks from:
-
-```sh
-cargo build --release
-export LECLERK_REPO=$PWD T7=$PWD/scripts/e2e
-export CLERK_BIN_DIR=${CARGO_TARGET_DIR:-$PWD/target}/release
-export CLERK_HOME=/tmp/clerk-t7          # short: the socket path must stay under 107 bytes
-export T7_SCRATCH=/tmp/clerk-t7-scratch T7_TMUX=t7
-mkdir -p $CLERK_HOME/config $T7_SCRATCH
-echo 'reconnect_grace = 20' > $CLERK_HOME/config/config.toml   # shorter grace for item 3
-$T7/tm.sh init
-$T7/clerk-user.sh resource create c6-boards --type device --scope user \
-  --description "ESP32-C6 dev boards on the test hub" \
-  --usage 'Flash with `idf.py -p {unit.path} flash`. Clean = erase flash.' \
-  --tag esp32c6 --tag devboard --health exists
-touch /tmp/board-a; $T7/clerk-user.sh unit add c6-boards c6-a --path /tmp/board-a
-```
-
-`clerk-user.sh` starts the daemon on first use. Interactive sessions start in
-`T7_SUBJECT`; Claude Code asks once to trust a new folder there, which it
-records in your `~/.claude.json`. To avoid that, point `T7_SUBJECT` at a
-directory you already trust, or use `claude -p` (no trust prompt).
-Afterwards: exit the sessions, `$T7/clerk-user.sh daemon stop`,
-`$T7/tm.sh stop`.
-
-1. **Two sessions, one board: the second queues, then its wait wakes it.**
-   Start sessions A and B (`tm.sh start A`). Ask A to lease `c6-boards`;
-   ask B the same. B reports "queued at position 1" and runs `clerk wait` in
-   the background. Ask A to release. Expect B, without a prompt, to read the
-   wait's output, with the offer already claimed, and report the grant.
-2. **An idle session is woken by an expiry warning.** Let a session lease
-   for `2m` (the warning comes at 20 % of the duration, at most 5 min) with a
-   wait running, then leave it idle. Expect it to wake about 24 s before the
-   end and extend, release, or ask.
-3. **`/clear` releases.** A session holds a lease; type `/clear`. Expect
-   `clerk leases` to show the lease gone at once, and the new conversation's
-   first answer to know it was released (the SessionStart brief).
-4. **Killing a session frees its board after the grace; `--continue` within
-   it keeps it.** A session holds a lease; `kill -9` its `claude` process
-   (`tm.sh pid A`). Expect `clerk leases` to keep the lease for
-   `reconnect_grace`, then the unit free and dirty (`holder_gone`). Again,
-   but start `claude --continue` within the grace: the lease stays, and the
-   brief lists it.
-5. **The Stop hook reminder appears once.** In `claude -p`, have the agent
-   lease something and end its turn without a wait. Expect exactly one Stop
-   block whose reason starts "Le Clerk: this session has 1 live lease but no
-   clerk wait is armed", and a second Stop (with `stop_hook_active`) that
-   lets the turn end.
-6. **Registration follows the skill.** Make fake device files (e.g.
-   `/tmp/hub/serial/by-id/usb-Espressif_…-if00`, two of a kind plus one
-   other) and ask: "Register the boards on my hub", saying where they are.
-   Expect the agent to read the clerk skill's `registering.md`, run
-   `clerk resources` first, group identical boards into one resource, write
-   a description, usage with `{unit.path}` placeholders, and tags, leave
-   `--scope` out (project scope), and add one unit per device with stable
-   paths.
-7. **Plugin load.** With `--debug-file`, check the log for `Loading hooks
-   from plugin: leclerk`, no hook schema error, the `clerk` skill listed,
-   and `SessionEnd:… [clerk hook session-end] completed`.
-
-### Results
-
-Last run 2026-11-10 (Claude Code 2.1.321, Haiku, isolated): items 1, 3, 4,
-5 and 6 passed. Items 2 (an idle session woken by an expiry warning) and 7
-(plugin load) were not re-run since the agent interface moved to the CLI.
-Not covered: the desktop app, VS Code and real hardware.
+[troubleshooting.md](troubleshooting.md) covers the daemon log, error codes
+and what to do about `session_not_hosted`, `agent_unidentified` and
+`protocol_mismatch`. The manual test checklist for contributors is in
+[testing.md](testing.md).

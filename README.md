@@ -92,9 +92,13 @@ One `clerk` binary is everything: it starts a small local daemon on first
 use (a Unix socket in your runtime directory, SQLite for state), and talks
 to it from the CLI. The Claude Code plugin adds one skill that teaches
 agents the lease loop and four hooks that keep them informed. There is no
-server to run, no account, and no network access.
+server to run and no account: no cloud service and no remote clients, only
+a Unix socket in your runtime directory. (Some health checks, `tcp-connect`
+and `http`, open connections to the unit they probe.)
 
 ## Install
+
+Linux only; it needs Rust 1.91 or later to build.
 
 ```sh
 cargo build --release
@@ -106,20 +110,49 @@ claude plugin install leclerk@leclerk --scope user
 
 Then restart Claude Code. Agents need Claude Code 2.1.214 or later.
 
+**Upgrading:** build and install the new `clerk`, run `clerk daemon restart`
+(leases and queues survive), update the plugin with `claude plugin marketplace
+update leclerk` and `claude plugin update leclerk@leclerk`, and restart Claude
+Code.
+
+## Good to know
+
+- **Limits.** Ids match `^[a-z0-9][a-z0-9._-]{0,62}$`; a resource has at most
+  16 tags of 1 to 32 characters; usage text is at most 4096 bytes; leases last
+  at most 30 days. ([Concepts](docs/concepts.md#limits))
+- **Priority.** `--priority low|normal|high` orders the queue, and lets a
+  more urgent request ask an interruptible holder to pause.
+  ([Concepts](docs/concepts.md#priority))
+- **Configuration.** `config.toml` holds timings and retention (90 days for
+  leases and the audit log). It is read when the daemon starts, so run
+  `clerk daemon restart` after editing it; unknown keys are refused.
+  `cleanup_extension` is the extra time `clerk extend <lease> --cleanup` adds
+  to a cleanup window, once. ([CLI reference](docs/cli.md#files-and-configuration))
+- **Trust.** Anything running as your user can talk to the daemon. `--override`
+  for agents guards against mistakes, not against a hostile process.
+  ([Trust model](docs/claude-code.md#trust-model))
+
 ## Documentation
 
 - [Concepts](docs/concepts.md): resources and units, scopes, the lease
-  lifecycle, health checks, duplicates, notices.
+  lifecycle, priority, health checks, duplicates, notices, limits.
 - [CLI reference](docs/cli.md): every command, output formats, exit codes,
-  files and configuration.
+  the daemon, files and configuration.
 - [Claude Code](docs/claude-code.md): installing the plugin, what the hooks
-  do, how sessions map to leases, and a manual test checklist.
+  do, how sessions map to leases, the trust model.
 - [Output format](docs/cli-output.md): what people and agents see.
+- [Troubleshooting](docs/troubleshooting.md): the daemon log, error codes and
+  exit codes, common failures.
+
+For contributors: [STYLEGUIDE.md](STYLEGUIDE.md), [Testing](docs/testing.md)
+(the automated suite and the manual Claude Code checklist) and
+[the demo's README](scripts/demo/README.md).
 
 ## Status
 
-Early, and local by design: one machine, one OS user. Linux first; macOS
-should work. Used daily on a bench of ESP32 boards, but expect rough edges.
+Early, and local by design: one machine, one OS user. Linux only: liveness
+tracking and the default device check read `/proc`. Used daily on a bench of
+ESP32 boards, but expect rough edges.
 
 ## Development
 
@@ -129,9 +162,11 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Conventions are in [STYLEGUIDE.md](STYLEGUIDE.md). Set `CLERK_HOME` to a
-scratch directory to keep experiments away from your real state.
+Conventions are in [STYLEGUIDE.md](STYLEGUIDE.md); the manual checklist is in
+[docs/testing.md](docs/testing.md). Set `CLERK_HOME` to a scratch directory
+to keep experiments away from your real state.
 
 ## License
 
-[AGPL-3.0](LICENSE).
+Copyright (C) 2026 Igor Yamolov. Licensed under
+[AGPL-3.0-only](LICENSE).

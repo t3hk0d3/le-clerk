@@ -4,6 +4,12 @@ version = "0.4.0"
 license = "AGPL-3.0-only"
 edition = "2024"
 description = "Local resource-lease broker for AI coding agents"
+repository = "https://github.com/t3hk0d3/le-clerk"
+homepage = "https://github.com/t3hk0d3/le-clerk"
+readme = "README.md"
+rust-version = "1.91"
+keywords = ["lease", "broker", "claude-code", "agents", "embedded"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "leclerk"
