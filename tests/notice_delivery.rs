@@ -37,6 +37,9 @@ const PASS: u8 = 0;
 const LOSE_FIRST: u8 = 1;
 /// `/v1/notices` answers nothing, as for a waiter between two polls.
 const HIDE: u8 = 2;
+/// As [`HIDE`], and the waiter cannot read its request's state either: the
+/// armed wait is sure to see the news first.
+const BLIND: u8 = 3;
 
 const SESSION: &str = "sess-1";
 
@@ -59,12 +62,16 @@ struct Gate {
     inner: Router,
     mode: Arc<AtomicU8>,
     lost: Arc<AtomicUsize>,
+    reading: Arc<AtomicUsize>,
 }
 
 async fn through_gate(State(gate): State<Gate>, request: Request) -> Response {
+    if request.uri().path() == "/v1/rpc/list_my_leases" {
+        return state_read(gate, request).await;
+    }
     let notices = request.uri().path() == "/v1/notices";
     let mode = gate.mode.load(Ordering::SeqCst);
-    if notices && mode == HIDE {
+    if notices && (mode == HIDE || mode == BLIND) {
         tokio::time::sleep(Duration::from_millis(20)).await;
         return axum::Json(json!({ "result": [] })).into_response();
     }
@@ -88,12 +95,28 @@ async fn through_gate(State(gate): State<Gate>, request: Request) -> Response {
     Response::from_parts(parts, Body::from(bytes))
 }
 
+/// A waiter reading its request's state: refused while [`BLIND`]. It counts
+/// as reading before it looks at the mode, so [`Daemon::blind_waiters`] can
+/// wait out the reads that got past.
+async fn state_read(gate: Gate, request: Request) -> Response {
+    gate.reading.fetch_add(1, Ordering::SeqCst);
+    let response = if gate.mode.load(Ordering::SeqCst) == BLIND {
+        let error = json!({"error": {"code": "internal_error", "message": "blind"}});
+        (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(error)).into_response()
+    } else {
+        gate.inner.clone().oneshot(request).await.unwrap()
+    };
+    gate.reading.fetch_sub(1, Ordering::SeqCst);
+    response
+}
+
 /// A real engine serving a private clerk home through a [`Gate`].
 struct Daemon {
     env: TestEnv,
     engine: EngineHandle,
     mode: Arc<AtomicU8>,
     lost: Arc<AtomicUsize>,
+    reading: Arc<AtomicUsize>,
 }
 
 impl Daemon {
@@ -127,10 +150,12 @@ impl Daemon {
         .unwrap();
         let mode = Arc::new(AtomicU8::new(PASS));
         let lost = Arc::new(AtomicUsize::new(0));
+        let reading = Arc::new(AtomicUsize::new(0));
         let gate = Gate {
             inner: http::router(engine.clone()),
             mode: mode.clone(),
             lost: lost.clone(),
+            reading: reading.clone(),
         };
         let app = Router::new().fallback(through_gate).with_state(gate);
         let listener = tokio::net::UnixListener::bind(&paths.socket).unwrap();
@@ -140,6 +165,7 @@ impl Daemon {
             engine,
             mode,
             lost,
+            reading,
         };
         daemon.seed_board().await;
         daemon
@@ -147,6 +173,16 @@ impl Daemon {
 
     fn set_mode(&self, mode: u8) {
         self.mode.store(mode, Ordering::SeqCst);
+    }
+
+    /// From here on waiters learn nothing, until the mode changes: no read
+    /// of a request's state is still on its way to the engine.
+    async fn blind_waiters(&self) {
+        self.set_mode(BLIND);
+        until("state reads in flight end", || async {
+            self.reading.load(Ordering::SeqCst) == 0
+        })
+        .await;
     }
 
     async fn rpc(&self, method: &str, caller: &Caller, args: Value) -> Value {
@@ -283,7 +319,7 @@ impl Daemon {
             .unwrap();
         match answer {
             AgentWait::Notices(notices) => notices,
-            _ => panic!("the armed wait got no notices"),
+            other => panic!("the armed wait got no notices: {other:?}"),
         }
     }
 }
@@ -488,6 +524,16 @@ mod waiting_for_an_offer_in_an_agent_session {
         child
     }
 
+    /// As [`offered`], with the waiter blind until the test lets it see.
+    async fn offered_unseen(daemon: &Daemon, marker: &std::path::Path) -> Child {
+        let other = daemon.hold("other").await;
+        let child = run_recording(daemon, marker);
+        daemon.queued_request().await;
+        daemon.blind_waiters().await;
+        daemon.give_back("other", &other).await;
+        child
+    }
+
     mod on_the_armed_wait_claiming_the_offer_first {
         use super::*;
 
@@ -497,7 +543,7 @@ mod waiting_for_an_offer_in_an_agent_session {
             let dir = tempfile::TempDir::new().unwrap();
             let marker = dir.path().join("lease");
             daemon.set_mode(HIDE);
-            let child = offered(&daemon, &marker).await;
+            let child = offered_unseen(&daemon, &marker).await;
             let notices = daemon.armed_wait_step().await;
             let offer = notices
                 .iter()
@@ -513,6 +559,7 @@ mod waiting_for_an_offer_in_an_agent_session {
                 .ack_notices(session_holder(), ids)
                 .await
                 .unwrap();
+            daemon.set_mode(HIDE);
             let out = finished(child).await;
             assert!(out.status.success(), "{out:?}");
             let ran_with = fs::read_to_string(&marker).unwrap();
@@ -531,6 +578,7 @@ mod waiting_for_an_offer_in_an_agent_session {
             daemon.set_mode(HIDE);
             let child = run_recording(&daemon, &dir.path().join("lease"));
             let request = daemon.queued_request().await;
+            daemon.blind_waiters().await;
             daemon
                 .rpc(
                     "admin_dequeue",
@@ -545,6 +593,7 @@ mod waiting_for_an_offer_in_an_agent_session {
                 .ack_notices(session_holder(), ids)
                 .await
                 .unwrap();
+            daemon.set_mode(HIDE);
             let out = finished(child).await;
             assert_eq!(out.status.code(), Some(4), "{out:?}");
         }
@@ -613,6 +662,7 @@ mod live_view {
             ],
         );
         daemon.queued_request().await;
+        daemon.blind_waiters().await;
         (tty, other)
     }
 
@@ -638,6 +688,7 @@ mod live_view {
                 .ack_notices(session_holder(), ids)
                 .await
                 .unwrap();
+            daemon.set_mode(HIDE);
             tty.expect("Ctrl+C releases");
         }
     }
@@ -651,6 +702,7 @@ mod live_view {
             let (tty, other) = queued_view(&daemon).await;
             daemon.give_back("other", &other).await;
             daemon.armed_wait_reads_all().await;
+            daemon.set_mode(HIDE);
             tty.expect("Ctrl+C releases");
         }
     }
@@ -671,6 +723,7 @@ mod live_view {
                 )
                 .await;
             daemon.armed_wait_reads_all().await;
+            daemon.set_mode(HIDE);
             tty.expect("EXIT=4");
         }
     }
