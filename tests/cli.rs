@@ -7274,6 +7274,94 @@ mod cli {
                 }
             }
 
+            mod override_of_a_linked_unit_busy_in_another_project {
+                use super::*;
+
+                fn forced(env: &Env, beta: &Path, md: bool) -> std::process::Output {
+                    let mut cmd = if md {
+                        env.agent_md("sess-b", beta)
+                    } else {
+                        env.agent("sess-b", beta)
+                    };
+                    let out = cmd
+                        .env(CLAUDE_PID, env.own_host("sess-b", beta).to_string())
+                        .args(["acquire", "shared", "--for", "10m", "--override", "asked"])
+                        .output()
+                        .unwrap();
+                    assert_eq!(out.status.code(), Some(6), "{out:?}");
+                    out
+                }
+
+                /// The JSON answer of the override and the lease it took.
+                fn overridden(env: &Env) -> (Value, String) {
+                    let beta = linked_elsewhere(env);
+                    let alpha = env.dir("alpha");
+                    let mine = json_of(env.agent("sess-a", &alpha).args(["leases", "--mine"]));
+                    let theirs = mine["leases"][0]["lease_id"].as_str().unwrap().to_owned();
+                    let out = forced(env, &beta, false);
+                    (serde_json::from_slice(&out.stdout).unwrap(), theirs)
+                }
+
+                #[test]
+                fn json_withholds_the_holder_and_lease() {
+                    let env = Env::new();
+                    let (body, _) = overridden(&env);
+                    assert!(body["displaced"]["holder"].is_null(), "{body}");
+                    assert!(body["displaced"]["lease_id"].is_null(), "{body}");
+                }
+
+                #[test]
+                fn json_still_says_a_unit_was_taken() {
+                    let env = Env::new();
+                    let (body, _) = overridden(&env);
+                    assert!(body["displaced"].is_object(), "{body}");
+                }
+
+                #[test]
+                fn the_answer_names_neither_anywhere() {
+                    let env = Env::new();
+                    let (body, theirs) = overridden(&env);
+                    let text = body.to_string();
+                    assert!(!text.contains(&theirs), "{text}");
+                    assert!(!text.contains("sess-a"), "{text}");
+                }
+
+                #[test]
+                fn the_summary_says_it_was_in_another_project() {
+                    let env = Env::new();
+                    let (body, _) = overridden(&env);
+                    let summary = body["summary"].to_string();
+                    assert!(summary.contains("another project"), "{body}");
+                    assert!(summary.contains("overridden"), "{body}");
+                }
+
+                #[test]
+                fn the_heading_says_it_was_taken_from_another_project() {
+                    let env = Env::new();
+                    let beta = linked_elsewhere(&env);
+                    let out = forced(&env, &beta, true);
+                    let md = String::from_utf8_lossy(&out.stdout).into_owned();
+                    let heading = md.lines().next().unwrap();
+                    assert!(heading.contains("taken from another project"), "{md}");
+                }
+
+                #[test]
+                fn human_says_it_was_taken_from_another_project() {
+                    let env = Env::new();
+                    let beta = linked_elsewhere(&env);
+                    let shown = env.tty(&format!(
+                        "{PLAIN} cd '{}' && {SESSION_VAR}=sess-b {CLAUDE_PID}={} \"$CLERK\" \
+                         acquire shared --for 1m --override asked < /dev/null",
+                        beta.display(),
+                        env.own_host("sess-b", &beta)
+                    ));
+                    assert!(
+                        shown.contains("Taken from a lease in another project"),
+                        "{shown}"
+                    );
+                }
+            }
+
             mod queued_acquire_on_a_linked_unit_busy_in_another_project {
                 use super::*;
 

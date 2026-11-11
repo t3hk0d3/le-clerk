@@ -1390,13 +1390,20 @@ fn outcome_text(v: &Value, target: &str) -> String {
                 let _ = write!(t, "\n  Expected turn: {}.", render::when(now + ms, now));
             }
             if let Some(d) = v.get("displaced").filter(|d| d.is_object()) {
-                let _ = write!(
-                    t,
-                    "\n  Taken from {}: lease {} is overridden and ends after its cleanup \
-                     window.",
-                    render::holder(&d["holder"]),
-                    text(&d["lease_id"])
-                );
+                if d["lease_id"].is_null() {
+                    t.push_str(
+                        "\n  Taken from a lease in another project: it is overridden and ends \
+                         after its cleanup window.",
+                    );
+                } else {
+                    let _ = write!(
+                        t,
+                        "\n  Taken from {}: lease {} is overridden and ends after its cleanup \
+                         window.",
+                        render::holder(&d["holder"]),
+                        text(&d["lease_id"])
+                    );
+                }
             }
             t
         }

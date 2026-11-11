@@ -248,11 +248,13 @@ pub enum AcquireOutcome {
 }
 
 /// The lease an override acquire displaced: it ends after its cleanup
-/// window and the overrider is served first.
+/// window and the overrider is served first. Its holder and id are told only
+/// when the caller may see its resource (it can be on a linked unit of
+/// another project).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Displaced {
-    pub holder: HolderRef,
-    pub lease_id: LeaseId,
+    pub holder: Option<HolderRef>,
+    pub lease_id: Option<LeaseId>,
 }
 
 /// What keeps a queued request from a unit when it is queued.
@@ -1364,9 +1366,17 @@ impl Scheduler {
                         purpose: &req.purpose,
                     };
                     self.apply_override(tx, who, lease, request_id, reason, other)?;
-                    *shown = Some(Displaced {
-                        holder: lease.holder.clone(),
-                        lease_id: lease.id.clone(),
+                    let held_on = inventory_sql::load_resource(tx, lease.resource_row)?;
+                    *shown = Some(if can_see(who.project.as_ref(), &held_on.scope) {
+                        Displaced {
+                            holder: Some(lease.holder.clone()),
+                            lease_id: Some(lease.id.clone()),
+                        }
+                    } else {
+                        Displaced {
+                            holder: None,
+                            lease_id: None,
+                        }
                     });
                 }
                 _ => self.maybe_request_yield(tx, request_id)?,

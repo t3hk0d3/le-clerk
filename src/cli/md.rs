@@ -234,7 +234,12 @@ fn heading(m: &Map<String, Value>) -> (Option<String>, Vec<&'static str>) {
                 None => format!("## Queued: request {}", s("request_id").unwrap_or("?")),
             };
             if let Some(d) = m.get("displaced").filter(|d| d.is_object()) {
-                let _ = write!(h, " (taken from {})", super::render::holder(&d["holder"]));
+                let from = if d["holder"].is_null() {
+                    "another project".to_owned()
+                } else {
+                    super::render::holder(&d["holder"])
+                };
+                let _ = write!(h, " (taken from {from})");
             }
             (Some(h), vec!["outcome"])
         }

@@ -152,6 +152,13 @@ fn queued(v: &Value) -> (Vec<String>, String) {
 /// ends and that the unit comes to the caller after it.
 fn displaced_line(v: &Value) -> Option<String> {
     let d = v.get("displaced").filter(|d| d.is_object())?;
+    if d["lease_id"].is_null() {
+        return Some(
+            "A lease on the same device in another project was overridden at your request: it \
+             ends after its cleanup window, then the unit is offered to you."
+                .to_owned(),
+        );
+    }
     Some(format!(
         "Lease {} of {} was overridden at your request: it ends after its cleanup window, then \
          the unit is offered to you.",
