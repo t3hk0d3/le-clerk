@@ -295,7 +295,8 @@ impl Hook {
         let unshown = brief["unshown"]
             .as_array()
             .context("the brief has no unshown notices")?;
-        let Some((context, ids)) = notice_context(unshown) else {
+        let armed = brief["open_waits"].as_u64().unwrap_or(0) > 0;
+        let Some((context, ids)) = notice_context(unshown, armed) else {
             return Ok(None);
         };
         session
@@ -439,7 +440,7 @@ fn plural(n: u64, what: &str) -> String {
 /// The `additionalContext` for `notices` and the ids it shows; `None`
 /// without notices. At most [`MAX_CONTEXT`] characters: notices that do
 /// not fit are counted, not shown (a later hook shows them).
-fn notice_context(notices: &[Value]) -> Option<(String, Vec<String>)> {
+fn notice_context(notices: &[Value], armed: bool) -> Option<(String, Vec<String>)> {
     // A notice without an id cannot be marked shown: it is left out.
     let notices: Vec<(&str, &Value)> = notices
         .iter()
@@ -448,9 +449,13 @@ fn notice_context(notices: &[Value]) -> Option<(String, Vec<String>)> {
     if notices.is_empty() {
         return None;
     }
+    let hearing = if armed {
+        "your armed clerk wait also reports them"
+    } else {
+        "no clerk wait is armed: arm a clerk wait (see the clerk skill) so notices reach you"
+    };
     let mut context = format!(
-        "Le Clerk: {} for this session. Act on them; your armed clerk wait also reports \
-         them.\n",
+        "Le Clerk: {} for this session. Act on them; {hearing}.\n",
         plural(notices.len() as u64, "pending notice")
     );
     let mut ids = Vec::new();
@@ -514,22 +519,38 @@ mod tests {
 
     #[test]
     fn context_is_none_without_notices() {
-        assert!(notice_context(&[]).is_none());
+        assert!(notice_context(&[], true).is_none());
     }
 
     #[test]
     fn context_lists_each_notice_with_its_id_and_action() {
-        let (context, ids) = notice_context(&[notice("N1", "Claim it.")]).unwrap();
+        let (context, ids) = notice_context(&[notice("N1", "Claim it.")], true).unwrap();
         assert_eq!(ids, vec!["N1".to_owned()]);
         assert!(context.contains("[N1] offered (board/u1, lease L1): Claim it."));
         assert!(context.contains("clerk wait"));
     }
 
     #[test]
+    fn context_says_the_armed_wait_reports_them_when_one_is_armed() {
+        let (context, _) = notice_context(&[notice("N1", "Claim it.")], true).unwrap();
+        assert!(
+            context.contains("your armed clerk wait also reports"),
+            "{context}"
+        );
+    }
+
+    #[test]
+    fn context_tells_the_agent_to_arm_a_wait_when_none_is_armed() {
+        let (context, _) = notice_context(&[notice("N1", "Claim it.")], false).unwrap();
+        assert!(context.contains("arm a clerk wait"), "{context}");
+        assert!(!context.contains("your armed"), "{context}");
+    }
+
+    #[test]
     fn context_stays_within_the_cap_and_counts_the_rest() {
         let action = "x".repeat(900);
         let notices: Vec<Value> = (0..50).map(|i| notice(&format!("N{i}"), &action)).collect();
-        let (context, ids) = notice_context(&notices).unwrap();
+        let (context, ids) = notice_context(&notices, true).unwrap();
         assert!(context.chars().count() <= MAX_CONTEXT);
         assert!(ids.len() < 50 && !ids.is_empty());
         assert!(context.contains(&format!("{} more notices", 50 - ids.len())));
@@ -539,8 +560,8 @@ mod tests {
     fn context_leaves_out_notices_without_an_id() {
         let mut no_id = notice("N0", "Lost.");
         no_id.as_object_mut().unwrap().remove("id");
-        assert!(notice_context(std::slice::from_ref(&no_id)).is_none());
-        let (context, ids) = notice_context(&[no_id, notice("N1", "Claim it.")]).unwrap();
+        assert!(notice_context(std::slice::from_ref(&no_id), true).is_none());
+        let (context, ids) = notice_context(&[no_id, notice("N1", "Claim it.")], true).unwrap();
         assert_eq!(ids, vec!["N1".to_owned()]);
         assert!(context.contains("1 pending notice "), "{context}");
         assert!(!context.contains("more notice"), "{context}");

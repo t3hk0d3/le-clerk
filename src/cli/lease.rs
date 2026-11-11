@@ -155,8 +155,9 @@ pub struct WaitArgs {
     /// Return after the first batch of notices (or after 30 s with none).
     #[arg(long)]
     pub once: bool,
-    /// Agent sessions: print one JSON line per notice as it arrives and
-    /// keep running until the session ends (for Claude Code's Monitor tool).
+    /// Agent sessions: print one Markdown block per notice as it arrives (JSON
+    /// lines with --json) and keep running until the session ends (for Claude
+    /// Code's Monitor tool).
     #[arg(long)]
     pub follow: bool,
     /// Agent sessions: give up after this long with an empty batch:

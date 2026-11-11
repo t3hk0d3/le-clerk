@@ -436,6 +436,17 @@ mod cli {
                 assert_eq!(out.status.code(), Some(0), "{out:?}");
                 assert!(String::from_utf8_lossy(&out.stdout).contains("Usage: clerk status"));
             }
+
+            #[test]
+            fn wait_help_describes_markdown_blocks_and_json_lines_only_with_json() {
+                let env = Env::new();
+                let out = env.cmd().args(["wait", "--help"]).output().unwrap();
+                let text = String::from_utf8_lossy(&out.stdout).replace('\n', " ");
+                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(text.contains("Markdown block per notice"), "{text}");
+                assert!(text.contains("JSON lines with --json"), "{text}");
+                assert!(!text.contains("print one JSON line per notice"), "{text}");
+            }
         }
     }
 
@@ -3701,17 +3712,19 @@ mod cli {
 
                 /// Review finding 3: an offer this session already holds
                 /// (claimed by hand, or by a wait that died before acking)
-                /// counts as claimed, not as a failed claim.
+                /// is dropped as superseded, not a failed claim.
                 #[test]
-                fn an_offer_already_claimed_counts_as_claimed() {
+                fn an_offer_already_claimed_is_dropped_not_a_failed_claim() {
                     let env = Env::new();
                     let dir = env.dir("alpha");
                     let theirs = agent_queued(&env, &dir);
                     free(&env, "x", &theirs);
                     let lease = lease_of(&unit_status(&env)["occupancy"]);
                     json_of(env.agent("sess-1", &dir).args(["claim", &lease]));
-                    let body = json_of(env.agent("sess-1", &dir).args(["wait"]));
-                    assert_eq!(body["claimed"][0]["state"], "held", "{body}");
+                    let body = json_of(env.agent("sess-1", &dir).args(["wait", "--timeout", "1s"]));
+                    // The offer is superseded by the claim: nothing to report,
+                    // and no failed claim.
+                    assert_eq!(body["notices"], json!([]), "{body}");
                     assert!(
                         !body["summary"].to_string().contains("Could not claim"),
                         "{body}"
@@ -4036,8 +4049,7 @@ mod cli {
                 let theirs = agent_queued(&env, &dir);
                 free(&env, "x", &theirs);
                 let text = text_of(env.agent_md("sess-1", &dir).arg("wait"));
-                assert!(text.contains("## Notice: offered\n"), "{text}");
-                assert!(text.contains("## Lease lse_"), "{text}");
+                assert!(text.contains("## Claimed: lease lse_"), "{text}");
                 assert!(
                     text.trim_end()
                         .lines()
@@ -4067,6 +4079,80 @@ mod cli {
                         .args(["wait", "--timeout", "1s"]),
                 );
                 assert!(!text.contains("## Notice"), "{text}");
+            }
+
+            mod on_an_offer_claimed_by_the_wait {
+                use super::*;
+
+                fn claimed_batch() -> String {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let theirs = agent_queued(&env, &dir);
+                    free(&env, "x", &theirs);
+                    text_of(env.agent_md("sess-1", &dir).arg("wait"))
+                }
+
+                #[test]
+                fn prints_a_claimed_heading_and_no_claim_before_the_deadline_text() {
+                    let text = claimed_batch();
+                    assert!(text.contains("## Claimed: lease lse_"), "{text}");
+                    assert!(!text.contains("before the deadline"), "{text}");
+                    assert!(!text.contains("## Notice: offered"), "{text}");
+                }
+
+                #[test]
+                fn next_does_not_ask_to_claim() {
+                    let text = claimed_batch();
+                    let next = text.lines().find(|l| l.starts_with("Next: ")).unwrap();
+                    assert!(next.contains("It is yours (claimed)"), "{text}");
+                    assert!(!next.contains("claim lease"), "{text}");
+                    assert!(!next.contains("Act on each notice"), "{text}");
+                }
+            }
+
+            mod on_a_follow_wait_killed_after_notices_were_printed {
+                use super::*;
+
+                #[test]
+                fn the_last_line_does_not_say_before_any_notice_arrived() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let theirs = agent_queued(&env, &dir);
+                    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"))
+                        .args(["wait", "--follow"])
+                        .env("CLERK_HOME", env.home())
+                        .env(SESSION_VAR, "sess-1")
+                        .env(CLAUDE_PID, std::process::id().to_string())
+                        .current_dir(&dir)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    let out = lines(&mut child);
+                    free(&env, "x", &theirs);
+                    let mut seen = Vec::new();
+                    while let Ok(line) = out.recv_timeout(PATIENCE) {
+                        let next = line.starts_with("Next: ");
+                        seen.push(line);
+                        if next {
+                            break;
+                        }
+                    }
+                    let pid = i32::try_from(child.id()).unwrap();
+                    // SAFETY: plain kill(2) on our own child.
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                    while let Ok(line) = out.recv_timeout(PATIENCE) {
+                        seen.push(line);
+                    }
+                    let _ = child.wait();
+                    let text = seen.join("\n");
+                    assert!(text.contains("## Notice: offered"), "{text}");
+                    assert!(
+                        text.contains("The wait was stopped (time limit or signal)."),
+                        "{text}"
+                    );
+                    assert!(!text.contains("before any notice arrived"), "{text}");
+                }
             }
 
             #[test]

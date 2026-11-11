@@ -82,11 +82,14 @@ pub fn wait(value: &Value, now_ms: i64) -> String {
         _ => Vec::new(),
     };
     let mut parts: Vec<String> = Vec::new();
+    let claimed = as_list("claimed");
     for n in as_list("notices").into_iter().chain(as_list("notice")) {
-        parts.push(block(&n, now_ms));
+        if !spent_offer(&n, &claimed) {
+            parts.push(block(&n, now_ms));
+        }
     }
-    for l in as_list("claimed") {
-        parts.push(block(&l, now_ms));
+    for l in &claimed {
+        parts.push(claimed_block(l, now_ms));
     }
     let summary: Vec<&str> = value["summary"]
         .as_array()
@@ -102,6 +105,30 @@ pub fn wait(value: &Value, now_ms: i64) -> String {
         parts.push(format!("Next: {next}"));
     }
     parts.join("\n\n")
+}
+
+/// Whether `notice` is an offer of one of the `claimed` leases: the claimed
+/// lease says everything the offer did.
+#[must_use]
+pub fn spent_offer(notice: &Value, claimed: &[Value]) -> bool {
+    notice["kind"] == "offered"
+        && notice["lease_id"]
+            .as_str()
+            .is_some_and(|id| claimed.iter().any(|l| l["lease_id"].as_str() == Some(id)))
+}
+
+/// A lease a wait claimed: headed `## Claimed: lease <id>`, then its fields.
+fn claimed_block(lease: &Value, now_ms: i64) -> String {
+    let text = block(lease, now_ms);
+    let Some(id) = lease["lease_id"].as_str() else {
+        return text;
+    };
+    match text.split_once('\n') {
+        Some((first, rest)) if first.starts_with("## Lease ") => {
+            format!("## Claimed: lease {id}\n{rest}")
+        }
+        _ => format!("## Claimed: lease {id}\n{text}"),
+    }
 }
 
 /// A `clerk wait --follow` event: the notice's heading and action, its

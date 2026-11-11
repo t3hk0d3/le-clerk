@@ -865,3 +865,239 @@ mod holder_ref_encoding {
         assert_eq!(json(&holder("t")), r#"{"kind":"user","tag":"t"}"#);
     }
 }
+
+mod notice_delivery {
+    use super::*;
+
+    impl Fixture {
+        fn release(&mut self, who: &Caller, lease: &LeaseId) {
+            self.store
+                .tx(|tx| self.sched.release(tx, who, lease))
+                .unwrap();
+        }
+
+        fn claim(&mut self, who: &Caller, lease: &LeaseId) {
+            self.store
+                .tx(|tx| self.sched.claim(tx, who, lease))
+                .unwrap();
+        }
+
+        fn extend(&mut self, who: &Caller, lease: &LeaseId, new_ends_at: i64) {
+            self.store
+                .tx(|tx| self.sched.extend(tx, who, lease, new_ends_at))
+                .unwrap();
+        }
+    }
+
+    mod on_cleanup_window_started_for_a_lease_already_confirmed {
+        use super::*;
+
+        /// `a` released its lease and confirmed the cleanup at once, so the
+        /// cleanup notice it was sent is out of date.
+        fn confirmed() -> (Fixture, LeaseId) {
+            let mut f = fixture();
+            f.seed_user("board");
+            let a = caller("a");
+            let lease = f
+                .grant(&a, req("board", Priority::Normal, false, "mine"))
+                .lease_id;
+            f.release(&a, &lease);
+            f.confirm(&a, &lease, Confirm::Clean);
+            (f, lease)
+        }
+
+        #[test]
+        fn is_not_returned() {
+            let (mut f, _) = confirmed();
+            let got = f.take(&holder("a"), 10);
+            assert!(
+                !got.iter()
+                    .any(|n| n.kind == NoticeKind::CleanupWindowStarted),
+                "{got:?}"
+            );
+        }
+
+        #[test]
+        fn is_not_returned_by_returned_either() {
+            let (mut f, _) = confirmed();
+            let h = holder("a");
+            let got = f.with_tx(|tx| notices::returned(tx, &h, None, 10, DELIVERED_AT).unwrap());
+            assert!(
+                !got.iter()
+                    .any(|n| n.kind == NoticeKind::CleanupWindowStarted),
+                "{got:?}"
+            );
+        }
+
+        #[test]
+        fn is_audited_as_superseded() {
+            let (mut f, lease) = confirmed();
+            f.take(&holder("a"), 10);
+            let got = f.audit_of("superseded");
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(got[0].detail["kind"], "cleanup_window_started");
+            assert_eq!(got[0].detail["lease"], lease.as_str());
+        }
+
+        #[test]
+        fn is_marked_delivered() {
+            let (mut f, _) = confirmed();
+            f.take(&holder("a"), 10);
+            assert_eq!(
+                f.with_tx(|tx| notices::pending(tx, &holder("a")).unwrap()),
+                Vec::new()
+            );
+        }
+
+        #[test]
+        fn is_audited_once_however_often_taken() {
+            let (mut f, _) = confirmed();
+            f.take(&holder("a"), 10);
+            f.take(&holder("a"), 10);
+            assert_eq!(f.audit_of("superseded").len(), 1);
+        }
+    }
+
+    mod on_cleanup_window_started_for_a_lease_still_cleaning {
+        use super::*;
+
+        #[test]
+        fn is_returned() {
+            let mut f = fixture();
+            f.seed_user("board");
+            let a = caller("a");
+            let lease = f
+                .grant(&a, req("board", Priority::Normal, false, "mine"))
+                .lease_id;
+            f.release(&a, &lease);
+            let got = f.take(&holder("a"), 10);
+            assert!(
+                got.iter()
+                    .any(|n| n.kind == NoticeKind::CleanupWindowStarted),
+                "{got:?}"
+            );
+            assert_eq!(f.audit_of("superseded"), Vec::new());
+        }
+    }
+
+    mod on_offered_for_a_lease_already_claimed {
+        use super::*;
+
+        #[test]
+        fn is_not_returned() {
+            let mut f = fixture();
+            f.seed_user("board");
+            let (a, b) = (caller("a"), caller("b"));
+            let first = f
+                .grant(&a, req("board", Priority::Normal, false, "mine"))
+                .lease_id;
+            f.acquire(&b, req("board", Priority::Normal, false, "theirs"));
+            f.release(&a, &first);
+            f.confirm(&a, &first, Confirm::Clean);
+            let offer = f.with_tx(|tx| {
+                notices::pending(tx, &holder("b"))
+                    .unwrap()
+                    .into_iter()
+                    .find(|n| n.kind == NoticeKind::Offered)
+                    .and_then(|n| n.lease_id)
+                    .unwrap()
+            });
+            f.claim(&b, &offer);
+            let got = f.take(&holder("b"), 10);
+            assert!(
+                !got.iter().any(|n| n.kind == NoticeKind::Offered),
+                "{got:?}"
+            );
+            assert_eq!(f.audit_of("superseded").len(), 1);
+        }
+    }
+
+    mod on_expiry_warning_for_an_extended_lease_whose_new_end_is_beyond_the_warning {
+        use super::*;
+
+        /// `a`'s lease (10 minutes) was warned of its end, then extended.
+        fn warned() -> (Fixture, LeaseId) {
+            let mut f = fixture();
+            f.seed_user("board");
+            let lease = f
+                .grant(&caller("a"), req("board", Priority::Normal, false, "mine"))
+                .lease_id;
+            f.clock.set(T0 + 9 * MIN_MS);
+            f.tick();
+            (f, lease)
+        }
+
+        #[test]
+        fn is_not_returned() {
+            let (mut f, lease) = warned();
+            f.extend(&caller("a"), &lease, T0 + 30 * MIN_MS);
+            let got = f.take(&holder("a"), 10);
+            assert!(
+                !got.iter().any(|n| n.kind == NoticeKind::ExpiryWarning),
+                "{got:?}"
+            );
+            assert_eq!(f.audit_of("superseded").len(), 1);
+        }
+
+        #[test]
+        fn is_returned_while_the_lease_is_not_extended() {
+            let (mut f, _) = warned();
+            let got = f.take(&holder("a"), 10);
+            assert!(
+                got.iter().any(|n| n.kind == NoticeKind::ExpiryWarning),
+                "{got:?}"
+            );
+        }
+    }
+
+    mod on_expiry_warning_for_a_lease_that_ended {
+        use super::*;
+
+        #[test]
+        fn is_not_returned() {
+            let mut f = fixture();
+            f.seed_user("board");
+            let a = caller("a");
+            let lease = f
+                .grant(&a, req("board", Priority::Normal, false, "mine"))
+                .lease_id;
+            f.clock.set(T0 + 9 * MIN_MS);
+            f.tick();
+            f.release(&a, &lease);
+            f.confirm(&a, &lease, Confirm::Clean);
+            let got = f.take(&holder("a"), 10);
+            assert!(
+                !got.iter().any(|n| n.kind == NoticeKind::ExpiryWarning),
+                "{got:?}"
+            );
+        }
+    }
+
+    mod on_expiry_warning_for_a_lease_overdue_under_soft_expiry {
+        use super::*;
+
+        #[test]
+        fn is_returned() {
+            let mut f = fixture();
+            f.seed_user("board");
+            let a = HolderRef::AgentSession {
+                session_id: "s1".into(),
+            };
+            let who = Caller {
+                holder: a.clone(),
+                project: None,
+                override_reason: None,
+            };
+            f.grant(&who, req("board", Priority::Normal, false, "mine"));
+            f.clock.set(T0 + 9 * MIN_MS);
+            f.tick();
+            f.clock.set(T0 + 11 * MIN_MS);
+            f.tick();
+            let got = f.take(&a, 10);
+            assert!(
+                got.iter().any(|n| n.kind == NoticeKind::ExpiryWarning),
+                "{got:?}"
+            );
+        }
+    }
+}

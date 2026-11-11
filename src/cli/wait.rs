@@ -146,28 +146,7 @@ async fn steps(
                         ack(client, session_id, &[&notice]).await?;
                     }
                 } else {
-                    let mut claimed = Vec::new();
-                    let mut summary = Vec::new();
-                    for notice in &notices {
-                        match claim_if_offered(client, caller, notice).await {
-                            Some(Ok(lease)) => claimed.push(lease),
-                            Some(Err(e)) => summary.push(format!(
-                                "Could not claim lease {}: {e}.",
-                                notice["lease_id"].as_str().unwrap_or("?")
-                            )),
-                            None => {}
-                        }
-                        summary.push(action_of(notice));
-                    }
-                    print(
-                        md,
-                        &json!({
-                            "notices": notices,
-                            "claimed": claimed,
-                            "summary": summary,
-                            "next": format!("Act on each notice as it says. {ARM_AGAIN}"),
-                        }),
-                    )?;
+                    print(md, &batch(client, caller, &notices).await)?;
                     let all: Vec<&Value> = notices.iter().collect();
                     ack(client, session_id, &all).await?;
                     return Ok(());
@@ -176,6 +155,71 @@ async fn steps(
             other => anyhow::bail!("the daemon answered the wait with {other:?}"),
         }
     }
+}
+
+/// The result of a batch wait over `notices`: offers claimed on the way
+/// are reported as claimed leases, not as the offers they answered.
+async fn batch(client: &Client, caller: &Caller, notices: &[Value]) -> Value {
+    let mut claimed = Vec::new();
+    let mut summary = Vec::new();
+    let mut shown = Vec::new();
+    for notice in notices {
+        match claim_if_offered(client, caller, notice).await {
+            Some(Ok(lease)) => {
+                // Claimed: the offer's deadline and "claim it" text are
+                // spent; the claimed lease says the rest.
+                shown.push(json!({
+                    "kind": notice["kind"],
+                    "lease_id": notice["lease_id"],
+                    "resource": notice["resource"],
+                    "unit": notice["unit"],
+                }));
+                claimed.push(lease);
+                continue;
+            }
+            Some(Err(e)) => summary.push(format!(
+                "Could not claim lease {}: {e}.",
+                notice["lease_id"].as_str().unwrap_or("?")
+            )),
+            None => {}
+        }
+        summary.push(action_of(notice));
+        shown.push(notice.clone());
+    }
+    let next = batch_next(&claimed, notices.len() - claimed.len());
+    json!({
+        "notices": shown,
+        "claimed": claimed,
+        "summary": summary,
+        "next": next,
+    })
+}
+
+/// The `next` of a batch that claimed `claimed` offers and has `others`
+/// notices to act on besides.
+fn batch_next(claimed: &[Value], others: usize) -> String {
+    if claimed.is_empty() {
+        return format!("Act on each notice as it says. {ARM_AGAIN}");
+    }
+    let ids: Vec<&str> = claimed
+        .iter()
+        .map(|l| l["lease_id"].as_str().unwrap_or("?"))
+        .collect();
+    let release = match ids.as_slice() {
+        [one] => format!("`clerk release {one}`"),
+        _ => "`clerk release <lease>` for each".to_owned(),
+    };
+    let mut next = format!(
+        "It is yours (claimed): {}. Read its description and usage with `clerk leases --mine`, \
+         use it, then {release}.",
+        ids.join(", ")
+    );
+    if others > 0 {
+        next.push_str(" Act on each other notice as it says.");
+    }
+    next.push(' ');
+    next.push_str(ARM_AGAIN);
+    next
 }
 
 /// Track `unreached` steps since `since`; whether they went on for
@@ -394,7 +438,7 @@ fn gone(why: &str, next: &str) -> Value {
 
 /// SIGTERM or SIGINT (a background command's time limit).
 fn stopped() -> Value {
-    empty(&["The wait was stopped (time limit or signal) before any notice arrived."])
+    empty(&["The wait was stopped (time limit or signal)."])
 }
 
 /// End the wait with `value`: printed, for a `--follow` wait too (Monitor
@@ -450,14 +494,18 @@ fn human(value: &Value) -> String {
         _ => Vec::new(),
     };
     let mut parts: Vec<String> = Vec::new();
+    let claimed = list("claimed");
     for n in list("notices").into_iter().chain(list("notice")) {
+        if super::md::spent_offer(&n, &claimed) {
+            continue;
+        }
         parts.push(format!(
             "[{}] {}",
             n["kind"].as_str().unwrap_or("notice"),
             n["action"].as_str().unwrap_or_default()
         ));
     }
-    for l in list("claimed") {
+    for l in claimed {
         parts.push(super::lease::granted_text(&l));
     }
     for line in value["summary"].as_array().into_iter().flatten() {

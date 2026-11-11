@@ -6,8 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{DirtyInfo, HolderRef, LeaseId, NoticeId, RequestId, ResourceId, UnitId};
-use crate::store::{StoreError, Tx, enum_text};
+use crate::model::{
+    Caller, DirtyInfo, HolderRef, LeaseId, LeaseState, NoticeId, RequestId, ResourceId, UnitId,
+};
+use crate::store::{StoreError, Tx, audit, enum_text, leases};
 
 /// What a notice is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -218,7 +220,7 @@ pub fn take_matching(
     limit: u32,
     now_ms: i64,
 ) -> Result<Vec<Notice>, StoreError> {
-    let rows = select_pending(tx, holder, filter, limit)?;
+    let rows = live(tx, select_pending(tx, holder, filter, limit)?, now_ms)?;
     let mut mark = tx
         .conn()
         .prepare("UPDATE notices SET delivered_at = ?2 WHERE row_id = ?1")?;
@@ -228,6 +230,72 @@ pub fn take_matching(
             Ok(notice)
         })
         .collect()
+}
+
+/// Whether later state made `notice` obsolete, judged from the current state
+/// of the lease it names (a notice naming no lease, or one that is gone,
+/// stands):
+/// - a cleanup notice (`CleanupWindowStarted`, `CleanupEnding`) for a lease
+///   no longer cleaning;
+/// - an `Offered` for a lease no longer offered;
+/// - an `ExpiryWarning` for a lease that ended, started cleaning, or was
+///   extended past the end the warning was about. A lease overdue under
+///   soft expiry still has that end: its warning is live.
+fn obsolete(tx: &Tx, notice: &Notice) -> Result<bool, StoreError> {
+    let Some(id) = &notice.lease_id else {
+        return Ok(false);
+    };
+    let Some(lease) = leases::find_lease(tx, id)? else {
+        return Ok(false);
+    };
+    Ok(match notice.kind {
+        NoticeKind::CleanupWindowStarted | NoticeKind::CleanupEnding => {
+            lease.state != LeaseState::Cleaning
+        }
+        NoticeKind::Offered => lease.state != LeaseState::Offered,
+        NoticeKind::ExpiryWarning => {
+            matches!(lease.state, LeaseState::Ended | LeaseState::Cleaning)
+                || matches!((lease.ends_at, notice.deadline), (Some(end), Some(warned)) if end > warned)
+        }
+        _ => false,
+    })
+}
+
+/// The rows of `rows` that are not [`obsolete`]. The others are marked
+/// delivered at `now_ms` and audited as `superseded`, so they are neither
+/// returned now nor pending later.
+fn live(tx: &Tx, rows: Vec<(i64, Notice)>, now_ms: i64) -> Result<Vec<(i64, Notice)>, StoreError> {
+    let mut keep = Vec::with_capacity(rows.len());
+    for (row, notice) in rows {
+        if !obsolete(tx, &notice)? {
+            keep.push((row, notice));
+            continue;
+        }
+        tx.conn().execute(
+            "UPDATE notices SET delivered_at = ?2 WHERE row_id = ?1",
+            rusqlite::params![row, now_ms],
+        )?;
+        let clerk = Caller {
+            holder: HolderRef::User {
+                tag: "clerk".to_owned(),
+            },
+            project: None,
+            override_reason: None,
+        };
+        audit::record(
+            tx,
+            now_ms,
+            &clerk,
+            "superseded",
+            &serde_json::json!({
+                "notice": notice.id,
+                "kind": notice.kind,
+                "holder": notice.holder,
+                "lease": notice.lease_id,
+            }),
+        )?;
+    }
+    Ok(keep)
 }
 
 /// Acknowledged delivery (MCP `lease_wait`): up to `limit` undelivered
@@ -246,7 +314,7 @@ pub fn returned(
     limit: u32,
     now_ms: i64,
 ) -> Result<Vec<Notice>, StoreError> {
-    let rows = select_pending(tx, holder, filter, limit)?;
+    let rows = live(tx, select_pending(tx, holder, filter, limit)?, now_ms)?;
     let mut mark = tx
         .conn()
         .prepare("UPDATE notices SET returned_at = COALESCE(returned_at, ?2) WHERE row_id = ?1")?;
