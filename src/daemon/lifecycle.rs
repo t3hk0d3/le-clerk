@@ -105,6 +105,8 @@ pub fn run(paths: &Paths, config: Config) -> Result<(), RunError> {
     let Some(lock) = take_lock(&paths.lock)? else {
         return Ok(());
     };
+    // On a first start nothing has made the state directory yet.
+    fs::create_dir_all(parent(&paths.db)).map_err(io_at(&paths.db))?;
     // One daemon per store, whatever run directory it uses; held until exit
     // (the kernel drops it on a crash too).
     let Some(store_lock) = take_lock(&paths.store_lock())? else {

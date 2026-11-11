@@ -419,8 +419,41 @@ mod plugin {
                     .collect();
                 assert_eq!(
                     commands,
-                    [format!("${{CLAUDE_PLUGIN_ROOT}}/hooks/clerk-hook.sh {sub}")],
+                    [format!(
+                        "\"${{CLAUDE_PLUGIN_ROOT}}/hooks/clerk-hook.sh\" {sub}"
+                    )],
                     "{event}"
+                );
+            }
+        }
+
+        #[test]
+        fn each_command_runs_from_a_plugin_root_with_spaces() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("with a space");
+            fs::create_dir_all(root.join("hooks")).unwrap();
+            fs::copy(
+                plugin_path("hooks/clerk-hook.sh"),
+                root.join("hooks/clerk-hook.sh"),
+            )
+            .unwrap();
+            let fake = dir.path().join("fake-clerk");
+            fs::write(&fake, "#!/bin/sh\necho \"ran: $*\"\n").unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+            for (event, sub, _) in HOOKS {
+                let group = &hook_groups(event)[0];
+                let command = group["hooks"][0]["command"].as_str().expect("command");
+                let out = Command::new("/bin/sh")
+                    .args(["-c", command])
+                    .env("CLAUDE_PLUGIN_ROOT", &root)
+                    .env("CLERK_BIN", &fake)
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    format!("ran: hook {sub}\n"),
+                    "{event}: {out:?}"
                 );
             }
         }
@@ -456,6 +489,40 @@ mod plugin {
         #[test]
         fn equals_cargo_pkg_version() {
             assert_eq!(manifest()["version"], env!("CARGO_PKG_VERSION"));
+        }
+    }
+
+    mod skill_on_a_wait_ended_by_another_session {
+        use super::*;
+
+        /// The bullet of SKILL.md that holds `needle`, on one line.
+        fn bullet_with(needle: &str) -> String {
+            let text = skill_file("SKILL.md").replace("\n  ", " ");
+            text.lines()
+                .find(|l| l.starts_with("- ") && l.contains(needle))
+                .unwrap_or_else(|| panic!("no bullet with {needle}"))
+                .to_owned()
+        }
+
+        #[test]
+        fn calls_it_the_normal_end_after_clear() {
+            let bullet = bullet_with("runs another session");
+            assert!(bullet.contains("/clear"), "{bullet}");
+            assert!(bullet.contains("normal"), "{bullet}");
+        }
+
+        #[test]
+        fn does_not_blame_the_hooks() {
+            let bullet = bullet_with("runs another session");
+            assert!(!bullet.contains("hooks are not reaching"), "{bullet}");
+            assert!(!bullet.contains("tell the user"), "{bullet}");
+        }
+
+        #[test]
+        fn blames_the_hooks_for_session_not_hosted() {
+            let bullet = bullet_with("session_not_hosted");
+            assert!(bullet.contains("hooks are not reaching"), "{bullet}");
+            assert!(bullet.contains("**tell the user**"), "{bullet}");
         }
     }
 

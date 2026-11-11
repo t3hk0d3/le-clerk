@@ -56,9 +56,10 @@ start it again only if you are still queued or interruptible.
 - **Subagents never arm a wait**; the main conversation keeps the one.
 - **Stop a wait** you no longer need by ending its background task
   (TaskStop); it also ends on its own at its timeout.
-- A wait that says this process runs another session, or an error
-  `session_not_hosted`: **tell the user** (the hooks are not reaching the
-  clerk); do not work around it.
+- A wait that says this process runs another session is the normal end
+  after `/clear`: it was the old session's. Do nothing about it.
+- An error `session_not_hosted`: **tell the user** (the hooks are not
+  reaching the clerk); do not work around it.
 
 ## While you hold it
 

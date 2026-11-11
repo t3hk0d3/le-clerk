@@ -2180,6 +2180,80 @@ mod single_instance {
             }
         }
 
+        mod on_a_fresh_state_directory {
+            use super::*;
+
+            /// A foreground `clerk daemon`; stopped and reaped when dropped.
+            struct Foreground(std::process::Child);
+
+            impl Drop for Foreground {
+                fn drop(&mut self) {
+                    // A pid always fits a pid_t.
+                    unsafe {
+                        libc::kill(self.0.id().cast_signed(), libc::SIGTERM);
+                    }
+                    let _ = self.0.wait();
+                }
+            }
+
+            /// Start `clerk daemon` with `vars` and wait for its socket; the
+            /// daemon and its paths.
+            fn started(vars: &[(&'static str, OsString)]) -> (Foreground, Paths) {
+                let paths = Paths::from_lookup(|k| {
+                    vars.iter()
+                        .find(|(name, _)| *name == k)
+                        .map(|(_, v)| v.clone())
+                })
+                .unwrap();
+                assert!(!paths.db.parent().unwrap().exists());
+                let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"));
+                cmd.arg("daemon").stdin(std::process::Stdio::null());
+                for (k, v) in vars {
+                    cmd.env(k, v);
+                }
+                let mut daemon = Foreground(cmd.spawn().unwrap());
+                until("the socket is there", || {
+                    let exit = daemon.0.try_wait().unwrap();
+                    assert_eq!(exit, None, "the daemon exited");
+                    paths.socket.exists()
+                });
+                (daemon, paths)
+            }
+
+            /// The variables of a [`Split`] with `CLERK_HOME` at a path that
+            /// does not exist yet.
+            fn clerk_home_vars(s: &Split) -> Vec<(&'static str, OsString)> {
+                let mut vars = s.vars(Some("r1"));
+                vars[0].1 = s.dir.path().join("fresh/home").into_os_string();
+                vars
+            }
+
+            #[tokio::test]
+            async fn serves_under_fresh_xdg_directories() {
+                let s = Split::new();
+                let (daemon, paths) = started(&s.vars(Some("r1")));
+                let client = Client::connect(&paths).await.unwrap();
+                assert_eq!(client.daemon().pid, daemon.0.id());
+            }
+
+            #[tokio::test]
+            async fn serves_under_a_fresh_clerk_home() {
+                let s = Split::new();
+                let (daemon, paths) = started(&clerk_home_vars(&s));
+                let client = Client::connect(&paths).await.unwrap();
+                assert_eq!(client.daemon().pid, daemon.0.id());
+            }
+
+            #[tokio::test]
+            async fn creates_the_store_and_its_lock() {
+                let s = Split::new();
+                let (_daemon, paths) = started(&s.vars(Some("r1")));
+                Client::connect(&paths).await.unwrap();
+                assert!(paths.db.exists());
+                assert!(paths.store_lock().exists());
+            }
+        }
+
         mod on_start {
             use super::*;
 

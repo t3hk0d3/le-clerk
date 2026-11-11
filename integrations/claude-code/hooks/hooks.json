@@ -4,28 +4,28 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/clerk-hook.sh session-start", "timeout": 3 }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/clerk-hook.sh\" session-start", "timeout": 3 }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/clerk-hook.sh stop", "timeout": 3 }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/clerk-hook.sh\" stop", "timeout": 3 }
         ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/clerk-hook.sh pre-tool-use", "timeout": 3 }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/clerk-hook.sh\" pre-tool-use", "timeout": 3 }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/clerk-hook.sh session-end", "timeout": 1.5 }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/clerk-hook.sh\" session-end", "timeout": 1.5 }
         ]
       }
     ]
