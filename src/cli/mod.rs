@@ -293,6 +293,10 @@ impl Ctx {
 pub fn run() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
+        // Hooks fail open and silent, parse errors included.
+        Err(_) if std::env::args_os().nth(1).is_some_and(|a| a == "hook") => {
+            return ExitCode::SUCCESS;
+        }
         Err(e) => return parse_failure(&with_suggestions(e)),
     };
     render::install(cli.json, cli.ascii);
@@ -545,4 +549,123 @@ fn daemon_view(action: DaemonAction, info: Option<DaemonInfo>) -> View {
         ),
         (_, None) => "The clerk daemon is not running; any clerk command starts it.".to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The skill's files, relative to the repo root.
+    const SKILL_DIR: &str = "integrations/claude-code/skills/clerk";
+    const SKILL_FILES: [&str; 3] = ["SKILL.md", "leasing.md", "registering.md"];
+
+    /// Every `clerk ...` command in `text`: an inline code span, or a line
+    /// of a fenced block (with its `\` continuations), as argv. A `<name>`
+    /// placeholder becomes a value, `a|b` its first choice; a command
+    /// cut off by `...` ends there.
+    fn clerk_commands(text: &str) -> Vec<Vec<String>> {
+        let mut spans = Vec::new();
+        let mut in_block = false;
+        let mut block_line = String::new();
+        let mut prose = String::new();
+        for line in text.lines() {
+            if line.starts_with("```") {
+                in_block = !in_block;
+                continue;
+            }
+            if in_block {
+                let line = line.trim_end();
+                if let Some(head) = line.strip_suffix('\\') {
+                    block_line.push_str(head);
+                } else {
+                    block_line.push_str(line);
+                    spans.push(std::mem::take(&mut block_line));
+                }
+            } else {
+                prose.push_str(line);
+                prose.push(' ');
+            }
+        }
+        spans.extend(prose.split('`').skip(1).step_by(2).map(str::to_owned));
+        spans
+            .iter()
+            .filter(|s| s.trim_start().starts_with("clerk "))
+            .map(|s| argv(s))
+            .filter(|a| a.len() > 1)
+            .collect()
+    }
+
+    /// The words of `span`, quotes removed; a quoted word is never a
+    /// placeholder or an ellipsis.
+    fn argv(span: &str) -> Vec<String> {
+        let mut words: Vec<(String, bool)> = Vec::new();
+        let mut word = String::new();
+        let mut quote = None;
+        let mut quoted = false;
+        for c in span.chars() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (None, '"' | '\'') => {
+                    quote = Some(c);
+                    quoted = true;
+                }
+                (None, c) if c.is_whitespace() => {
+                    if quoted || !word.is_empty() {
+                        words.push((std::mem::take(&mut word), quoted));
+                    }
+                    quoted = false;
+                }
+                (_, c) => word.push(c),
+            }
+        }
+        if quoted || !word.is_empty() {
+            words.push((word, quoted));
+        }
+        let mut out = Vec::new();
+        for (w, quoted) in words {
+            if quoted {
+                out.push(w);
+                continue;
+            }
+            let w = match w.as_str() {
+                // A value after a flag, else the rest of the command.
+                "..." if out.last().is_some_and(|f: &String| f.starts_with("--")) => "x".to_owned(),
+                // An alternative command line starts here.
+                "..." | "|" => break,
+                "<d>" => "5m".to_owned(),
+                "<type>" => "device".to_owned(),
+                _ if w.starts_with('<') && w.ends_with('>') => "x".to_owned(),
+                _ => w,
+            };
+            out.push(w.split('|').next().unwrap_or_default().to_owned());
+        }
+        out
+    }
+
+    #[test]
+    fn every_clerk_command_in_the_skill_parses() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0;
+        for file in SKILL_FILES {
+            let text = std::fs::read_to_string(root.join(SKILL_DIR).join(file)).unwrap();
+            for args in clerk_commands(&text) {
+                // `clerk approve` alone names a command; what it lacks is
+                // arguments, not a valid spelling.
+                if let Err(e) = Cli::try_parse_from(&args)
+                    && e.kind() != clap::error::ErrorKind::MissingRequiredArgument
+                {
+                    panic!("{file}: `{}` does not parse: {e}", args.join(" "));
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "only {checked} commands found");
+    }
+
+    #[test]
+    fn a_misspelled_command_does_not_parse() {
+        let found = clerk_commands("Run `clerk aquire board --for 5m` now.\n");
+        assert_eq!(found.len(), 1);
+        assert!(Cli::try_parse_from(&found[0]).is_err());
+    }
 }

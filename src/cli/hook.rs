@@ -217,9 +217,33 @@ impl Hook {
         })
     }
 
-    /// Report the session's host, whatever the source (that unhosts the
-    /// session this process ran before, e.g. on `/clear`).
+    /// The session-start output: the brief (see [`Hook::start_context`])
+    /// plus a warning when the plugin and the binary differ in version.
+    /// The warning shows even when the daemon cannot be asked.
     async fn session_start(&self) -> anyhow::Result<Option<Value>> {
+        let warning = version_warning(plugin_version().as_deref(), leclerk::VERSION);
+        let brief = match self.start_context().await {
+            Ok(brief) => brief,
+            Err(_) if warning.is_some() => None,
+            Err(e) => return Err(e),
+        };
+        let context = match (brief, warning) {
+            (Some(brief), Some(warning)) => format!("{brief}\n{warning}"),
+            (Some(text), None) | (None, Some(text)) => text,
+            (None, None) => return Ok(None),
+        };
+        Ok(Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": context,
+            }
+        })))
+    }
+
+    /// Report the session's host, whatever the source (that unhosts the
+    /// session this process ran before, e.g. on `/clear`); the brief for
+    /// a `/clear`, a compact or a resume.
+    async fn start_context(&self) -> anyhow::Result<Option<String>> {
         let Some(source) = self.input.source.as_deref() else {
             bail!("the session-start input has no source");
         };
@@ -249,14 +273,7 @@ impl Hook {
             .await?;
         let armed = brief["open_waits"].as_u64().unwrap_or(0) > 0;
         let released = started["released"].as_array().cloned().unwrap_or_default();
-        Ok(start_brief(&mine, armed, &released).map(|context| {
-            json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": context,
-                }
-            })
-        }))
+        Ok(start_brief(&mine, armed, &released))
     }
 
     /// Block once while the session holds or waits for something without
@@ -368,9 +385,29 @@ fn stop_reason(leases: u64, requests: u64) -> String {
         ),
     };
     format!(
-        "Le Clerk: this session has {what} but no clerk wait is armed, so offers and yield \
-         requests would go unanswered. {WAIT_HOW}"
+        "Release what you are done with; if you still need it, arm a wait. Le Clerk: this \
+         session has {what} but no clerk wait is armed, so offers and yield requests would go \
+         unanswered. {WAIT_HOW}"
     )
+}
+
+/// The version in the plugin's manifest (`$CLAUDE_PLUGIN_ROOT`), when
+/// there is one.
+fn plugin_version() -> Option<String> {
+    let root = std::env::var_os("CLAUDE_PLUGIN_ROOT").filter(|v| !v.is_empty())?;
+    let path = std::path::Path::new(&root).join(".claude-plugin/plugin.json");
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    manifest["version"].as_str().map(str::to_owned)
+}
+
+/// The warning for a plugin of version `plugin` run with a binary of
+/// version `binary`; `None` when they match or the plugin's is unknown.
+fn version_warning(plugin: Option<&str>, binary: &str) -> Option<String> {
+    let plugin = plugin.filter(|p| *p != binary)?;
+    Some(format!(
+        "Le Clerk: the plugin is version {plugin} but the clerk binary is {binary}; tell the \
+         user to update the plugin or the clerk binary so they match."
+    ))
 }
 
 /// How an agent keeps a wait armed.
@@ -575,6 +612,16 @@ mod tests {
     }
 
     #[test]
+    fn stop_reason_starts_with_releasing_what_is_done() {
+        assert!(
+            stop_reason(1, 0)
+                .starts_with("Release what you are done with; if you still need it, arm a wait"),
+            "{}",
+            stop_reason(1, 0)
+        );
+    }
+
+    #[test]
     fn agent_detected_by_either_variable() {
         let only =
             |name: &'static str| move |k: &str| (k == name).then(|| std::ffi::OsString::from("1"));
@@ -582,6 +629,18 @@ mod tests {
         assert!(agent_detected(only("CLAUDE_CODE_SESSION_ID")));
         assert!(!agent_detected(|_| None));
         assert!(!agent_detected(|_| Some(std::ffi::OsString::new())));
+    }
+
+    #[test]
+    fn version_warning_names_both_versions_when_they_differ() {
+        let w = version_warning(Some("0.1.0"), "0.2.0").unwrap();
+        assert!(w.contains("0.1.0") && w.contains("0.2.0"), "{w}");
+    }
+
+    #[test]
+    fn version_warning_is_none_when_they_match_or_the_plugin_is_unknown() {
+        assert_eq!(version_warning(Some("0.2.0"), "0.2.0"), None);
+        assert_eq!(version_warning(None, "0.2.0"), None);
     }
 
     #[test]

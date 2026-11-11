@@ -1,10 +1,16 @@
 //! The Claude Code plugin under `integrations/claude-code` and the local
-//! marketplace at the repo root: every JSON file and both skills checked
-//! against the documented schemas (spec Appendix B), the MCP server
-//! registration and the hook wiring.
+//! marketplace at the repo root: every JSON file and the skill checked
+//! against the documented schemas (spec Appendix B), the version match with
+//! the binary, the hook wiring, and the fail-open hook launcher and
+//! `clerk hook` entry point. (Every `clerk ...` command in the skill parses
+//! with clap: that check is a unit test in `src/cli/mod.rs`, where `Cli`
+//! lives.)
 
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
@@ -18,34 +24,6 @@ const SKILL: &str = "clerk";
 const SKILL_FILES: [&str; 3] = ["SKILL.md", "leasing.md", "registering.md"];
 /// The longest `SKILL.md` may be, in lines.
 const SKILL_MAX_LINES: usize = 120;
-/// The top-level `clerk` commands (`clerk --help`).
-const COMMANDS: [&str; 25] = [
-    "daemon",
-    "resource",
-    "unit",
-    "status",
-    "resources",
-    "leases",
-    "queue",
-    "log",
-    "promotions",
-    "acquire",
-    "attach",
-    "cancel",
-    "release",
-    "extend",
-    "run",
-    "wait",
-    "admin",
-    "hook",
-    "approve",
-    "types",
-    "confirm",
-    "interruptible",
-    "yield",
-    "reclaim",
-    "claim",
-];
 /// The removed MCP tools: no skill may name them.
 const MCP_TOOLS: [&str; 6] = [
     "lease_wait",
@@ -117,29 +95,6 @@ fn is_kebab(s: &str) -> bool {
         && !s.contains("--")
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// Every `clerk <word>` in command position in `text` (after a backtick,
-/// or starting a line of a code block) whose word is not a clerk command.
-fn unknown_commands(text: &str) -> Vec<String> {
-    text.match_indices("clerk ")
-        .filter(|(at, _)| {
-            let before = &text[..*at];
-            before.ends_with('`')
-                || before
-                    .rsplit('\n')
-                    .next()
-                    .is_some_and(|l| l.trim().is_empty())
-        })
-        .filter_map(|(at, m)| {
-            let word: String = text[at + m.len()..]
-                .chars()
-                .take_while(|c| c.is_ascii_lowercase() || *c == '-')
-                .collect();
-            (!word.is_empty() && !word.starts_with('-') && !COMMANDS.contains(&word.as_str()))
-                .then_some(word)
-        })
-        .collect()
 }
 
 /// The matcher groups of `event` in hooks.json.
@@ -270,10 +225,9 @@ mod plugin {
         }
 
         #[test]
-        fn names_only_real_clerk_commands_and_no_mcp_tool() {
+        fn names_no_removed_mcp_tool() {
             for file in SKILL_FILES {
                 let text = skill_file(file);
-                assert_eq!(unknown_commands(&text), Vec::<String>::new(), "{file}");
                 for tool in MCP_TOOLS {
                     assert!(!text.contains(tool), "{file} names {tool}");
                 }
@@ -327,17 +281,6 @@ mod plugin {
         }
     }
 
-    mod command_check {
-        use super::*;
-
-        #[test]
-        fn flags_a_misspelled_command() {
-            let text = "Run `clerk aquire board` and `clerk wait --follow`; the clerk hands.\n\
-                        clerk relase x";
-            assert_eq!(unknown_commands(text), ["aquire", "relase"]);
-        }
-    }
-
     mod hooks_json_wires_events_to_clerk_hook {
         use super::*;
 
@@ -364,7 +307,11 @@ mod plugin {
                     .flat_map(|g| g["hooks"].as_array().expect("hooks array").clone())
                     .map(|h| h["command"].as_str().expect("command").to_owned())
                     .collect();
-                assert_eq!(commands, [format!("clerk hook {sub}")], "{event}");
+                assert_eq!(
+                    commands,
+                    [format!("${{CLAUDE_PLUGIN_ROOT}}/hooks/clerk-hook.sh {sub}")],
+                    "{event}"
+                );
             }
         }
 
@@ -388,6 +335,184 @@ mod plugin {
                         let t = h["timeout"].as_f64().expect("timeout is a number");
                         assert!(t > 0.0 && t <= max, "{event} timeout {t} within {max} s");
                     }
+                }
+            }
+        }
+    }
+
+    mod the_plugin_version {
+        use super::*;
+
+        #[test]
+        fn equals_cargo_pkg_version() {
+            assert_eq!(manifest()["version"], env!("CARGO_PKG_VERSION"));
+        }
+    }
+
+    mod clerk_hook_sh {
+        use super::*;
+
+        fn script() -> PathBuf {
+            plugin_path("hooks/clerk-hook.sh")
+        }
+
+        /// Run the launcher for `event` with `PATH=path`, and `CLERK_BIN`
+        /// when given.
+        fn launch(path: &Path, clerk_bin: Option<&Path>, event: &str) -> Output {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg(script())
+                .arg(event)
+                .env_clear()
+                .env("PATH", path)
+                .stdin(Stdio::null());
+            if let Some(bin) = clerk_bin {
+                cmd.env("CLERK_BIN", bin);
+            }
+            cmd.output().unwrap()
+        }
+
+        #[test]
+        fn is_executable() {
+            let mode = fs::metadata(script()).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "mode {mode:o}");
+        }
+
+        mod on_clerk_missing_from_path_and_no_clerk_bin {
+            use super::*;
+
+            #[test]
+            fn exits_0_silently() {
+                let empty = tempfile::tempdir().unwrap();
+                let out = launch(empty.path(), None, "stop");
+                assert_eq!(out.status.code(), Some(0));
+                assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+            }
+        }
+
+        mod on_clerk_bin_set {
+            use super::*;
+
+            #[test]
+            fn runs_that_binary_with_hook_and_the_event() {
+                let dir = tempfile::tempdir().unwrap();
+                let fake = dir.path().join("fake-clerk");
+                fs::write(&fake, "#!/bin/sh\necho \"ran: $*\"\n").unwrap();
+                fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+                let out = launch(Path::new("/usr/bin:/bin"), Some(&fake), "pre-tool-use");
+                assert_eq!(out.status.code(), Some(0));
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    "ran: hook pre-tool-use\n"
+                );
+            }
+        }
+    }
+
+    mod clerk_hook {
+        use super::*;
+
+        /// Run the real `clerk` with `args`, with or without the session
+        /// variables.
+        fn clerk(args: &[&str], session_vars: bool) -> Output {
+            let home = tempfile::tempdir().unwrap();
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_clerk"));
+            cmd.args(args)
+                .env("CLERK_HOME", home.path())
+                .env_remove("CLAUDE_PID")
+                .env_remove("CLAUDE_CODE_SESSION_ID")
+                .stdin(Stdio::null());
+            if session_vars {
+                cmd.env("CLAUDE_PID", "1")
+                    .env("CLAUDE_CODE_SESSION_ID", "s1");
+            }
+            cmd.output().unwrap()
+        }
+
+        fn assert_silent_success(out: &Output) {
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+        }
+
+        mod on_an_unknown_hook_name {
+            use super::*;
+
+            #[test]
+            fn exits_0_with_empty_stdout_and_stderr() {
+                for vars in [false, true] {
+                    assert_silent_success(&clerk(&["hook", "bogus"], vars));
+                }
+            }
+        }
+
+        mod on_a_bad_flag {
+            use super::*;
+
+            #[test]
+            fn exits_0_silently() {
+                for vars in [false, true] {
+                    assert_silent_success(&clerk(&["hook", "stop", "--bogus"], vars));
+                }
+            }
+        }
+    }
+
+    mod hook_session_start {
+        use super::*;
+
+        fn start(plugin_version: Option<&str>) -> Output {
+            let home = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_clerk"));
+            cmd.args(["hook", "session-start"])
+                .env("CLERK_HOME", home.path())
+                .env("CLAUDE_PID", "1")
+                .env_remove("CLAUDE_CODE_SESSION_ID")
+                .env_remove("CLAUDE_PLUGIN_ROOT")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(v) = plugin_version {
+                let dir = root.path().join(".claude-plugin");
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("plugin.json"), format!(r#"{{"version": "{v}"}}"#)).unwrap();
+                cmd.env("CLAUDE_PLUGIN_ROOT", root.path());
+            }
+            let mut child = cmd.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"session_id": "s1", "source": "startup"}"#)
+                .unwrap();
+            child.wait_with_output().unwrap()
+        }
+
+        mod on_a_plugin_version_different_from_the_binarys {
+            use super::*;
+
+            #[test]
+            fn the_brief_says_to_update_the_plugin_or_the_binary() {
+                let out = start(Some("0.0.1"));
+                assert_eq!(out.status.code(), Some(0));
+                let doc: Value = serde_json::from_slice(&out.stdout).expect("JSON output");
+                let text = doc["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .expect("additionalContext");
+                assert!(text.contains("0.0.1") && text.contains(env!("CARGO_PKG_VERSION")));
+                assert!(
+                    text.contains("update the plugin or the clerk binary"),
+                    "{text}"
+                );
+            }
+        }
+
+        mod on_a_matching_version_or_no_plugin_root {
+            use super::*;
+
+            #[test]
+            fn prints_nothing() {
+                for out in [start(Some(env!("CARGO_PKG_VERSION"))), start(None)] {
+                    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
                 }
             }
         }
