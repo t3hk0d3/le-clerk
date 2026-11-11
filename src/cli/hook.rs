@@ -414,6 +414,24 @@ fn version_warning(plugin: Option<&str>, binary: &str) -> Option<String> {
 const WAIT_HOW: &str = "Run `clerk wait` with the Bash tool's run_in_background (timeout \
      7200000); it costs nothing while idle. When it completes, read its output and act on it.";
 
+/// One released lease as a brief line. The daemon sends
+/// `{lease_id, resource, unit, purpose}`; an older one sent the bare id.
+fn released_line(lease: &Value) -> String {
+    let field = |name: &str| super::output::plain(&lease[name]);
+    if !lease.is_object() {
+        return format!("  - {}\n", super::output::plain(lease));
+    }
+    let mut line = format!("  - {}", field("lease_id"));
+    if lease["resource"].is_string() && lease["unit"].is_string() {
+        let _ = write!(line, " on {}/{}", field("resource"), field("unit"));
+    }
+    if lease["purpose"].as_str().is_some_and(|p| !p.is_empty()) {
+        let _ = write!(line, " (purpose: {})", field("purpose"));
+    }
+    line.push('\n');
+    line
+}
+
 /// The `SessionStart` brief for a session that holds `mine` (the
 /// `list_my_leases` answer), with a wait `armed` or not, after its process's
 /// previous session `released` these leases. `None` when there is nothing
@@ -426,12 +444,13 @@ fn start_brief(mine: &Value, armed: bool, released: &[Value]) -> Option<String> 
     }
     let mut text = String::from("Le Clerk (shared resources; use the clerk skill):\n");
     if !released.is_empty() {
-        let ids: Vec<String> = released.iter().map(super::output::plain).collect();
-        let _ = writeln!(
-            text,
-            "- The previous conversation ended, so its leases were released: {}.",
-            ids.join(", ")
+        text.push_str(
+            "- The previous conversation ended, so its leases were released; lease again if \
+             you still need them:\n",
         );
+        for l in released {
+            text.push_str(&released_line(l));
+        }
     }
     for l in leases {
         let _ = writeln!(

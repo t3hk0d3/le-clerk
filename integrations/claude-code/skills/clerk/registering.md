@@ -20,15 +20,17 @@ configs, asking the user) is your job: the clerk has no scan command.
 3. **Group interchangeable things** into one resource with one unit each:
    two identical boards are one resource with two units.
 4. **Fill in the context.** Agents only know what you write here.
-   - **ID**: lowercase letters, digits and dashes, at most 63 characters.
+   - **ID**: starts with a lowercase letter or digit, then lowercase letters,
+     digits, `.`, `_` or `-`; at most 63 characters.
    - **Description**: one line per resource and per unit.
    - **Tags**: what it is, its capabilities, its kind (`esp32`, `esp32c6`,
      `thread`, `devboard`); lowercase, at most 16.
    - **Usage**: Markdown, at most 4 KiB: how to use it, gotchas, and what
      "clean" means. Placeholders filled in on grant: `{resource.id}`,
-     `{unit.id}`, `{unit.description}`; `device`: `{unit.path}`; `service`:
-     `{unit.host}`, `{unit.port}`, `{unit.address}`, `{unit.scheme}`;
-     `generic`: `{unit.identity_key}`. Other braces (`${PORT}`) pass through.
+     `{resource.description}`, `{unit.id}`, `{unit.description}`; `device`:
+     `{unit.path}`; `service`: `{unit.host}`, `{unit.port}`, `{unit.address}`,
+     `{unit.scheme}`, `{unit.mode}`, `{unit.service_id}`; `generic`:
+     `{unit.identity_key}`. `clerk types` lists them per type. Other braces (`${PORT}`) pass through.
 5. **Create and add units**, reading every result:
    `clerk resource create <id> --type <type> --description "..." --tag <t>
    --usage-file usage.md`, then per unit `clerk unit add <id> <unit>

@@ -12,6 +12,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use leclerk::client::wire::NoticeKind;
+use leclerk::model::ResourceType;
+use leclerk::model::text::placeholder_keys;
 use serde_json::Value;
 
 /// The plugin root, relative to the repo root.
@@ -43,6 +46,35 @@ const HOOKS: [(&str, &str, f64); 4] = [
     // would raise that budget, which the hook must not rely on.
     ("SessionEnd", "session-end", 1.5),
 ];
+
+/// Every [`NoticeKind`] the clerk delivers (not `Unknown`). The exhaustive
+/// match makes a new kind fail to compile here until it is listed.
+fn all_notice_kinds() -> Vec<NoticeKind> {
+    use NoticeKind::*;
+    let all = vec![
+        Offered,
+        QueueDropped,
+        PositionChanged,
+        ExpiryWarning,
+        CleanupWindowStarted,
+        CleanupEnding,
+        YieldRequested,
+        YieldWithdrawn,
+        UnitReturned,
+        BorrowerOverran,
+        Overridden,
+        LeaseEnded,
+        ResourceRemoved,
+    ];
+    for kind in &all {
+        match kind {
+            Offered | QueueDropped | PositionChanged | ExpiryWarning | CleanupWindowStarted
+            | CleanupEnding | YieldRequested | YieldWithdrawn | UnitReturned | BorrowerOverran
+            | Overridden | LeaseEnded | ResourceRemoved | Unknown => {}
+        }
+    }
+    all
+}
 
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -247,6 +279,84 @@ mod plugin {
                     !skill_file(file).contains("Monitor"),
                     "{file} recommends Monitor"
                 );
+            }
+        }
+
+        /// An offer arrives claimed; the follow event carries no usage, so
+        /// the skill must send the agent to `clerk leases --mine` for it.
+        #[test]
+        fn never_claims_an_offer_event_carries_usage() {
+            for file in ["SKILL.md", "leasing.md"] {
+                for para in skill_file(file).split("\n\n") {
+                    let flat = para.replace('\n', " ");
+                    if flat.contains("offer") && flat.contains("usage") {
+                        assert!(
+                            flat.contains("clerk leases --mine"),
+                            "{file}: an offer paragraph mentions usage without `clerk leases --mine`: {flat}"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Every notice kind the clerk delivers is named, by the name it
+        /// prints after `## Notice:`, with what to do.
+        #[test]
+        fn leasing_md_names_every_notice_kind() {
+            let text = skill_file("leasing.md");
+            for kind in all_notice_kinds() {
+                let name = serde_json::to_value(kind).unwrap();
+                let name = name.as_str().unwrap();
+                assert!(text.contains(&format!("`{name}`")), "leasing.md: {name}");
+            }
+        }
+
+        /// Only placeholders the clerk substitutes: a stray `{path}` would
+        /// reach an agent's usage text literally.
+        #[test]
+        fn names_only_placeholders_the_clerk_substitutes() {
+            let known: Vec<&str> = [
+                ResourceType::Device,
+                ResourceType::Service,
+                ResourceType::Generic,
+            ]
+            .into_iter()
+            .flat_map(placeholder_keys)
+            .copied()
+            .collect();
+            for file in SKILL_FILES {
+                let text = skill_file(file);
+                for (i, _) in text.match_indices('{') {
+                    let rest = &text[i + 1..];
+                    let Some(end) = rest.find('}') else { continue };
+                    let word = &rest[..end];
+                    let looks_like_key = word.starts_with("unit.")
+                        || word.starts_with("resource.")
+                        || word == "path";
+                    if looks_like_key {
+                        assert!(
+                            known.contains(&word),
+                            "{file}: {{{word}}} is not substituted"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn description_names_the_status_hand_back_and_override_triggers_and_excludes_clerk_source()
+        {
+            let (fm, _) = frontmatter(&skill_file("SKILL.md"));
+            let d = fm["description"].as_str().expect("description is a string");
+            for phrase in [
+                "who holds",
+                "what is free",
+                "hand back",
+                "take it anyway",
+                "not your own dev server",
+                "Not for working on the clerk's own source",
+            ] {
+                assert!(d.contains(phrase), "description lacks {phrase:?}: {d}");
             }
         }
 

@@ -21,22 +21,45 @@ with a `Next:` line; follow it.
   says something is wrong. It never takes a unit from a lease holder, and
   it is audited.
 - `clerk claim <lease>` claims an offer by hand (the wait normally does).
+- Exit 6 means queued, not failed. Asking again for the same target
+  returns your existing request instead of a second one; `clerk cancel` it
+  first to change it.
+- `clerk run <target> --for <d> -- <cmd>` holds a unit while a command
+  runs. When the target is queued it exits 6 and the command does not run;
+  add `--wait` to wait for the unit and then run it.
 
 ## Notices and what to do
 
 Each notice says what happened, which lease or unit, the other party's
-purpose, the deadline, and the expected action.
+purpose, the deadline, and the expected action. The kind is printed after
+`## Notice:`.
 
-- **offered:** your turn. The wait claims it and the result carries the grant.
-- **position changed:** nothing to do.
-- **expiry warning:** `clerk extend <lease> --for <d>` or finish up.
-- **yield requested:** pause, clean up, `clerk confirm <lease> yielded`, or
-  `clerk yield <lease> --refuse`. When the borrower is done you get "your
-  unit is back" and your clock resumes. If the borrower overruns you are
-  told and may `clerk reclaim <lease>`.
-- **cleanup window ending:** confirm cleanup now (below).
-- **handed over without confirmed cleanup:** the unit may be dirty; check it.
-- **lease ended / overridden:** stop using the unit.
+- `offered`: your turn. The wait claims it and its output carries the lease;
+  read its usage with `clerk leases --mine` before you touch the unit.
+- `queue_dropped`: your request is gone (your offer lapsed, the resource was
+  removed, or the holder went away). Acquire again if you still need it.
+- `position_changed`: nothing to do.
+- `expiry_warning`: `clerk extend <lease> --for <d>` or finish up.
+- `cleanup_window_started`: your lease is ending (expired, released or
+  overridden). Clean up as the usage says, then `clerk confirm <lease> clean`.
+- `cleanup_ending`: confirm cleanup now, or `clerk extend <lease> --cleanup`
+  for the one cleanup extension; otherwise the unit is marked dirty.
+- `yield_requested`: pause at a safe point, clean up,
+  `clerk confirm <lease> yielded`, or `clerk yield <lease> --refuse`.
+- `yield_withdrawn`: carry on; you need not yield.
+- `unit_returned`: the borrower is done, your unit is back and your clock
+  resumes. If the notice says cleanup was not confirmed, check the unit.
+- `borrower_overran`: the borrower is past its time; wait, or
+  `clerk reclaim <lease>` after its cleanup window.
+- `overridden`: the user took the unit. Stop, clean up and confirm before the
+  deadline; acquire again if you still need it.
+- `lease_ended`: stop using the unit. If it says the unit was marked dirty,
+  you did not confirm cleanup in time.
+- `resource_removed`: an admin removed the unit or resource; your lease or
+  request is over. Stop using it.
+
+A grant can come marked **dirty**: the previous holder did not confirm
+cleanup (or abandoned the unit). Check the unit's state before you use it.
 
 ## Handing back
 
@@ -55,9 +78,10 @@ purpose, the deadline, and the expected action.
   them.
 - **Subagents** share your leases. A subagent should not arm its own wait;
   the main conversation keeps the one wait.
-- **Headless `claude -p`:** the run ends when you finish. Use the wait only
-  while queued, and before you finish release every lease you hold
-  (`clerk leases --mine` lists them).
+- **Headless `claude -p`:** the run ends when you finish, so nothing can
+  wake you later. Before you finish release every lease you hold and cancel
+  requests you no longer need (`clerk leases --mine` lists them); the Stop
+  hook says the same. Arm a wait only while you keep working.
 
 ## Example
 
@@ -65,7 +89,7 @@ purpose, the deadline, and the expected action.
 clerk resources --tag esp32c6
   -> c6-boards (2 units, 1 free)
 clerk acquire c6-boards --for 30m --purpose "flash and test the OTA path"
-  -> granted c6-a, usage: flash with `idf.py -p {path} flash`; clean = erase
+  -> granted c6-a, usage: flash with `idf.py -p /dev/serial/by-id/usb-Espressif_..._AA-if00 flash`; clean = erase
 ... work; before a tool call the clerk shows an expiry warning ...
 clerk extend lse_... --for 15m
 ... done; erase flash as the usage says ...

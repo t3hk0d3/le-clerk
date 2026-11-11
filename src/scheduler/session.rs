@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::model::{EndCause, HolderRef, Host, LeaseId};
+use crate::model::{Caller, EndCause, HolderRef, Host};
 use crate::scheduler::liveness::{HolderEnded, host_alive};
 use crate::scheduler::{Scheduler, SchedulerError, clerk_actor};
 use crate::store::{Store, StoreError, Tx, audit, leases, sessions as host_store};
@@ -88,8 +88,9 @@ pub struct Sessions {
     grace_ms: i64,
     known: HashMap<String, Session>,
     /// The leases each process's last ended session released
-    /// ([`Sessions::end`]), for the next session's brief.
-    released: HashMap<Host, Vec<LeaseId>>,
+    /// ([`Sessions::end`]), for the next session's brief: each as
+    /// `{lease_id, resource, unit, purpose}`.
+    released: HashMap<Host, Vec<serde_json::Value>>,
 }
 
 impl Sessions {
@@ -427,14 +428,35 @@ impl Sessions {
         if let Some(host) = host
             && !ended.leases.is_empty()
         {
-            self.released.insert(host, ended.leases.clone());
+            let holder = HolderRef::AgentSession {
+                session_id: session_id.to_owned(),
+            };
+            let who = Caller {
+                holder,
+                project: None,
+                override_reason: None,
+            };
+            let named = ended
+                .leases
+                .iter()
+                .map(|id| match sched.get_lease(tx, &who, id) {
+                    Ok(l) => json!({
+                        "lease_id": id,
+                        "resource": l.resource,
+                        "unit": l.unit,
+                        "purpose": l.purpose,
+                    }),
+                    Err(_) => json!({ "lease_id": id }),
+                })
+                .collect();
+            self.released.insert(host, named);
         }
         Ok(Some(ended))
     }
 
     /// The leases the last session `host` ended released, once: the next
     /// session's brief says so (`/clear`).
-    pub fn take_released(&mut self, host: &Host) -> Vec<LeaseId> {
+    pub fn take_released(&mut self, host: &Host) -> Vec<serde_json::Value> {
         self.released.remove(host).unwrap_or_default()
     }
 

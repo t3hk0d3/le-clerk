@@ -418,6 +418,32 @@ mod cli {
                     assert!(context.contains(&lease), "{context}");
                     assert!(context.contains("released"), "{context}");
                 }
+
+                #[test]
+                fn the_brief_lists_the_resource_unit_and_purpose_of_each() {
+                    let env = Env::new();
+                    seed(&env);
+                    let host = Host::spawn();
+                    let (body, code) = agent(
+                        &env,
+                        "s1",
+                        &host,
+                        &[
+                            "acquire",
+                            "board",
+                            "--for",
+                            "10m",
+                            "--purpose",
+                            "flash the OTA build",
+                        ],
+                    );
+                    assert_eq!(code, Some(0), "{body}");
+                    let end = input("session-end", "s1", &json!({ "reason": "clear" }));
+                    run_hook(env.home(), "session-end", &end, Some(host.pid()));
+                    let context = context_of(&start(&env, "s2", "clear", &host));
+                    assert!(context.contains("board/u1"), "{context}");
+                    assert!(context.contains("flash the OTA build"), "{context}");
+                }
             }
 
             mod on_resume_while_holding {
