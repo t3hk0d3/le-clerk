@@ -1,6 +1,6 @@
 {
   "name": "leclerk",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Le Clerk for Claude Code: one skill for leasing and registering shared resources with the clerk CLI, and hooks that keep agents listening for lease notices. Needs `clerk` on PATH.",
   "author": {
     "name": "Igor Yamolov"
