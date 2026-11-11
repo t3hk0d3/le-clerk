@@ -925,10 +925,10 @@ impl Command {
             Self::ListMyLeases(who, NoArgs {}) => {
                 encode(MyLeasesView::from(sched.my_leases(tx, &who)?))
             }
-            Self::Confirm(who, a) => {
-                sched.confirm(tx, &who, &a.lease_id, a.how)?;
-                Ok(Value::Null)
-            }
+            Self::Confirm(who, a) => match sched.confirm(tx, &who, &a.lease_id, a.how)? {
+                Some(already) => encode(LeaseView::from(already)),
+                None => Ok(Value::Null),
+            },
             Self::RequestCleanupExtension(who, a) => encode(LeaseView::from(
                 sched.request_cleanup_extension(tx, &who, &a.lease_id, &a.reason)?,
             )),

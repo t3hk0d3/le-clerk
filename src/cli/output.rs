@@ -350,6 +350,28 @@ impl Output {
         Ok(())
     }
 
+    /// In an agent session, report the exit `code` of `clerk run`'s command
+    /// as the last line of output: `- child_exit: N`, or `{"child_exit": N}`
+    /// in JSON. The process exits with the code too, where it cannot be told
+    /// from clerk's own exit codes. Nothing for people.
+    ///
+    /// # Errors
+    /// When stdout cannot be written.
+    pub fn child_exit(self, code: u8) -> anyhow::Result<()> {
+        if self.agent.is_none() || self.mode != Mode::Json {
+            return Ok(());
+        }
+        let line = if self.markdown {
+            format!("- child_exit: {code}")
+        } else {
+            json!({ "child_exit": code }).to_string()
+        };
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{line}")?;
+        stdout.flush()?;
+        Ok(())
+    }
+
     /// Report `failure` and return its exit code. JSON mode prints
     /// `{"error": {"code", "message", "details"?}}` on stdout; human mode
     /// prints the message, then one `  key: value` line per detail, on
@@ -550,6 +572,7 @@ mod tests {
                     "bad_state",
                     "borrower_not_overrun",
                     "busy",
+                    "device_absent",
                     "duplicate_in_scope",
                     "extend_refused",
                     "extension_used",

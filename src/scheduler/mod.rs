@@ -30,6 +30,7 @@ pub mod session;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -40,7 +41,7 @@ use thiserror::Error;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::ErrorCode;
-use crate::health::{HealthChecker, HealthResult};
+use crate::health::{self, HealthChecker, HealthResult};
 use crate::inventory::{Inventory, InventoryError, View};
 use crate::model::{
     BuiltinCheck, Caller, Check, DirtyInfo, EndCause, HealthSpec, HolderRef, LeaseId, LeaseState,
@@ -48,7 +49,7 @@ use crate::model::{
     ResourceType, Scope, ServiceMode, TagSet, Unit, UnitId, UnitSettings, UsageTemplate,
 };
 use crate::store::inventory::{self as inventory_sql, ScopeFilter};
-use crate::store::leases::{self, LeaseRow, NewLease, NewRequest};
+use crate::store::leases::{self, LeaseRow, NewLease, NewRequest, RequestRow};
 use crate::store::notices::{self, Notice};
 use crate::store::{StoreError, Tx, audit};
 
@@ -76,6 +77,13 @@ pub trait HealthProbe: Send + Sync {
     fn blocks(&self, _spec: &HealthSpec) -> bool {
         false
     }
+
+    /// The path of a device unit with nothing at it; `None` for anything
+    /// else. `None` (the default) for probes that do not look at the
+    /// filesystem.
+    fn absent_path(&self, _settings: &UnitSettings) -> Option<PathBuf> {
+        None
+    }
 }
 
 impl HealthProbe for HealthChecker {
@@ -99,6 +107,13 @@ impl HealthProbe for HealthChecker {
                     | Check::Builtin(BuiltinCheck::TcpConnect | BuiltinCheck::Http)
             )
         })
+    }
+
+    fn absent_path(&self, settings: &UnitSettings) -> Option<PathBuf> {
+        match settings {
+            UnitSettings::Device { path } if !health::path_exists(path) => Some(path.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -182,6 +197,10 @@ pub struct Grant {
     pub ends_at: i64,
     /// Set when the unit was handed over without confirmed cleanup.
     pub dirty: Option<DirtyInfo>,
+    /// The caller's other queued requests for this unit, cancelled by the
+    /// grant. Absent from the answer when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cancelled_requests: Vec<RequestId>,
 }
 
 /// The answer to an acquire.
@@ -212,6 +231,9 @@ pub enum AcquireOutcome {
         /// The lease an override displaced to make room for this request;
         /// `None` for a plain request.
         displaced: Option<Displaced>,
+        /// The caller had already queued for this target: this is that
+        /// request, unchanged, and no new one was made.
+        existing: bool,
     },
     /// An override by a paused holder against its own borrower: the
     /// borrower is reclaimed and the unit returns to the paused lease.
@@ -278,6 +300,8 @@ pub struct UnhealthyUnit {
 }
 
 /// A lease as seen by its holder.
+// Independent facts about the lease, each its own field on the wire.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Lease {
     pub id: LeaseId,
@@ -314,6 +338,16 @@ pub struct Lease {
     /// The queued request the lease was offered for; `None` for a direct
     /// grant.
     pub request_id: Option<RequestId>,
+    /// Held, its expiry warning is out, and it has not reached its end.
+    pub expiring: bool,
+    /// Held past its end: it stays until someone asks for the unit.
+    pub overdue: bool,
+    /// In the answer to a repeated `claim` or `confirm`: the lease was
+    /// already so, and nothing changed.
+    pub already: bool,
+    /// In the answer to a `claim`: the holder's other queued requests for
+    /// this unit, cancelled by it.
+    pub cancelled_requests: Vec<RequestId>,
 }
 
 /// A queued request as seen by its holder.
@@ -394,8 +428,17 @@ pub enum SchedulerError {
     #[error("that resource has no units; add one or ask for another resource")]
     NoUnits,
     /// The lease is not in a state that allows this.
-    #[error("the lease is {state:?}, which does not allow that")]
+    #[error("the lease {}, which does not allow that", state_in_words(*state))]
     BadState { state: LeaseState },
+    /// `skip_checks` vouches for a device, but nothing is at its path.
+    #[error(
+        "the device is absent: nothing is at {}, so --skip-checks cannot vouch for it",
+        path.display()
+    )]
+    DeviceAbsent {
+        /// The unit's device path.
+        path: PathBuf,
+    },
     /// Storage failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -415,6 +458,7 @@ impl ErrorCode for SchedulerError {
             SchedulerError::NoUnits => "no_units",
             SchedulerError::BorrowerNotOverrun { .. } => "borrower_not_overrun",
             SchedulerError::BadState { .. } => "bad_state",
+            SchedulerError::DeviceAbsent { .. } => "device_absent",
             SchedulerError::Store(e) => e.code(),
         }
     }
@@ -427,8 +471,20 @@ impl ErrorCode for SchedulerError {
             SchedulerError::BorrowerNotOverrun { due_at } => Some(json!({ "due_at": due_at })),
             SchedulerError::ExtendNotLater { ends_at } => Some(json!({ "ends_at": ends_at })),
             SchedulerError::NotYours { holder_kind } => Some(json!({ "holder_kind": holder_kind })),
+            SchedulerError::DeviceAbsent { path } => Some(json!({ "path": path })),
             _ => None,
         }
+    }
+}
+
+/// A lease state as the end of "the lease …".
+fn state_in_words(state: LeaseState) -> &'static str {
+    match state {
+        LeaseState::Offered => "is offered and not claimed yet",
+        LeaseState::Held => "is held",
+        LeaseState::Paused => "is paused",
+        LeaseState::Cleaning => "is in cleanup",
+        LeaseState::Ended => "has ended",
     }
 }
 
@@ -1036,6 +1092,11 @@ impl Scheduler {
         if pinned.is_some_and(|u| u.retiring) || (pinned.is_none() && all_retiring) {
             return Err(SchedulerError::Retiring);
         }
+        if req.skip_checks
+            && let Some(path) = pinned.and_then(|u| self.health.absent_path(&u.settings))
+        {
+            return Err(SchedulerError::DeviceAbsent { path });
+        }
         let ask = Ask {
             holder: &who.holder,
             project: who.project.as_ref(),
@@ -1065,36 +1126,7 @@ impl Scheduler {
                     }
                 }
             }
-            let handed = self.hand_over(tx, &resource, unit, &ask, LeaseState::Held)?;
-            audit::record(
-                tx,
-                self.now(),
-                who,
-                "granted",
-                &json!({
-                    "lease": handed.id,
-                    "resource": resource.id,
-                    "unit": unit.id,
-                    "purpose": req.purpose,
-                    "override_reason": req.override_reason,
-                    "dirty": handed.dirty,
-                    "skip_checks": req.skip_checks,
-                }),
-            )?;
-            let brief = brief(&resource, unit);
-            return Ok(AcquireOutcome::Granted(Grant {
-                lease_id: handed.id,
-                resource: resource.id.clone(),
-                unit: unit.id.clone(),
-                settings: unit.settings.clone(),
-                resource_description: brief.resource_description,
-                unit_description: brief.unit_description,
-                usage: brief.usage,
-                resource_tags: brief.resource_tags,
-                // Invariant: a held hand-over always sets ends_at.
-                ends_at: handed.ends_at.unwrap_or_default(),
-                dirty: handed.dirty,
-            }));
+            return self.grant(tx, who, req, &resource, unit, &ask);
         }
         if checking && defer_on_check {
             return Ok(AcquireOutcome::Checking);
@@ -1102,9 +1134,90 @@ impl Scheduler {
         self.queue_request(tx, who, req, &resource, pinned, &ask)
     }
 
+    /// Grant the free `unit` to `who` at once, ending its other requests
+    /// for that unit.
+    fn grant(
+        &self,
+        tx: &Tx,
+        who: &Caller,
+        req: &AcquireRequest,
+        resource: &Resource,
+        unit: &Unit,
+        ask: &Ask<'_>,
+    ) -> Result<AcquireOutcome, SchedulerError> {
+        let handed = self.hand_over(tx, resource, unit, ask, LeaseState::Held)?;
+        audit::record(
+            tx,
+            self.now(),
+            who,
+            "granted",
+            &json!({
+                "lease": handed.id,
+                "resource": resource.id,
+                "unit": unit.id,
+                "purpose": req.purpose,
+                "override_reason": req.override_reason,
+                "dirty": handed.dirty,
+                "skip_checks": req.skip_checks,
+            }),
+        )?;
+        let cancelled_requests = self.cancel_own_requests_for(tx, who, unit.row)?;
+        let brief = brief(resource, unit);
+        Ok(AcquireOutcome::Granted(Grant {
+            lease_id: handed.id,
+            resource: resource.id.clone(),
+            unit: unit.id.clone(),
+            settings: unit.settings.clone(),
+            resource_description: brief.resource_description,
+            unit_description: brief.unit_description,
+            usage: brief.usage,
+            resource_tags: brief.resource_tags,
+            // Invariant: a held hand-over always sets ends_at.
+            ends_at: handed.ends_at.unwrap_or_default(),
+            dirty: handed.dirty,
+            cancelled_requests,
+        }))
+    }
+
+    /// Cancel `who`'s queued requests for exactly the unit at `unit_row`,
+    /// which it was just granted. Returns their ids.
+    fn cancel_own_requests_for(
+        &self,
+        tx: &Tx,
+        who: &Caller,
+        unit_row: i64,
+    ) -> Result<Vec<RequestId>, SchedulerError> {
+        let mut cancelled = Vec::new();
+        for request in leases::queued_requests(tx)? {
+            if request.holder == who.holder && request.unit_row == Some(unit_row) {
+                self.cancel(tx, who, &request.id)?;
+                cancelled.push(request.id);
+            }
+        }
+        Ok(cancelled)
+    }
+
+    /// `who`'s queued request for the same target (the same resource, and
+    /// the same unit or the same whole-resource pool), first in queue order.
+    fn own_queued_request(
+        tx: &Tx,
+        who: &Caller,
+        resource_row: i64,
+        unit_row: Option<i64>,
+    ) -> Result<Option<RequestRow>, SchedulerError> {
+        Ok(leases::queued_requests(tx)?
+            .into_iter()
+            .filter(|r| {
+                r.holder == who.holder && r.resource_row == resource_row && r.unit_row == unit_row
+            })
+            .min_by_key(dispatch::queue_key))
+    }
+
     /// Queue an acquire that found no free unit, then either override the
     /// held lease it displaces (with `override_reason`) or ask a holder to
-    /// yield.
+    /// yield. A caller already queued for the target gets that request back,
+    /// unless this acquire is what displaces a lease: its override then
+    /// replaces a plain request.
     fn queue_request(
         &self,
         tx: &Tx,
@@ -1134,6 +1247,24 @@ impl Scheduler {
             return Ok(AcquireOutcome::Reclaiming {
                 lease_id: paused.id,
             });
+        }
+        if let Some(existing) =
+            Self::own_queued_request(tx, who, resource.row, pinned.map(|u| u.row))?
+        {
+            if displaced.is_none() || existing.override_lease.is_some() {
+                let queue = QueueSnapshot::load(tx)?;
+                let (position, estimated_wait, blocked_by) =
+                    self.queued_state(tx, who, &queue, existing.row, resource, pinned)?;
+                return Ok(AcquireOutcome::Queued {
+                    request_id: existing.id,
+                    position,
+                    estimated_wait,
+                    blocked_by,
+                    displaced: None,
+                    existing: true,
+                });
+            }
+            self.cancel(tx, who, &existing.id)?;
         }
         let mut outcome = self.enqueue(
             tx,
@@ -1203,21 +1334,8 @@ impl Scheduler {
         )?;
         let after = QueueSnapshot::load(tx)?;
         self.publish_moves(tx, &before, &after)?;
-        let position = after.position(row).ok_or(StoreError::Corrupt("requests"))?;
-        let eligible: Vec<&Unit> = match pinned {
-            Some(u) => vec![u],
-            None => resource.units.iter().collect(),
-        }
-        .into_iter()
-        .filter(|u| !u.retiring)
-        .collect();
-        let estimated_wait = self.estimate(tx, &after, row, &eligible)?;
-        let blocked_by = {
-            let book = self.check_book();
-            blocked_by(tx, who, resource.row, pinned.map(|u| u.row), |row| {
-                book.checking(row)
-            })?
-        };
+        let (position, estimated_wait, blocked_by) =
+            self.queued_state(tx, who, &after, row, resource, pinned)?;
         audit::record(
             tx,
             self.now(),
@@ -1239,7 +1357,37 @@ impl Scheduler {
             estimated_wait,
             blocked_by,
             displaced: None,
+            existing: false,
         })
+    }
+
+    /// Where the queued request at `row` stands in `queue`: its position,
+    /// the estimated wait and what blocks it.
+    fn queued_state(
+        &self,
+        tx: &Tx,
+        who: &Caller,
+        queue: &QueueSnapshot,
+        row: i64,
+        resource: &Resource,
+        pinned: Option<&Unit>,
+    ) -> Result<(u32, Option<Duration>, Option<BlockedBy>), SchedulerError> {
+        let position = queue.position(row).ok_or(StoreError::Corrupt("requests"))?;
+        let eligible: Vec<&Unit> = match pinned {
+            Some(u) => vec![u],
+            None => resource.units.iter().collect(),
+        }
+        .into_iter()
+        .filter(|u| !u.retiring)
+        .collect();
+        let estimated_wait = self.estimate(tx, queue, row, &eligible)?;
+        let blocked_by = {
+            let book = self.check_book();
+            blocked_by(tx, who, resource.row, pinned.map(|u| u.row), |row| {
+                book.checking(row)
+            })?
+        };
+        Ok((position, estimated_wait, blocked_by))
     }
 
     /// The remaining time of live leases on the identity groups of the
@@ -1297,7 +1445,10 @@ impl Scheduler {
         Ok(Some(from_millis(total / units)))
     }
 
-    /// Claim an offered lease; its clock starts now.
+    /// Claim an offered lease; its clock starts now. The holder's other
+    /// queued requests for the same unit are cancelled and listed in the
+    /// answer. Claiming a lease the caller already holds changes nothing and
+    /// answers it with `already` set, so a retry is not an error.
     ///
     /// # Errors
     /// [`SchedulerError::NotFound`], [`SchedulerError::NotHolder`], or
@@ -1309,6 +1460,11 @@ impl Scheduler {
         let lease = leases::find_lease(tx, id)?.ok_or(SchedulerError::NotFound)?;
         if lease.holder != who.holder {
             return Err(SchedulerError::NotHolder);
+        }
+        if lease.state == LeaseState::Held {
+            let mut view = Self::lease_view(tx, lease)?;
+            view.already = true;
+            return Ok(view);
         }
         if lease.state != LeaseState::Offered {
             return Err(SchedulerError::BadState { state: lease.state });
@@ -1326,8 +1482,11 @@ impl Scheduler {
             leases::set_borrow_due(tx, lease.row, ends_at)?;
         }
         audit::record(tx, now, who, "claimed", &json!({ "lease": id }))?;
+        let cancelled_requests = self.cancel_own_requests_for(tx, who, lease.unit_row)?;
         let lease = leases::find_lease(tx, id)?.ok_or(SchedulerError::NotFound)?;
-        Self::lease_view(tx, lease)
+        let mut view = Self::lease_view(tx, lease)?;
+        view.cancelled_requests = cancelled_requests;
+        Ok(view)
     }
 
     fn lease_view(tx: &Tx, lease: LeaseRow) -> Result<Lease, SchedulerError> {
@@ -1338,7 +1497,12 @@ impl Scheduler {
             .find(|u| u.row == lease.unit_row)
             .ok_or(SchedulerError::NotFound)?;
         let brief = brief(&resource, unit);
+        let held = lease.state == LeaseState::Held;
         Ok(Lease {
+            expiring: held && lease.warning_sent && !lease.overdue,
+            overdue: held && lease.overdue,
+            already: false,
+            cancelled_requests: Vec::new(),
             id: lease.id,
             resource: resource.id,
             unit: unit.id.clone(),

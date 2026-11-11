@@ -185,7 +185,9 @@ impl Fixture {
         lease: &LeaseId,
         how: Confirm,
     ) -> Result<(), SchedulerError> {
-        self.store.tx(|tx| self.sched.confirm(tx, who, lease, how))
+        self.store
+            .tx(|tx| self.sched.confirm(tx, who, lease, how))
+            .map(drop)
     }
 
     fn cleanup_extension(
@@ -532,6 +534,22 @@ mod lease_lifecycle {
             }
 
             #[test]
+            fn reports_the_lease_as_expiring_once_warned() {
+                let mut f = fixture();
+                f.seed("board", &["u1"]);
+                let g = f.grant(&caller("a"), req("board", 10 * MIN, Priority::Normal, "x"));
+                let get = |f: &mut Fixture| {
+                    f.store
+                        .tx(|tx| f.sched.get_lease(tx, &caller("a"), &g.lease_id))
+                        .unwrap()
+                };
+                assert!(!get(&mut f).expiring);
+                f.at(T0 + 9 * MIN_MS);
+                f.tick();
+                assert!(get(&mut f).expiring);
+            }
+
+            #[test]
             fn warning_names_the_lease_and_its_end() {
                 let mut f = fixture();
                 f.seed("board", &["u1"]);
@@ -856,6 +874,19 @@ mod lease_lifecycle {
                 assert_eq!(got.len(), 1);
                 assert_eq!(got[0].lease_id.as_ref(), Some(&lease));
                 assert_eq!(got[0].deadline, Some(DEADLINE));
+            }
+
+            #[test]
+            fn names_the_command_for_the_cleanup_extension() {
+                let mut f = fixture();
+                let lease = f.released(MIN);
+                f.at(NOTICE_AT);
+                f.tick();
+                let action = endings(&mut f)[0].action.clone();
+                assert!(
+                    action.contains(&format!("`clerk extend {lease} --cleanup`")),
+                    "{action}"
+                );
             }
 
             #[test]
@@ -1653,6 +1684,18 @@ mod soft_expiry {
 
     mod on_an_overdue_lease {
         use super::*;
+
+        #[test]
+        fn is_reported_on_the_lease() {
+            let mut f = fixture();
+            let lease = overdue(&mut f);
+            let seen = f
+                .store
+                .tx(|tx| f.sched.get_lease(tx, &agent("s1"), &lease))
+                .unwrap();
+            assert!(seen.overdue, "{seen:?}");
+            assert!(!seen.expiring, "{seen:?}");
+        }
 
         #[test]
         fn extend_moves_the_end_and_clears_overdue() {

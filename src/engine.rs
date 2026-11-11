@@ -255,7 +255,8 @@ impl From<SchedulerError> for ApiError {
             | SchedulerError::Retiring
             | SchedulerError::NoUnits
             | SchedulerError::BorrowerNotOverrun { .. }
-            | SchedulerError::BadState { .. } => ErrorKind::Conflict,
+            | SchedulerError::BadState { .. }
+            | SchedulerError::DeviceAbsent { .. } => ErrorKind::Conflict,
             SchedulerError::ExtendNotLater { .. } => ErrorKind::Invalid,
             SchedulerError::Store(_) => ErrorKind::Internal,
         };

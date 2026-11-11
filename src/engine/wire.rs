@@ -168,6 +168,10 @@ pub enum AcquireView {
         /// otherwise.
         #[serde(skip_serializing_if = "Option::is_none")]
         displaced: Option<Displaced>,
+        /// The caller had already queued for this target and this is that
+        /// request; absent otherwise.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        existing: bool,
     },
     /// A paused holder's override of its own borrower: the unit comes back.
     Reclaiming { lease_id: LeaseId },
@@ -186,12 +190,14 @@ impl AcquireView {
                 estimated_wait,
                 blocked_by,
                 displaced,
+                existing,
             } => Self::Queued {
                 request_id,
                 position,
                 estimated_wait_ms: estimated_wait.map(millis),
                 blocked_by,
                 displaced,
+                existing,
             },
             AcquireOutcome::Reclaiming { lease_id } => Self::Reclaiming { lease_id },
             AcquireOutcome::Checking => return None,
@@ -200,6 +206,8 @@ impl AcquireView {
 }
 
 /// A lease as seen by its holder.
+// Independent facts about the lease, each its own field on the wire.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize)]
 pub struct LeaseView {
     pub lease_id: LeaseId,
@@ -231,6 +239,19 @@ pub struct LeaseView {
     /// The queued request the lease was offered for; `null` for a direct
     /// grant.
     pub request_id: Option<RequestId>,
+    /// Held with its expiry warning out; absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub expiring: bool,
+    /// Held past its end, until someone asks for the unit; absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub overdue: bool,
+    /// A repeated `claim` or `confirm`: nothing changed; absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub already: bool,
+    /// The holder's other queued requests for this unit, cancelled by a
+    /// `claim`; absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cancelled_requests: Vec<RequestId>,
 }
 
 /// The caller's live leases and queued requests (`list_my_leases`).
@@ -276,6 +297,10 @@ impl From<Lease> for LeaseView {
             paused_remaining_ms: l.paused_remaining.map(millis),
             end_cause: l.end_cause,
             request_id: l.request_id,
+            expiring: l.expiring,
+            overdue: l.overdue,
+            already: l.already,
+            cancelled_requests: l.cancelled_requests,
         }
     }
 }

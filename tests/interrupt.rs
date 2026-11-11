@@ -185,7 +185,9 @@ impl Fixture {
         lease: &LeaseId,
         how: Confirm,
     ) -> Result<(), SchedulerError> {
-        self.store.tx(|tx| self.sched.confirm(tx, who, lease, how))
+        self.store
+            .tx(|tx| self.sched.confirm(tx, who, lease, how))
+            .map(drop)
     }
 
     fn refuse(&mut self, who: &Caller, lease: &LeaseId) -> Result<(), SchedulerError> {

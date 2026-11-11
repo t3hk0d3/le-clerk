@@ -373,6 +373,9 @@ fn kill_group(child: &Child) {
     }
 }
 
+/// The message of a failed `exists` check: the device is not there.
+pub const PATH_MISSING: &str = "path missing";
+
 /// True when something exists at `path` (following symlinks).
 #[must_use]
 pub fn path_exists(path: &Path) -> bool {
@@ -383,7 +386,7 @@ fn exists(path: &Path) -> HealthResult {
     if path_exists(path) {
         HealthResult::Healthy
     } else {
-        unhealthy("path missing")
+        unhealthy(PATH_MISSING)
     }
 }
 

@@ -364,8 +364,9 @@ impl Scheduler {
             lease,
             NoticeKind::CleanupEnding,
             format!(
-                "The cleanup window of lease {} ends soon; finish cleaning and confirm, or ask \
-                 for the one cleanup extension, or the unit is marked dirty.",
+                "The cleanup window of lease {0} ends soon; finish cleaning and confirm, or run \
+                 `clerk extend {0} --cleanup` for the one cleanup extension, or the unit is \
+                 marked dirty.",
                 lease.id
             ),
         )?;
@@ -691,27 +692,39 @@ impl Scheduler {
     /// request on a held lease: the lease is paused and its unit lent to the
     /// requester (see `interrupt`).
     ///
+    /// Repeating `Clean` on a lease that ended with its cleanup confirmed
+    /// changes nothing and answers the lease with `already` set, so a retry
+    /// is not an error; every other success answers `None`.
+    ///
     /// # Errors
     /// [`SchedulerError::NotFound`]; [`SchedulerError::NotHolder`];
     /// [`SchedulerError::BadState`] for `Clean` unless cleaning with the
     /// window open (a passed window reports `Ended`: it ends at the next
-    /// tick), and for `Yielded` unless held with a yield request whose
-    /// window is open.
+    /// tick) or already confirmed, and for `Yielded` unless held with a
+    /// yield request whose window is open.
     pub fn confirm(
         &self,
         tx: &Tx,
         who: &Caller,
         id: &LeaseId,
         how: Confirm,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<Option<Lease>, SchedulerError> {
         if how == Confirm::Yielded {
-            return self.confirm_yielded(tx, who, id);
+            self.confirm_yielded(tx, who, id)?;
+            return Ok(None);
         }
         let now = self.now();
+        let found = Self::own_lease(tx, who, id)?;
+        if found.state == LeaseState::Ended && found.cleanup_confirmed == Some(true) {
+            let mut view = Self::lease_view(tx, found)?;
+            view.already = true;
+            return Ok(Some(view));
+        }
         let lease = Self::open_cleanup(tx, who, id, now)?;
         audit::record(tx, now, who, "cleanup_confirmed", &json!({ "lease": id }))?;
         let cause = lease.cleanup_cause.unwrap_or(EndCause::Released);
-        self.finish(tx, &lease, cause, true, now)
+        self.finish(tx, &lease, cause, true, now)?;
+        Ok(None)
     }
 
     /// Add `cleanup_extension` to a cleaning lease's window, once.

@@ -452,7 +452,7 @@ fn unhealthy_message(u: &Value) -> Option<String> {
 }
 
 /// Why a unit was handed over dirty, in words.
-fn dirty_explanation(reason: &str) -> &'static str {
+pub(super) fn dirty_explanation(reason: &str) -> &'static str {
     match reason {
         "window_passed" => "the last holder did not confirm cleanup in time",
         "expired" => "the last lease expired before its cleanup was confirmed",

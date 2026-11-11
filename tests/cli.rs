@@ -4926,7 +4926,7 @@ mod cli {
                 seed(&s.env, "board", "k1");
                 hold(&s.env, "x");
                 let child = s.spawn(
-                    &["run", "board", "--for", "10m", "--", "true"],
+                    &["run", "board", "--for", "10m", "--wait", "--", "true"],
                     Some("sess-1"),
                 );
                 let mut request = None;
@@ -6902,6 +6902,640 @@ mod cli {
                     let message = error["message"].as_str().unwrap();
                     assert!(!message.contains("--help"), "{message}");
                     assert!(!message.contains("For more information"), "{message}");
+                }
+            }
+        }
+    }
+
+    /// Lease commands as an agent uses them (Task 10).
+    mod agent_lease_commands {
+        use super::*;
+
+        /// Agent `sess-1` in `dir` holds `board`; returns the lease.
+        fn holding(env: &Env, dir: &Path) -> String {
+            seed(env, "board", "k1");
+            lease_of(&json_of(
+                env.agent("sess-1", dir)
+                    .args(["acquire", "board", "--for", "10m"]),
+            ))
+        }
+
+        /// As [`holding`], with the lease released into its cleanup window.
+        fn cleaning(env: &Env, dir: &Path) -> String {
+            let lease = holding(env, dir);
+            json_of(
+                env.agent("sess-1", dir)
+                    .args(["release", &lease, "--cleanup"]),
+            );
+            lease
+        }
+
+        /// Run `args` as `sess-1`, expecting exit 6; the queued answer.
+        fn queued_on(env: &Env, dir: &Path, args: &[&str]) -> Value {
+            let out = env.agent("sess-1", dir).args(args).output().unwrap();
+            assert_eq!(out.status.code(), Some(6), "{out:?}");
+            serde_json::from_slice(&out.stdout).unwrap()
+        }
+
+        fn queue_len(env: &Env) -> usize {
+            env.ok(&["queue", "board"])[0]["queue"]
+                .as_array()
+                .unwrap()
+                .len()
+        }
+
+        /// A device resource `dev` whose unit `u1` is at a file a process
+        /// keeps open (health: exists and not open), so it reads unhealthy.
+        struct OpenDevice(std::process::Child);
+
+        impl OpenDevice {
+            fn new(env: &Env) -> Self {
+                let path = env.home().join("tty-u1");
+                fs::write(&path, b"").unwrap();
+                env.ok(&["resource", "create", "dev", "--type", "device"]);
+                env.ok(&["unit", "add", "dev", "u1", "--path", path.to_str().unwrap()]);
+                let opened = env.home().join("opened");
+                let child = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("exec 3<\"$0\"; : > \"$1\"; exec sleep 300")
+                    .arg(&path)
+                    .arg(&opened)
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + PATIENCE;
+                while !opened.exists() {
+                    assert!(Instant::now() < deadline, "the device was never opened");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Self(child)
+            }
+        }
+
+        impl Drop for OpenDevice {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// A device resource `dev` whose unit `u1` has no device file.
+        fn absent_device(env: &Env) {
+            let path = env.home().join("no-such-tty");
+            env.ok(&["resource", "create", "dev", "--type", "device"]);
+            env.ok(&["unit", "add", "dev", "u1", "--path", path.to_str().unwrap()]);
+        }
+
+        mod extend_cleanup {
+            use super::*;
+
+            mod on_a_lease_in_its_cleanup_window_first_time {
+                use super::*;
+
+                #[test]
+                fn extends_the_cleanup_deadline_by_cleanup_extension() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let lease = cleaning(&env, &dir);
+                    let mine = json_of(env.agent("sess-1", &dir).args(["leases", "--mine"]));
+                    let before = mine["leases"][0]["cleanup_deadline"].as_i64().unwrap();
+                    let body =
+                        json_of(
+                            env.agent("sess-1", &dir)
+                                .args(["extend", &lease, "--cleanup"]),
+                        );
+                    assert_eq!(
+                        body["cleanup_deadline"].as_i64().unwrap() - before,
+                        120_000,
+                        "{body}"
+                    );
+                }
+            }
+
+            mod on_a_second_request {
+                use super::*;
+
+                #[test]
+                fn refuses_with_extend_refused_and_says_only_one_is_allowed() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let lease = cleaning(&env, &dir);
+                    json_of(
+                        env.agent("sess-1", &dir)
+                            .args(["extend", &lease, "--cleanup"]),
+                    );
+                    let error = error_of(
+                        env.agent("sess-1", &dir)
+                            .args(["extend", &lease, "--cleanup"]),
+                        4,
+                    );
+                    assert_eq!(error["code"], "extend_refused", "{error}");
+                    assert!(
+                        error["message"].as_str().unwrap().contains("only one"),
+                        "{error}"
+                    );
+                }
+            }
+
+            mod on_a_duration_as_well {
+                use super::*;
+
+                #[test]
+                fn is_a_usage_error() {
+                    let env = Env::new();
+                    let error = error_of(
+                        env.cmd()
+                            .args(["extend", "x", "--cleanup", "--for", "5m", "--json"]),
+                        2,
+                    );
+                    assert_eq!(error["code"], "usage_error", "{error}");
+                }
+            }
+        }
+
+        mod acquire {
+            use super::*;
+
+            mod on_the_same_holder_asking_again_for_the_same_target_while_queued {
+                use super::*;
+
+                fn asked_twice(env: &Env, dir: &Path) -> (Value, Value) {
+                    seed(env, "board", "k1");
+                    hold(env, "x");
+                    let args = ["acquire", "board", "--for", "10m"];
+                    (queued_on(env, dir, &args), queued_on(env, dir, &args))
+                }
+
+                #[test]
+                fn returns_the_existing_request() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let (first, again) = asked_twice(&env, &dir);
+                    assert_eq!(again["request_id"], first["request_id"], "{again}");
+                    assert_eq!(again["outcome"], "queued", "{again}");
+                    assert_eq!(again["existing"], true, "{again}");
+                }
+
+                #[test]
+                fn makes_no_second_request() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    asked_twice(&env, &dir);
+                    assert_eq!(queue_len(&env), 1);
+                }
+
+                #[test]
+                fn summary_says_it_was_already_queued() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let (_, again) = asked_twice(&env, &dir);
+                    assert!(
+                        again["summary"].to_string().contains("already queued"),
+                        "{again}"
+                    );
+                }
+
+                #[test]
+                fn the_first_answer_does_not_claim_to_be_existing() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let (first, _) = asked_twice(&env, &dir);
+                    assert!(first.get("existing").is_none(), "{first}");
+                }
+            }
+
+            mod on_the_same_holder_asking_for_another_target {
+                use super::*;
+
+                #[test]
+                fn a_unit_and_its_pool_are_two_requests() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    seed(&env, "board", "k1");
+                    hold(&env, "x");
+                    let pool = queued_on(&env, &dir, &["acquire", "board", "--for", "10m"]);
+                    let unit = queued_on(&env, &dir, &["acquire", "board/u1", "--for", "10m"]);
+                    assert_ne!(unit["request_id"], pool["request_id"], "{unit}");
+                }
+            }
+
+            mod on_another_holder_asking_for_the_same_target {
+                use super::*;
+
+                #[test]
+                fn gets_a_request_of_its_own() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    seed(&env, "board", "k1");
+                    hold(&env, "x");
+                    queued_on(&env, &dir, &["acquire", "board", "--for", "10m"]);
+                    env.agent("sess-2", &dir)
+                        .env(CLAUDE_PID, env.own_host("sess-2", &dir).to_string())
+                        .args(["acquire", "board", "--for", "10m"])
+                        .assert()
+                        .code(6);
+                    assert_eq!(queue_len(&env), 2);
+                }
+            }
+
+            mod on_an_override_after_a_plain_request {
+                use super::*;
+
+                fn overridden(env: &Env, dir: &Path) -> (Value, Value) {
+                    seed(env, "board", "k1");
+                    hold(env, "x");
+                    let args = ["acquire", "board", "--for", "10m"];
+                    let plain = queued_on(env, dir, &args);
+                    let forced = queued_on(
+                        env,
+                        dir,
+                        &[
+                            "acquire",
+                            "board",
+                            "--for",
+                            "10m",
+                            "--override",
+                            "user said",
+                        ],
+                    );
+                    (plain, forced)
+                }
+
+                #[test]
+                fn still_displaces_the_holder() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let (_, forced) = overridden(&env, &dir);
+                    assert!(forced["displaced"].is_object(), "{forced}");
+                }
+
+                #[test]
+                fn leaves_one_request() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    overridden(&env, &dir);
+                    assert_eq!(queue_len(&env), 1);
+                }
+            }
+
+            mod on_a_grant_to_a_holder_that_also_queued_for_the_same_unit {
+                use super::*;
+
+                /// `sess-1` queued for an unhealthy `dev/u1`, then granted
+                /// it with `--skip-checks`: the request and the grant.
+                fn granted_over_own_request(env: &Env, dir: &Path) -> (Value, Value) {
+                    let args = ["acquire", "dev/u1", "--for", "10m"];
+                    let queued = queued_on(env, dir, &args);
+                    let grant = json_of(env.agent("sess-1", dir).args([
+                        "acquire",
+                        "dev/u1",
+                        "--for",
+                        "10m",
+                        "--skip-checks",
+                    ]));
+                    (queued, grant)
+                }
+
+                #[test]
+                fn cancels_the_duplicate_request() {
+                    let env = Env::new();
+                    let _open = OpenDevice::new(&env);
+                    let dir = env.dir("alpha");
+                    granted_over_own_request(&env, &dir);
+                    let mine = json_of(env.agent("sess-1", &dir).args(["leases", "--mine"]));
+                    assert_eq!(mine["requests"], json!([]), "{mine}");
+                }
+
+                #[test]
+                fn lists_it_in_the_answer() {
+                    let env = Env::new();
+                    let _open = OpenDevice::new(&env);
+                    let dir = env.dir("alpha");
+                    let (queued, grant) = granted_over_own_request(&env, &dir);
+                    assert_eq!(
+                        grant["cancelled_requests"],
+                        json!([queued["request_id"]]),
+                        "{grant}"
+                    );
+                }
+            }
+
+            mod on_a_claim_by_a_holder_that_also_queued_for_the_same_unit {
+                use super::*;
+
+                /// `sess-1` queued for the pool, then for `board/u1`; the
+                /// pool's offer claimed: the unit's request and the answer.
+                fn claimed(env: &Env, dir: &Path) -> (Value, Value) {
+                    seed(env, "board", "k1");
+                    let theirs = hold(env, "x");
+                    queued_on(env, dir, &["acquire", "board", "--for", "10m"]);
+                    let unit = queued_on(env, dir, &["acquire", "board/u1", "--for", "10m"]);
+                    free(env, "x", &theirs);
+                    let mine = json_of(env.agent("sess-1", dir).args(["leases", "--mine"]));
+                    let offer = lease_of(&mine["leases"][0]);
+                    let answer = json_of(env.agent("sess-1", dir).args(["claim", &offer]));
+                    (unit, answer)
+                }
+
+                #[test]
+                fn cancels_the_duplicate_request() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    claimed(&env, &dir);
+                    assert_eq!(queue_len(&env), 0);
+                }
+
+                #[test]
+                fn lists_it_in_the_answer() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let (unit, answer) = claimed(&env, &dir);
+                    assert_eq!(
+                        answer["cancelled_requests"],
+                        json!([unit["request_id"]]),
+                        "{answer}"
+                    );
+                }
+            }
+
+            mod skip_checks_on_a_device_unit_whose_path_is_missing {
+                use super::*;
+
+                #[test]
+                fn refuses_with_device_absent() {
+                    let env = Env::new();
+                    absent_device(&env);
+                    let dir = env.dir("alpha");
+                    let error = error_of(
+                        env.agent("sess-1", &dir).args([
+                            "acquire",
+                            "dev/u1",
+                            "--for",
+                            "10m",
+                            "--skip-checks",
+                        ]),
+                        4,
+                    );
+                    assert_eq!(error["code"], "device_absent", "{error}");
+                }
+            }
+        }
+
+        mod confirm_and_claim {
+            use super::*;
+
+            mod on_confirm_clean_of_a_lease_already_ended_with_cleanup_confirmed {
+                use super::*;
+
+                #[test]
+                fn succeeds_with_already_true() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let lease = cleaning(&env, &dir);
+                    let args = ["confirm", lease.as_str(), "clean"];
+                    let first = json_of(env.agent("sess-1", &dir).args(args));
+                    assert!(first.get("already").is_none(), "{first}");
+                    let again = json_of(env.agent("sess-1", &dir).args(args));
+                    assert_eq!(again["already"], true, "{again}");
+                }
+            }
+
+            mod on_claim_of_a_lease_the_caller_already_holds {
+                use super::*;
+
+                #[test]
+                fn succeeds_with_already_true() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let lease = holding(&env, &dir);
+                    let body = json_of(env.agent("sess-1", &dir).args(["claim", &lease]));
+                    assert_eq!(body["already"], true, "{body}");
+                }
+            }
+
+            mod on_a_state_that_refuses_the_command {
+                use super::*;
+
+                #[test]
+                fn message_names_the_state_in_words() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let lease = cleaning(&env, &dir);
+                    let error = error_of(
+                        env.agent("sess-1", &dir)
+                            .args(["extend", &lease, "--for", "20m"]),
+                        4,
+                    );
+                    let message = error["message"].as_str().unwrap();
+                    assert!(message.contains("is in cleanup"), "{message}");
+                    assert!(!message.contains("Cleaning"), "{message}");
+                }
+            }
+        }
+
+        mod leases_mine {
+            use super::*;
+
+            mod on_a_lease_in_cleanup {
+                use super::*;
+
+                #[test]
+                fn next_starts_with_confirm_and_its_deadline() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let lease = cleaning(&env, &dir);
+                    let body = json_of(env.agent("sess-1", &dir).args(["leases", "--mine"]));
+                    let next = body["next"].as_str().unwrap();
+                    let start = format!("`clerk confirm {lease} clean` by ");
+                    assert!(next.starts_with(&start), "{next}");
+                    assert!(next.contains("(in "), "{next}");
+                }
+            }
+        }
+
+        mod grant_output {
+            use super::*;
+
+            mod on_a_dirty_unit {
+                use super::*;
+
+                #[test]
+                fn summary_says_the_unit_is_dirty_why_and_to_check_it_per_its_usage() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    seed(&env, "board", "k1");
+                    env.cmd()
+                        .args(["run", "board", "--for", "10m", "--", "false"])
+                        .assert()
+                        .code(1);
+                    let body = json_of(
+                        env.agent("sess-1", &dir)
+                            .args(["acquire", "board", "--for", "10m"]),
+                    );
+                    let summary = body["summary"].to_string();
+                    assert!(summary.contains("dirty"), "{summary}");
+                    assert!(summary.contains("command failed"), "{summary}");
+                    assert!(summary.contains("usage"), "{summary}");
+                }
+            }
+        }
+
+        mod queued_output {
+            use super::*;
+
+            mod on_unhealthy_blocked_by_with_an_exists_failure {
+                use super::*;
+
+                #[test]
+                fn next_says_the_device_is_absent_tell_the_user_or_fix_path() {
+                    let env = Env::new();
+                    absent_device(&env);
+                    let dir = env.dir("alpha");
+                    let body = queued_on(&env, &dir, &["acquire", "dev/u1", "--for", "10m"]);
+                    let next = body["next"].as_str().unwrap();
+                    assert!(next.contains("device is absent"), "{next}");
+                    assert!(next.contains("tell the user"), "{next}");
+                    assert!(next.contains("--path"), "{next}");
+                }
+
+                #[test]
+                fn next_does_not_offer_skip_checks() {
+                    let env = Env::new();
+                    absent_device(&env);
+                    let dir = env.dir("alpha");
+                    let body = queued_on(&env, &dir, &["acquire", "dev/u1", "--for", "10m"]);
+                    let next = body["next"].as_str().unwrap();
+                    assert!(!next.contains("--skip-checks"), "{next}");
+                }
+            }
+
+            #[test]
+            fn summary_repeats_that_exit_6_means_queued_not_failed() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                seed(&env, "board", "k1");
+                hold(&env, "x");
+                let body = queued_on(&env, &dir, &["acquire", "board", "--for", "10m"]);
+                let summary = body["summary"].to_string();
+                assert!(summary.contains("Exit 6 means queued"), "{summary}");
+                assert!(summary.contains("not failed"), "{summary}");
+            }
+        }
+
+        mod clerk_run {
+            use super::*;
+
+            mod on_a_queued_target_without_wait {
+                use super::*;
+
+                #[test]
+                fn exits_6_with_the_queued_markdown_block() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    seed(&env, "board", "k1");
+                    hold(&env, "x");
+                    let out = env
+                        .agent_md("sess-1", &dir)
+                        .args(["run", "board", "--for", "10m", "--", "true"])
+                        .output()
+                        .unwrap();
+                    assert_eq!(out.status.code(), Some(6), "{out:?}");
+                    let shown = String::from_utf8_lossy(&out.stdout);
+                    assert!(shown.starts_with("## Queued: board"), "{shown}");
+                    assert!(shown.contains("\nNext: "), "{shown}");
+                }
+
+                #[test]
+                fn does_not_run_the_command() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    seed(&env, "board", "k1");
+                    hold(&env, "x");
+                    let marker = env.home().join("ran");
+                    env.agent_md("sess-1", &dir)
+                        .args(["run", "board", "--for", "10m", "--", "touch"])
+                        .arg(&marker)
+                        .assert()
+                        .code(6);
+                    assert!(!marker.exists());
+                }
+            }
+
+            mod on_wait {
+                use super::*;
+
+                /// `clerk run --wait` for an agent, in Markdown, queued
+                /// behind user `x` and then given the unit; its output.
+                fn waited(env: &Env, dir: &Path, script: &str) -> std::process::Output {
+                    use std::os::unix::process::CommandExt;
+                    seed(env, "board", "k1");
+                    let theirs = hold(env, "x");
+                    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_clerk"));
+                    cmd.process_group(0)
+                        .args(["run", "board", "--for", "10m", "--wait"])
+                        .args(["--", "sh", "-c", script])
+                        .env("CLERK_HOME", env.home())
+                        .env(SESSION_VAR, "sess-1")
+                        .env(CLAUDE_PID, std::process::id().to_string())
+                        .current_dir(dir)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    let child = cmd.spawn().unwrap();
+                    let deadline = Instant::now() + PATIENCE;
+                    while queue_len(env) == 0 {
+                        assert!(Instant::now() < deadline, "the run never queued");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    free(env, "x", &theirs);
+                    child.wait_with_output().unwrap()
+                }
+
+                #[test]
+                fn waits_and_prints_markdown() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let out = waited(&env, &dir, "exit 0");
+                    let shown = String::from_utf8_lossy(&out.stdout);
+                    assert!(shown.starts_with("## Queued: board"), "{shown}");
+                    assert!(shown.contains("\n## Lease "), "{shown}");
+                }
+
+                #[test]
+                fn ends_with_child_exit() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let out = waited(&env, &dir, "exit 3");
+                    let shown = String::from_utf8_lossy(&out.stdout);
+                    assert_eq!(shown.trim_end().lines().last(), Some("- child_exit: 3"));
+                }
+
+                #[test]
+                fn exits_with_the_childs_code() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let out = waited(&env, &dir, "exit 3");
+                    assert_eq!(out.status.code(), Some(3), "{out:?}");
+                }
+            }
+
+            mod on_a_free_target {
+                use super::*;
+
+                #[test]
+                fn prints_the_grant_and_child_exit_around_the_commands_output() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    seed(&env, "board", "k1");
+                    let out = env
+                        .agent_md("sess-1", &dir)
+                        .args(["run", "board", "--for", "10m", "--", "echo", "ran"])
+                        .output()
+                        .unwrap();
+                    assert_eq!(out.status.code(), Some(0), "{out:?}");
+                    let shown = String::from_utf8_lossy(&out.stdout);
+                    assert!(shown.starts_with("## Granted: board/u1"), "{shown}");
+                    assert!(shown.contains("\nran\n"), "{shown}");
+                    assert_eq!(shown.trim_end().lines().last(), Some("- child_exit: 0"));
                 }
             }
         }

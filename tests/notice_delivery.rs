@@ -471,7 +471,9 @@ mod waiting_for_an_offer_in_an_agent_session {
     fn run_recording(daemon: &Daemon, marker: &std::path::Path) -> Child {
         let script = format!("echo \"$CLERK_LEASE_ID\" > {}", marker.display());
         daemon.spawn(
-            &["run", "board", "--for", "10m", "--", "sh", "-c", &script],
+            &[
+                "run", "board", "--for", "10m", "--wait", "--", "sh", "-c", &script,
+            ],
             true,
         )
     }

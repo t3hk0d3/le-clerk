@@ -56,6 +56,8 @@ const RUN_ACTS_ON: [notices::NoticeKind; 3] = [
 ];
 /// Pause after a failed notice poll, so a sick daemon is not hammered.
 pub const POLL_RETRY: Duration = Duration::from_secs(1);
+/// What `clerk extend --cleanup` records as the extension's reason.
+const CLEANUP_EXTENSION_REASON: &str = "asked for with clerk extend --cleanup";
 /// Longest default purpose of `clerk run`, in characters.
 const PURPOSE_MAX: usize = 80;
 
@@ -132,9 +134,15 @@ pub struct ExtendArgs {
         long = "for",
         value_name = "DURATION",
         value_parser = parse_duration,
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        required_unless_present = "cleanup",
+        conflicts_with = "cleanup"
     )]
-    duration: Duration,
+    duration: Option<Duration>,
+    /// Ask for the lease's one cleanup extension, while it is in its cleanup
+    /// window (takes no --for).
+    #[arg(long)]
+    cleanup: bool,
 }
 
 /// `clerk run`.
@@ -144,6 +152,10 @@ pub struct RunArgs {
     target: String,
     #[command(flatten)]
     lease: LeaseFlags,
+    /// Agent sessions: wait for a queued target, then run the command.
+    /// Without it, a queued target exits 6 and the command does not run.
+    #[arg(long)]
+    wait: bool,
     /// The command to run, after `--`.
     #[arg(last = true, required = true, value_name = "CMD")]
     command: Vec<OsString>,
@@ -231,13 +243,7 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
         return ctx.out.emit(&View::new(outcome, granted_text));
     }
     if !args.wait {
-        let mut outcome = outcome;
-        // The daemon's queued answer names only the request: add what was
-        // asked for, so the result reads on its own.
-        outcome["resource"] = target["resource"].clone();
-        if let Some(unit) = target.get("unit") {
-            outcome["unit"] = unit.clone();
-        }
+        let mut outcome = with_target(outcome, &target);
         outcome["next"] = Value::String(queued_next(&outcome));
         let shown = args.target.clone();
         ctx.out.emit(&View::new(outcome, move |v| {
@@ -250,6 +256,16 @@ pub async fn acquire(ctx: &Ctx, args: AcquireArgs) -> anyhow::Result<()> {
     let lease = await_offer(ctx, &client, &caller, &request).await?;
     let lease = detach_from_process(&client, &caller, lease).await?;
     ctx.out.emit(&View::new(lease, granted_text))
+}
+
+/// A queued answer, which names only the request, with what was asked for,
+/// so that it reads on its own.
+fn with_target(mut outcome: Value, target: &Value) -> Value {
+    outcome["resource"] = target["resource"].clone();
+    if let Some(unit) = target.get("unit") {
+        outcome["unit"] = unit.clone();
+    }
+    outcome
 }
 
 /// What to do about a request left queued: how to claim its offer, and how
@@ -374,7 +390,10 @@ pub async fn release(ctx: &Ctx, lease: String, cleanup: bool) -> anyhow::Result<
 pub async fn extend(ctx: &Ctx, args: ExtendArgs) -> anyhow::Result<()> {
     let client = ctx.client().await?;
     let caller = lease_caller(ctx, &client, &args.lease).await?;
-    let ends_at = SystemClock.now_ms().saturating_add(millis(args.duration));
+    let Some(duration) = args.duration else {
+        return extend_cleanup(ctx, &client, &caller, &args.lease).await;
+    };
+    let ends_at = SystemClock.now_ms().saturating_add(millis(duration));
     let view = client
         .call(
             "extend",
@@ -391,6 +410,41 @@ pub async fn extend(ctx: &Ctx, args: ExtendArgs) -> anyhow::Result<()> {
     }))
 }
 
+/// `clerk extend <lease> --cleanup`: the lease's one cleanup extension. A
+/// second one is an extension refused, whichever reason the daemon gives.
+async fn extend_cleanup(
+    ctx: &Ctx,
+    client: &Client,
+    caller: &Caller,
+    lease: &str,
+) -> anyhow::Result<()> {
+    let args = json!({ "lease_id": lease, "reason": CLEANUP_EXTENSION_REASON });
+    let view = match client.call("request_cleanup_extension", caller, args).await {
+        Ok(view) => view,
+        Err(e) if e.code == "extension_used" => {
+            return Err(ApiError {
+                code: "extend_refused".to_owned(),
+                message: format!(
+                    "Lease {lease} has used its cleanup extension: only one is allowed."
+                ),
+                details: None,
+            }
+            .into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    ctx.out.emit(&View::new(view, |v| {
+        let ends = v["cleanup_deadline"].as_i64().map_or_else(
+            || "-".to_owned(),
+            |at| render::when(at, SystemClock.now_ms()),
+        );
+        format!(
+            "Extended: the cleanup window of lease {} now ends {ends}.",
+            text(&v["lease_id"])
+        )
+    }))
+}
+
 pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
     let target = target_arg(&args.target)?;
     let caller = ctx.caller(CallerKind::Run)?;
@@ -399,17 +453,40 @@ pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
     let purpose = purpose_of(&args.command);
     let body = request_args(&target, &args.lease, purpose, &caller);
     let client = ctx.client().await?;
+    let agent = caller::is_agent(&caller);
     let outcome = client.call("acquire", &caller, body).await?;
     let lease = match outcome["outcome"].as_str() {
         Some("granted") => outcome,
+        Some("queued") if agent => {
+            let mut queued = with_target(outcome, &target);
+            if args.wait {
+                queued["waiting"] = json!(true);
+            }
+            let request = id(&queued, "request_id")?;
+            let shown = args.target.clone();
+            ctx.out
+                .emit(&View::new(queued, move |v| outcome_text(v, &shown)))?;
+            if !args.wait {
+                return Err(Exit(EXIT_QUEUED).into());
+            }
+            await_offer(ctx, &client, &caller, &request).await?
+        }
         Some("queued") => {
             note(|| outcome_text(&outcome, &args.target));
             await_offer(ctx, &client, &caller, &id(&outcome, "request_id")?).await?
         }
         _ => anyhow::bail!("the daemon answered the acquire with {outcome}"),
     };
-    note(|| granted_text(&lease));
-    match supervise(&client, &caller, &lease, &args.command).await? {
+    if agent {
+        ctx.out.emit(&View::new(lease.clone(), granted_text))?;
+    } else {
+        note(|| granted_text(&lease));
+    }
+    let code = supervise(&client, &caller, &lease, &args.command).await?;
+    if agent {
+        ctx.out.child_exit(code)?;
+    }
+    match code {
         0 => Ok(()),
         code => Err(Exit(code).into()),
     }

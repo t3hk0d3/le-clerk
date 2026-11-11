@@ -3,8 +3,10 @@
 //! and `next` (the step the clerk expects). Errors end their message with
 //! the next step instead.
 
+use leclerk::health::PATH_MISSING;
 use serde_json::{Value, json};
 
+use super::views::dirty_explanation;
 use super::wait::ARM_AGAIN;
 
 /// The next step when nothing more specific applies.
@@ -55,9 +57,10 @@ pub fn after_error(code: &str) -> &'static str {
              --override \"<their reason>\"."
         }
         "extend_refused" => {
-            "Someone with priority is waiting (see the details): finish up and release, or ask \
-             the user."
+            "The extension is refused, for the reason given here: finish up and release or \
+             confirm the cleanup, or ask the user."
         }
+        "device_absent" => "Check the device: tell the user (unplugged?) or fix the unit's --path.",
         "daemon_unavailable"
         | "daemon_unresponsive"
         | "engine_unavailable"
@@ -98,16 +101,29 @@ pub fn error_message(code: &str, message: &str) -> String {
 /// The summary and next step of a queued request.
 fn queued(v: &Value) -> (Vec<String>, String) {
     let mut summary = vec![format!(
-        "Queued for {} at position {} (request {}).",
+        "{} {} at position {} (request {}).",
+        if v["existing"] == true {
+            "You were already queued for"
+        } else {
+            "Queued for"
+        },
         v["unit"]
             .as_str()
             .map_or_else(|| s(v, "resource"), |u| format!("{}/{u}", s(v, "resource"))),
         v["position"],
         s(v, "request_id")
     )];
+    if v["existing"] == true {
+        summary.push(
+            "It stays as first asked, with no second request; `clerk cancel` it first to \
+             change it."
+                .to_owned(),
+        );
+    }
     if let Some(line) = displaced_line(v) {
         summary.push(line);
     }
+    summary.push("Exit 6 means queued, not failed: do not acquire again.".to_owned());
     (
         summary,
         format!(
@@ -131,10 +147,41 @@ fn displaced_line(v: &Value) -> Option<String> {
     ))
 }
 
+/// The summary and next step of a `clerk run` left queued, or waiting
+/// (`waiting`, with `--wait`): the command has not run.
+fn run_queued(v: &Value) -> (Vec<String>, String) {
+    let (summary, _) = queued(v);
+    let next = if v["waiting"] == true {
+        "`clerk run` is waiting for the unit and runs the command once it has it: let it run."
+            .to_owned()
+    } else {
+        format!(
+            "The command has not run. Repeat this `clerk run` with --wait (with \
+             run_in_background: true, as it can take long): it keeps this request, waits, then \
+             runs the command. `clerk cancel {}` drops the request.{}",
+            s(v, "request_id"),
+            unhealthy_hint(v)
+        )
+    };
+    (summary, next)
+}
+
+/// Whether a failed `exists` check is among what blocks a queued request.
+fn device_absent(v: &Value) -> bool {
+    v["blocked_by"]["kind"] == "unhealthy"
+        && v["blocked_by"]["units"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|x| x["message"] == PATH_MISSING))
+}
+
 /// For a request a failed health check blocks: how to get past it when the
-/// caller's own job is what the check sees (`--override` does not).
+/// caller's own job is what the check sees (`--override` does not), or, for
+/// a device that is not there, who can.
 fn unhealthy_hint(v: &Value) -> &'static str {
-    if v["blocked_by"]["kind"] == "unhealthy" {
+    if device_absent(v) {
+        " The device is absent (path missing), so waiting will not help: tell the user \
+         (unplugged?) or fix the unit's --path with `clerk unit update`."
+    } else if v["blocked_by"]["kind"] == "unhealthy" {
         " The unit fails its health check (see blocked_by), which --override does not get \
          past: if it is your own running job that holds it, cancel and `clerk acquire \
          <resource>/<unit> --skip-checks`; otherwise wait, it is re-checked."
@@ -171,19 +218,39 @@ fn needs_wait(v: &Value) -> bool {
             .is_some_and(|l| l.iter().any(|x| x["interruptible"] == true))
 }
 
-/// The note of a grant: what is held, whether the previous owner abandoned
-/// it, and a wait only when the lease can be asked to yield.
-fn granted(v: &Value, lease: &str) -> (Vec<String>, String) {
+/// What every grant's summary says: what is held, that it was held already
+/// on a repeat, a dirty unit and why, and the duplicate requests it ended.
+fn granted_summary(v: &Value, lease: &str) -> Vec<String> {
     let mut summary = vec![format!(
-        "You hold lease {lease} ({}/{}); read its description and usage before using it.",
+        "You {} lease {lease} ({}/{}); read its description and usage before using it.",
+        if v["already"] == true {
+            "already hold"
+        } else {
+            "hold"
+        },
         s(v, "resource"),
         s(v, "unit")
     )];
-    if v["dirty"]["reason"] == "abandoned" {
-        summary.push(
-            "The previous owner abandoned this unit: check it before you rely on it.".to_owned(),
-        );
+    if let Some(reason) = v["dirty"]["reason"].as_str() {
+        summary.push(format!(
+            "The unit is dirty ({}): check it per its usage before you rely on it.",
+            dirty_explanation(reason)
+        ));
     }
+    if let Some(cancelled) = v["cancelled_requests"].as_array().filter(|c| !c.is_empty()) {
+        let ids: Vec<&str> = cancelled.iter().filter_map(Value::as_str).collect();
+        summary.push(format!(
+            "Your other queued request(s) for this unit are cancelled: {}.",
+            ids.join(", ")
+        ));
+    }
+    summary
+}
+
+/// The note of a grant: its summary, and a wait only when the lease can be
+/// asked to yield.
+fn granted(v: &Value, lease: &str) -> (Vec<String>, String) {
+    let summary = granted_summary(v, lease);
     let wait = if v["interruptible"] == true {
         format!(" {ARM_AGAIN}")
     } else {
@@ -198,15 +265,103 @@ fn granted(v: &Value, lease: &str) -> (Vec<String>, String) {
     )
 }
 
+/// What each lease needs from its holder now, soonest first: cleanups by
+/// their deadlines, then offers, then leases near or past their end.
+fn lease_actions(v: &Value) -> Vec<String> {
+    let leases = v["leases"].as_array().map_or(&[][..], Vec::as_slice);
+    let mut cleaning: Vec<&Value> = leases.iter().filter(|l| l["state"] == "cleaning").collect();
+    cleaning.sort_by_key(|l| l["cleanup_deadline"].as_i64());
+    let mut offered: Vec<&Value> = leases.iter().filter(|l| l["state"] == "offered").collect();
+    offered.sort_by_key(|l| l["claim_deadline"].as_i64());
+    let mut ending: Vec<&Value> = leases
+        .iter()
+        .filter(|l| l["expiring"] == true || l["overdue"] == true)
+        .collect();
+    ending.sort_by_key(|l| l["ends_at"].as_i64());
+    let cleaning = cleaning.into_iter().map(|l| {
+        let id = s(l, "lease_id");
+        format!(
+            "`clerk confirm {id} clean` by {}, or the unit is marked dirty (`clerk extend {id} \
+             --cleanup` asks for the one extension).",
+            time(&l["cleanup_deadline"])
+        )
+    });
+    let offered = offered.into_iter().map(|l| {
+        format!(
+            "`clerk claim {}` by {}, or it goes to the next in line.",
+            s(l, "lease_id"),
+            time(&l["claim_deadline"])
+        )
+    });
+    let ending = ending.into_iter().map(|l| {
+        let id = s(l, "lease_id");
+        if l["overdue"] == true {
+            format!(
+                "Lease {id} is past its end and stays yours until someone asks for the unit: \
+                 `clerk extend {id} --for <d>` if you still need it, else `clerk release {id}`."
+            )
+        } else {
+            format!(
+                "`clerk extend {id} --for <d>` before {} if you need more time, else `clerk \
+                 release {id}`.",
+                time(&l["ends_at"])
+            )
+        }
+    });
+    cleaning.chain(offered).chain(ending).collect()
+}
+
+/// `base`, after what each lease of `v` needs now.
+fn after_lease_actions(v: &Value, base: String) -> String {
+    let mut parts = lease_actions(v);
+    parts.push(base);
+    parts.join(" ")
+}
+
+/// The note of `leases --mine`: the counts, then what each lease needs now.
+fn leases(v: &Value) -> (Vec<String>, String) {
+    (
+        vec![format!(
+            "{} lease(s), {} queued request(s); a wait is {}armed.",
+            v["leases"].as_array().map_or(0, Vec::len),
+            v["requests"].as_array().map_or(0, Vec::len),
+            if v["armed"] == true { "" } else { "not " }
+        )],
+        after_lease_actions(
+            v,
+            if v["armed"] == true {
+                "Act on the notices as they arrive.".to_owned()
+            } else if needs_wait(v) {
+                ARM_AGAIN.to_owned()
+            } else {
+                "No wait is needed for plain leases; release them when you are done.".to_owned()
+            },
+        ),
+    )
+}
+
 /// The summary lines and next step for `command`'s result `v`.
 pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
     let lease = s(v, "lease_id");
     match command {
         "acquire" | "claim" | "attach" if v["outcome"] == "queued" => queued(v),
+        "run" if v["outcome"] == "queued" => run_queued(v),
+        "run" => (
+            granted_summary(v, &lease),
+            "`clerk run` is running your command now and gives the lease back when it exits; \
+             its last line reports the command's status (`- child_exit: N`)."
+                .to_owned(),
+        ),
         "acquire" | "claim" | "attach" | "reclaim" => granted(v, &lease),
         "release" if v["state"] == "cleaning" => (
             vec![format!("Lease {lease} is in its cleanup window.")],
             format!("Clean the unit up, then `clerk confirm {lease} clean`."),
+        ),
+        "confirm" if v["already"] == true => (
+            vec![format!(
+                "Lease {lease} had already ended with its cleanup confirmed; nothing changed."
+            )],
+            "Nothing more for this lease.".to_owned(),
         ),
         "release" | "confirm" if v["state"] == "ended" => (
             vec![format!(
@@ -219,6 +374,13 @@ pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
         "confirm" => (
             vec![format!("Lease {lease} is {}.", s(v, "state"))],
             format!("Wait for your unit to come back (the wait tells you). {ARM_AGAIN}"),
+        ),
+        "extend" if v["state"] == "cleaning" => (
+            vec![format!(
+                "The cleanup window of lease {lease} now ends {}; that was its one extension.",
+                time(&v["cleanup_deadline"])
+            )],
+            format!("Clean the unit up, then `clerk confirm {lease} clean`."),
         ),
         "extend" => (
             vec![format!("Lease {lease} now ends {}.", time(&v["ends_at"]))],
@@ -261,21 +423,7 @@ pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
              `clerk acquire <resource> --for <d> --purpose <text>` before using one."
                 .to_owned(),
         ),
-        "leases" => (
-            vec![format!(
-                "{} lease(s), {} queued request(s); a wait is {}armed.",
-                v["leases"].as_array().map_or(0, Vec::len),
-                v["requests"].as_array().map_or(0, Vec::len),
-                if v["armed"] == true { "" } else { "not " }
-            )],
-            if v["armed"] == true {
-                "Act on the notices as they arrive.".to_owned()
-            } else if needs_wait(v) {
-                ARM_AGAIN.to_owned()
-            } else {
-                "No wait is needed for plain leases; release them when you are done.".to_owned()
-            },
-        ),
+        "leases" => leases(v),
         "daemon" if v["running"] == false => (
             vec!["The clerk daemon is stopped.".to_owned()],
             "Nothing: the daemon stays stopped until the next clerk command.".to_owned(),
@@ -350,6 +498,7 @@ mod tests {
         assert!(after_error("ambiguous_duplicate").contains("ask the user"));
         assert!(after_error("override_required").contains("--override"));
         assert!(after_error("extend_refused").contains("release"));
+        assert!(after_error("device_absent").contains("tell the user"));
     }
 
     #[test]
@@ -377,6 +526,95 @@ mod tests {
                            "dirty": {"reason": "abandoned"}});
         annotate("acquire", &mut v);
         assert!(v["summary"].to_string().contains("abandoned"), "{v}");
+    }
+
+    /// `leases --mine` answer holding `leases`, no requests, no wait armed.
+    fn mine(leases: &Value) -> Value {
+        json!({"leases": leases, "requests": [], "armed": false})
+    }
+
+    #[test]
+    fn leases_next_starts_with_the_soonest_cleanup_then_offers_then_expiries() {
+        let (_, next) = note(
+            "leases",
+            &mine(&json!([
+                {"lease_id": "L1", "state": "held", "expiring": true,
+                 "ends_at": 1_800_000_000_000_i64},
+                {"lease_id": "L2", "state": "offered", "claim_deadline": 1_800_000_000_000_i64},
+                {"lease_id": "L3", "state": "cleaning", "cleanup_deadline": 1_800_000_500_000_i64},
+                {"lease_id": "L4", "state": "cleaning", "cleanup_deadline": 1_800_000_000_000_i64},
+            ])),
+        );
+        assert!(next.starts_with("`clerk confirm L4 clean` by "), "{next}");
+        let at = |s: &str| next.find(s).unwrap_or_else(|| panic!("{s}: {next}"));
+        assert!(
+            at("`clerk confirm L3 clean`") < at("`clerk claim L2`"),
+            "{next}"
+        );
+        assert!(
+            at("`clerk claim L2`") < at("`clerk extend L1 --for <d>`"),
+            "{next}"
+        );
+    }
+
+    #[test]
+    fn leases_next_says_an_overdue_lease_stays_until_someone_asks() {
+        let (_, next) = note(
+            "leases",
+            &mine(&json!([{"lease_id": "L1", "state": "held", "overdue": true,
+                          "ends_at": 1_i64}])),
+        );
+        assert!(next.contains("past its end"), "{next}");
+        assert!(next.contains("until someone"), "{next}");
+        assert!(next.contains("`clerk extend L1 --for <d>`"), "{next}");
+        assert!(next.contains("`clerk release L1`"), "{next}");
+    }
+
+    #[test]
+    fn leases_next_has_no_action_for_a_plain_held_lease() {
+        let (_, next) = note(
+            "leases",
+            &mine(&json!([{"lease_id": "L1", "state": "held", "ends_at": 1_i64}])),
+        );
+        assert!(next.starts_with("No wait is needed"), "{next}");
+    }
+
+    #[test]
+    fn a_repeated_confirm_says_nothing_changed() {
+        let mut v = json!({"lease_id": "L1", "state": "ended", "already": true});
+        annotate("confirm", &mut v);
+        assert!(v["summary"].to_string().contains("already"), "{v}");
+    }
+
+    #[test]
+    fn a_repeated_claim_says_it_was_already_held() {
+        let mut v = json!({"lease_id": "L1", "resource": "r", "unit": "u", "state": "held",
+                           "already": true});
+        annotate("claim", &mut v);
+        assert!(v["summary"].to_string().contains("already"), "{v}");
+    }
+
+    #[test]
+    fn a_grant_says_which_duplicates_it_cancelled() {
+        let mut v = json!({"outcome": "granted", "lease_id": "L1", "resource": "r", "unit": "u",
+                           "cancelled_requests": ["R1"]});
+        annotate("acquire", &mut v);
+        assert!(v["summary"].to_string().contains("R1"), "{v}");
+    }
+
+    #[test]
+    fn a_cleanup_extension_names_the_new_deadline_and_the_confirm() {
+        let mut v = json!({"lease_id": "L1", "state": "cleaning",
+                           "cleanup_deadline": 1_800_000_000_000_i64});
+        annotate("extend", &mut v);
+        assert!(v["summary"].to_string().contains("cleanup"), "{v}");
+        assert!(
+            v["next"]
+                .as_str()
+                .unwrap()
+                .contains("`clerk confirm L1 clean`"),
+            "{v}"
+        );
     }
 
     #[test]

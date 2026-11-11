@@ -1208,18 +1208,13 @@ mod scheduler {
             }
 
             #[test]
-            fn of_a_held_lease_returns_bad_state() {
+            fn of_a_held_lease_answers_it_as_already_held() {
                 let mut f = fixture();
                 f.seed("board", &["u1"]);
                 let a = caller("a");
                 let g = f.grant(&a, req(on("board"), MIN, Priority::Normal, "x"));
                 let out = f.store.tx(|tx| f.sched.claim(tx, &a, &g.lease_id));
-                assert!(matches!(
-                    out,
-                    Err(SchedulerError::BadState {
-                        state: LeaseState::Held
-                    })
-                ));
+                assert!(out.unwrap().already);
             }
 
             #[test]
