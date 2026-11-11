@@ -549,6 +549,81 @@ mod cli {
             }
         }
 
+        mod pre_tool_use {
+            use super::*;
+
+            fn pre_tool_use(env: &Env, session: &str, host: &Host) -> Output {
+                let doc = typical("pre-tool-use", session);
+                run_hook(env.home(), "pre-tool-use", &doc, Some(host.pid())).0
+            }
+
+            /// `s1` holds `board/u1` with a plain lease, which `s2` overrides.
+            fn overridden(env: &Env, host: &Host, other: &Host) {
+                seed(env);
+                holds(env, "s1", host);
+                let args = ["acquire", "board", "--for", "10m", "--override", "asked"];
+                let (body, code) = agent(env, "s2", other, &args);
+                assert_eq!(code, Some(6), "{body}");
+            }
+
+            mod on_a_lease_released_with_nothing_else_going_on {
+                use super::*;
+
+                #[test]
+                fn prints_nothing() {
+                    let env = Env::new();
+                    seed(&env);
+                    let host = Host::spawn();
+                    let lease = holds(&env, "s1", &host);
+                    let (body, code) = agent(&env, "s1", &host, &["release", &lease]);
+                    assert_eq!(code, Some(0), "{body}");
+                    assert_eq!(pre_tool_use(&env, "s1", &host).stdout, b"");
+                }
+            }
+
+            mod on_a_live_notice_to_a_plain_holder {
+                use super::*;
+
+                fn shown() -> String {
+                    let env = Env::new();
+                    let (host, other) = (Host::spawn(), Host::spawn());
+                    overridden(&env, &host, &other);
+                    context_of(&pre_tool_use(&env, "s1", &host))
+                }
+
+                #[test]
+                fn shows_it() {
+                    assert!(shown().contains("overridden"));
+                }
+
+                #[test]
+                fn does_not_ask_for_a_wait() {
+                    let context = shown();
+                    assert!(!context.contains("arm a clerk wait"), "{context}");
+                }
+            }
+
+            mod on_a_live_notice_to_a_session_with_a_queued_request {
+                use super::*;
+
+                #[test]
+                fn asks_for_a_wait() {
+                    let env = Env::new();
+                    let (host, other) = (Host::spawn(), Host::spawn());
+                    overridden(&env, &host, &other);
+                    env.ok(&["resource", "create", "rig", "--type", "generic"]);
+                    env.ok(&["unit", "add", "rig", "r1", "--key", "k2"]);
+                    let (body, code) =
+                        agent(&env, "s2", &other, &["acquire", "rig", "--for", "9m"]);
+                    assert_eq!(code, Some(0), "{body}");
+                    let (body, code) = agent(&env, "s1", &host, &["acquire", "rig", "--for", "9m"]);
+                    assert_eq!(code, Some(6), "{body}");
+                    let context = context_of(&pre_tool_use(&env, "s1", &host));
+                    assert!(context.contains("arm a clerk wait"), "{context}");
+                }
+            }
+        }
+
         mod session_end {
             use super::*;
 

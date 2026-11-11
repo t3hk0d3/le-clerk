@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    Caller, DirtyInfo, HolderRef, LeaseId, LeaseState, NoticeId, RequestId, ResourceId, UnitId,
+    Caller, DirtyInfo, EndCause, HolderRef, LeaseId, LeaseState, NoticeId, RequestId, ResourceId,
+    UnitId,
 };
 use crate::store::{StoreError, Tx, audit, enum_text, leases};
 
@@ -125,29 +126,43 @@ fn decode(tx: &Tx, row: i64, payload: &str) -> Option<Notice> {
     }
 }
 
-/// `(row_id, notice)` of the first `limit` rows of `(row_id, payload)` that
-/// decode. Rows after those are not read, and rows that do not decode do not
-/// count: however many there are, they cannot hold up the notices behind.
-fn decode_up_to(
-    tx: &Tx,
-    mut rows: rusqlite::Rows<'_>,
-    limit: u32,
-) -> Result<Vec<(i64, Notice)>, StoreError> {
-    let mut out = Vec::new();
-    while out.len() < limit as usize {
+/// What a read of pending notices found, each as `(row_id, notice)`.
+struct Page {
+    /// Notices that stand, up to the limit.
+    live: Vec<(i64, Notice)>,
+    /// The [`obsolete`] notices met on the way to them.
+    obsolete: Vec<(i64, Notice)>,
+}
+
+/// The first `limit` rows of `(row_id, payload)` that decode and are not
+/// [`obsolete`], with the obsolete rows before them. Rows after those are
+/// not read. Rows that do not decode and obsolete rows do not count: however
+/// many there are, they cannot hold up the notices behind.
+fn read_page(tx: &Tx, mut rows: rusqlite::Rows<'_>, limit: u32) -> Result<Page, StoreError> {
+    let mut page = Page {
+        live: Vec::new(),
+        obsolete: Vec::new(),
+    };
+    while page.live.len() < limit as usize {
         let Some(r) = rows.next()? else {
             break;
         };
         let row: i64 = r.get(0)?;
         let payload: String = r.get(1)?;
         if let Some(notice) = decode(tx, row, &payload) {
-            out.push((row, notice));
+            if obsolete(tx, &notice)? {
+                page.obsolete.push((row, notice));
+            } else {
+                page.live.push((row, notice));
+            }
         }
     }
-    Ok(out)
+    Ok(page)
 }
 
-/// Undelivered notices of `holder`, oldest first, without marking them.
+/// Every undelivered notice of `holder`, oldest first, without marking them:
+/// what the store still owes, [`obsolete`] or not. It is for inspecting the
+/// store; what an agent is shown goes through [`unshown`] or [`returned`].
 ///
 /// # Errors
 /// [`StoreError`] on SQL failure.
@@ -156,10 +171,14 @@ pub fn pending(tx: &Tx, holder: &HolderRef) -> Result<Vec<Notice>, StoreError> {
         "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
          ORDER BY row_id",
     )?;
-    let rows = stmt.query([serde_json::to_string(holder)?])?;
-    Ok(decode_up_to(tx, rows, u32::MAX)?
-        .into_iter()
-        .map(|(_, n)| n)
+    let rows = stmt
+        .query_map([serde_json::to_string(holder)?], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .iter()
+        .filter_map(|(row, payload)| decode(tx, *row, payload))
         .collect())
 }
 
@@ -220,11 +239,13 @@ pub fn take_matching(
     limit: u32,
     now_ms: i64,
 ) -> Result<Vec<Notice>, StoreError> {
-    let rows = live(tx, select_pending(tx, holder, filter, limit)?, now_ms)?;
+    let page = select_pending(tx, holder, filter, limit)?;
+    supersede(tx, page.obsolete, now_ms)?;
     let mut mark = tx
         .conn()
         .prepare("UPDATE notices SET delivered_at = ?2 WHERE row_id = ?1")?;
-    rows.into_iter()
+    page.live
+        .into_iter()
         .map(|(row, notice)| {
             mark.execute(rusqlite::params![row, now_ms])?;
             Ok(notice)
@@ -261,16 +282,10 @@ fn obsolete(tx: &Tx, notice: &Notice) -> Result<bool, StoreError> {
     })
 }
 
-/// The rows of `rows` that are not [`obsolete`]. The others are marked
-/// delivered at `now_ms` and audited as `superseded`, so they are neither
-/// returned now nor pending later.
-fn live(tx: &Tx, rows: Vec<(i64, Notice)>, now_ms: i64) -> Result<Vec<(i64, Notice)>, StoreError> {
-    let mut keep = Vec::with_capacity(rows.len());
+/// Mark `rows`, which are [`obsolete`], delivered at `now_ms` and audit them
+/// as `superseded`, so they are neither returned now nor pending later.
+fn supersede(tx: &Tx, rows: Vec<(i64, Notice)>, now_ms: i64) -> Result<(), StoreError> {
     for (row, notice) in rows {
-        if !obsolete(tx, &notice)? {
-            keep.push((row, notice));
-            continue;
-        }
         tx.conn().execute(
             "UPDATE notices SET delivered_at = ?2 WHERE row_id = ?1",
             rusqlite::params![row, now_ms],
@@ -295,7 +310,29 @@ fn live(tx: &Tx, rows: Vec<(i64, Notice)>, now_ms: i64) -> Result<Vec<(i64, Noti
             }),
         )?;
     }
-    Ok(keep)
+    Ok(())
+}
+
+/// Whether `notice` asks nothing of its holder, so that no hook need
+/// interrupt the agent with it: a queue position, or the clean end of a
+/// lease the holder ended itself. An end that someone else caused, or that
+/// left the unit dirty, is news.
+fn needs_no_action(tx: &Tx, notice: &Notice) -> Result<bool, StoreError> {
+    Ok(match notice.kind {
+        NoticeKind::PositionChanged => true,
+        NoticeKind::LeaseEnded if notice.dirty.is_none() => {
+            let Some(id) = &notice.lease_id else {
+                return Ok(false);
+            };
+            leases::find_lease(tx, id)?.is_some_and(|lease| {
+                matches!(
+                    lease.end_cause,
+                    Some(EndCause::Released | EndCause::Yielded | EndCause::Unclaimed)
+                )
+            })
+        }
+        _ => false,
+    })
 }
 
 /// Acknowledged delivery (`clerk wait`): up to `limit` undelivered
@@ -314,11 +351,13 @@ pub fn returned(
     limit: u32,
     now_ms: i64,
 ) -> Result<Vec<Notice>, StoreError> {
-    let rows = live(tx, select_pending(tx, holder, filter, limit)?, now_ms)?;
+    let page = select_pending(tx, holder, filter, limit)?;
+    supersede(tx, page.obsolete, now_ms)?;
     let mut mark = tx
         .conn()
         .prepare("UPDATE notices SET returned_at = COALESCE(returned_at, ?2) WHERE row_id = ?1")?;
-    rows.into_iter()
+    page.live
+        .into_iter()
         .map(|(row, notice)| {
             mark.execute(rusqlite::params![row, now_ms])?;
             Ok(notice)
@@ -350,8 +389,10 @@ pub fn ack(
     )?)
 }
 
-/// Undelivered notices of `holder` that no hook has shown yet, oldest
-/// first, changing nothing. Showing is not delivery: see [`mark_shown`].
+/// Undelivered notices of `holder` that no hook has shown yet and that are
+/// worth showing (neither [`obsolete`] nor [`needs_no_action`]), oldest
+/// first, changing nothing: a wait still gets what is left out here. Showing
+/// is not delivery: see [`mark_shown`].
 ///
 /// # Errors
 /// [`StoreError`] on SQL failure.
@@ -361,10 +402,13 @@ pub fn unshown(tx: &Tx, holder: &HolderRef) -> Result<Vec<Notice>, StoreError> {
          AND hook_shown_at IS NULL ORDER BY row_id",
     )?;
     let rows = stmt.query([serde_json::to_string(holder)?])?;
-    Ok(decode_up_to(tx, rows, u32::MAX)?
-        .into_iter()
-        .map(|(_, n)| n)
-        .collect())
+    let mut shown = Vec::new();
+    for (_, notice) in read_page(tx, rows, u32::MAX)?.live {
+        if !needs_no_action(tx, &notice)? {
+            shown.push(notice);
+        }
+    }
+    Ok(shown)
 }
 
 /// Mark those of `ids` that are undelivered, not yet shown notices of
@@ -392,16 +436,16 @@ pub fn mark_shown(
     )?)
 }
 
-/// `(row_id, notice)` of up to `limit` undelivered notices of `holder`,
-/// oldest first; with `filter`, only those it matches. The filter runs in
-/// SQL on the stored payload, so only the rows selected are read. There is
-/// no SQL `LIMIT`: rows that do not decode must not use it up.
+/// A [`Page`] of up to `limit` undelivered live notices of `holder`, oldest
+/// first; with `filter`, only those it matches. The filter runs in SQL on
+/// the stored payload, so only the rows selected are read. There is no SQL
+/// `LIMIT`: rows that do not decode or are obsolete must not use it up.
 fn select_pending(
     tx: &Tx,
     holder: &HolderRef,
     filter: Option<&NoticeFilter>,
     limit: u32,
-) -> Result<Vec<(i64, Notice)>, StoreError> {
+) -> Result<Page, StoreError> {
     let holder = serde_json::to_string(holder)?;
     match filter {
         None => {
@@ -409,7 +453,7 @@ fn select_pending(
                 "SELECT row_id, payload FROM notices WHERE holder = ?1 AND delivered_at IS NULL \
                  ORDER BY row_id",
             )?;
-            decode_up_to(tx, stmt.query([holder])?, limit)
+            read_page(tx, stmt.query([holder])?, limit)
         }
         Some(f) => {
             // CASE keeps json_extract away from payloads that are not JSON.
@@ -428,7 +472,7 @@ fn select_pending(
                 serde_json::to_string(&f.requests)?,
                 f.kinds.as_ref().map(serde_json::to_string).transpose()?,
             ])?;
-            decode_up_to(tx, rows, limit)
+            read_page(tx, rows, limit)
         }
     }
 }

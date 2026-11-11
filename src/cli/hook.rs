@@ -22,10 +22,11 @@
 //!   the session holds a live lease or a queued request, has no open wait,
 //!   and `stop_hook_active` is false.
 //! - pre-tool-use (not inside a subagent, whose input has `agent_id`): the
-//!   session's pending notices that no hook has shown yet, as
-//!   `additionalContext` (at most [`MAX_CONTEXT`] characters; the rest are
-//!   counted and shown by a later hook), then marked shown. They stay
-//!   pending for `clerk wait`.
+//!   session's pending notices that no hook has shown yet and that still
+//!   ask something of the agent, as `additionalContext` (at most
+//!   [`MAX_CONTEXT`] characters; the rest are counted and shown by a later
+//!   hook), then marked shown. They stay pending for `clerk wait`. It asks
+//!   for a wait only when the session has something that needs one.
 //! - session-end: the session's leases and requests end now, when this
 //!   process is the session's host.
 
@@ -312,8 +313,7 @@ impl Hook {
         let unshown = brief["unshown"]
             .as_array()
             .context("the brief has no unshown notices")?;
-        let armed = brief["open_waits"].as_u64().unwrap_or(0) > 0;
-        let Some((context, ids)) = notice_context(unshown, armed) else {
+        let Some((context, ids)) = notice_context(unshown, Hearing::of(&brief)?) else {
             return Ok(None);
         };
         session
@@ -493,10 +493,36 @@ fn plural(n: u64, what: &str) -> String {
     }
 }
 
+/// How the session hears of its notices, which is what the context says
+/// about a wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hearing {
+    /// A clerk wait is armed.
+    Armed,
+    /// No wait is armed, and the session has something that needs one: a
+    /// queued request or an interruptible lease.
+    NeedsWait,
+    /// No wait is armed and none is needed (a plain holder): only the hooks.
+    Hooks,
+}
+
+impl Hearing {
+    /// How a session with this `brief` hears of its notices.
+    fn of(brief: &Value) -> anyhow::Result<Self> {
+        Ok(if count(brief, "open_waits")? > 0 {
+            Self::Armed
+        } else if count(brief, "requests")? + count(brief, "interruptible")? > 0 {
+            Self::NeedsWait
+        } else {
+            Self::Hooks
+        })
+    }
+}
+
 /// The `additionalContext` for `notices` and the ids it shows; `None`
 /// without notices. At most [`MAX_CONTEXT`] characters: notices that do
 /// not fit are counted, not shown (a later hook shows them).
-fn notice_context(notices: &[Value], armed: bool) -> Option<(String, Vec<String>)> {
+fn notice_context(notices: &[Value], hearing: Hearing) -> Option<(String, Vec<String>)> {
     // A notice without an id cannot be marked shown: it is left out.
     let notices: Vec<(&str, &Value)> = notices
         .iter()
@@ -505,13 +531,15 @@ fn notice_context(notices: &[Value], armed: bool) -> Option<(String, Vec<String>
     if notices.is_empty() {
         return None;
     }
-    let hearing = if armed {
-        "your armed clerk wait also reports them"
-    } else {
-        "no clerk wait is armed: arm a clerk wait (see the clerk skill) so notices reach you"
+    let about_waits = match hearing {
+        Hearing::Armed => "; your armed clerk wait also reports them",
+        Hearing::NeedsWait => {
+            "; no clerk wait is armed: arm a clerk wait (see the clerk skill) so notices reach you"
+        }
+        Hearing::Hooks => "",
     };
     let mut context = format!(
-        "Le Clerk: {} for this session. Act on them; {hearing}.\n",
+        "Le Clerk: {} for this session. Act on them{about_waits}.\n",
         plural(notices.len() as u64, "pending notice")
     );
     let mut ids = Vec::new();
@@ -530,9 +558,13 @@ fn notice_context(notices: &[Value], armed: bool) -> Option<(String, Vec<String>
     let rest = notices.len() - ids.len();
     if rest > 0 {
         // Writing to a String cannot fail.
+        let later = match hearing {
+            Hearing::Armed | Hearing::NeedsWait => "the clerk wait reports them",
+            Hearing::Hooks => "the next tool call shows them",
+        };
         let _ = writeln!(
             context,
-            "…and {} not shown here; the clerk wait reports them.",
+            "…and {} not shown here; {later}.",
             plural(rest as u64, "more notice")
         );
     }
@@ -575,12 +607,12 @@ mod tests {
 
     #[test]
     fn context_is_none_without_notices() {
-        assert!(notice_context(&[], true).is_none());
+        assert!(notice_context(&[], Hearing::Armed).is_none());
     }
 
     #[test]
     fn context_lists_each_notice_with_its_id_and_action() {
-        let (context, ids) = notice_context(&[notice("N1", "Claim it.")], true).unwrap();
+        let (context, ids) = notice_context(&[notice("N1", "Claim it.")], Hearing::Armed).unwrap();
         assert_eq!(ids, vec!["N1".to_owned()]);
         assert!(context.contains("[N1] offered (board/u1, lease L1): Claim it."));
         assert!(context.contains("clerk wait"));
@@ -588,7 +620,7 @@ mod tests {
 
     #[test]
     fn context_says_the_armed_wait_reports_them_when_one_is_armed() {
-        let (context, _) = notice_context(&[notice("N1", "Claim it.")], true).unwrap();
+        let (context, _) = notice_context(&[notice("N1", "Claim it.")], Hearing::Armed).unwrap();
         assert!(
             context.contains("your armed clerk wait also reports"),
             "{context}"
@@ -596,17 +628,37 @@ mod tests {
     }
 
     #[test]
-    fn context_tells_the_agent_to_arm_a_wait_when_none_is_armed() {
-        let (context, _) = notice_context(&[notice("N1", "Claim it.")], false).unwrap();
+    fn context_tells_the_agent_to_arm_a_wait_when_one_is_needed_and_none_is_armed() {
+        let (context, _) =
+            notice_context(&[notice("N1", "Claim it.")], Hearing::NeedsWait).unwrap();
         assert!(context.contains("arm a clerk wait"), "{context}");
         assert!(!context.contains("your armed"), "{context}");
+    }
+
+    #[test]
+    fn context_asks_for_no_wait_when_none_is_needed() {
+        let (context, _) = notice_context(&[notice("N1", "Extend it.")], Hearing::Hooks).unwrap();
+        assert!(context.contains("Act on them."), "{context}");
+        assert!(!context.contains("clerk wait"), "{context}");
+    }
+
+    #[test]
+    fn context_says_a_later_hook_shows_the_rest_when_no_wait_is_needed() {
+        let action = "x".repeat(900);
+        let notices: Vec<Value> = (0..50).map(|i| notice(&format!("N{i}"), &action)).collect();
+        let (context, _) = notice_context(&notices, Hearing::Hooks).unwrap();
+        assert!(
+            context.contains("the next tool call shows them"),
+            "{context}"
+        );
+        assert!(!context.contains("clerk wait"), "{context}");
     }
 
     #[test]
     fn context_stays_within_the_cap_and_counts_the_rest() {
         let action = "x".repeat(900);
         let notices: Vec<Value> = (0..50).map(|i| notice(&format!("N{i}"), &action)).collect();
-        let (context, ids) = notice_context(&notices, true).unwrap();
+        let (context, ids) = notice_context(&notices, Hearing::Armed).unwrap();
         assert!(context.chars().count() <= MAX_CONTEXT);
         assert!(ids.len() < 50 && !ids.is_empty());
         assert!(context.contains(&format!("{} more notices", 50 - ids.len())));
@@ -616,8 +668,9 @@ mod tests {
     fn context_leaves_out_notices_without_an_id() {
         let mut no_id = notice("N0", "Lost.");
         no_id.as_object_mut().unwrap().remove("id");
-        assert!(notice_context(std::slice::from_ref(&no_id), true).is_none());
-        let (context, ids) = notice_context(&[no_id, notice("N1", "Claim it.")], true).unwrap();
+        assert!(notice_context(std::slice::from_ref(&no_id), Hearing::Armed).is_none());
+        let (context, ids) =
+            notice_context(&[no_id, notice("N1", "Claim it.")], Hearing::Armed).unwrap();
         assert_eq!(ids, vec!["N1".to_owned()]);
         assert!(context.contains("1 pending notice "), "{context}");
         assert!(!context.contains("more notice"), "{context}");

@@ -115,7 +115,7 @@ Code's limit); `hooks.json` allows 3 s (1.5 s for SessionEnd).
 |-------|--------------|
 | `SessionStart` | Reports the Claude Code process now running the session (which leaves the process's previous session, e.g. on `/clear`). For `clear`, `compact` and `resume`, adds a brief to the context: what the session holds or waits for, whether a wait is armed, and what the previous conversation released. |
 | `Stop` | When the session has a queued request or an interruptible lease but no `clerk wait` is armed, blocks the end of the turn once with a reminder to start one. |
-| `PreToolUse` | Before a tool call, adds notices no hook has shown yet (offers, expiry warnings, yield requests, cleanup windows) to the agent's context. Skipped inside subagents. |
+| `PreToolUse` | Before a tool call, adds notices no hook has shown yet (offers, expiry warnings, yield requests, cleanup windows) to the agent's context, leaving out those out of date or needing no action. It asks for a `clerk wait` only when the session has a queued request or an interruptible lease. Skipped inside subagents. |
 | `SessionEnd` | Releases the session's leases and queued requests at once (`/clear`, quitting, `/resume` of another conversation), when this process runs the session. |
 
 ### Sessions and leases

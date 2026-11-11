@@ -7,7 +7,7 @@ use leclerk::config::Config;
 use leclerk::health::HealthResult;
 use leclerk::inventory::{Inventory, NewResource, NewUnit, Promotions};
 use leclerk::model::{
-    Caller, HealthSpec, HolderRef, LeaseId, NoticeId, Priority, ProjectKey, ResourceId,
+    Caller, EndCause, HealthSpec, HolderRef, LeaseId, NoticeId, Priority, ProjectKey, ResourceId,
     ResourceType, Scope, UnitId, UnitSettings,
 };
 use leclerk::scheduler::{
@@ -1098,6 +1098,191 @@ mod notice_delivery {
                 got.iter().any(|n| n.kind == NoticeKind::ExpiryWarning),
                 "{got:?}"
             );
+        }
+    }
+
+    /// `a`'s ended lease and, in row order, `obsolete` notices about it that
+    /// later state made out of date, then one notice that stands.
+    fn behind_obsolete(obsolete: u32) -> (Fixture, Notice) {
+        let mut f = fixture();
+        f.seed_user("board");
+        let a = caller("a");
+        let lease = f
+            .grant(&a, req("board", Priority::Normal, false, "mine"))
+            .lease_id;
+        f.release(&a, &lease);
+        f.confirm(&a, &lease, Confirm::Clean);
+        f.take(&holder("a"), 10);
+        for _ in 0..obsolete {
+            let mut stale = notice(&holder("a"), NoticeKind::CleanupEnding, T0);
+            stale.lease_id = Some(lease.clone());
+            f.publish(&stale);
+        }
+        let standing = notice(&holder("a"), NoticeKind::YieldWithdrawn, T0);
+        f.publish(&standing);
+        (f, standing)
+    }
+
+    mod on_a_full_page_of_obsolete_notices_ahead_of_a_live_one {
+        use super::*;
+
+        #[test]
+        fn take_returns_the_live_one() {
+            let (mut f, standing) = behind_obsolete(3);
+            assert_eq!(f.take(&holder("a"), 2), vec![standing]);
+        }
+
+        #[test]
+        fn returned_returns_the_live_one() {
+            let (mut f, standing) = behind_obsolete(3);
+            let h = holder("a");
+            let got = f.with_tx(|tx| notices::returned(tx, &h, None, 2, DELIVERED_AT).unwrap());
+            assert_eq!(got, vec![standing]);
+        }
+
+        #[test]
+        fn every_obsolete_one_ahead_of_it_is_audited_as_superseded() {
+            let (mut f, _) = behind_obsolete(3);
+            let before = f.audit_of("superseded").len();
+            f.take(&holder("a"), 2);
+            assert_eq!(f.audit_of("superseded").len(), before + 3);
+        }
+    }
+
+    mod pending {
+        use super::*;
+
+        mod on_an_obsolete_notice {
+            use super::*;
+
+            #[test]
+            fn is_still_listed_until_a_read_supersedes_it() {
+                let (mut f, _) = behind_obsolete(2);
+                let h = holder("a");
+                assert_eq!(f.with_tx(|tx| notices::pending(tx, &h).unwrap()).len(), 3);
+                f.take(&h, 10);
+                assert_eq!(f.with_tx(|tx| notices::pending(tx, &h).unwrap()).len(), 0);
+            }
+        }
+    }
+
+    mod unshown {
+        use super::*;
+
+        impl Fixture {
+            fn unshown(&mut self, who: &HolderRef) -> Vec<Notice> {
+                self.with_tx(|tx| notices::unshown(tx, who).unwrap())
+            }
+
+            fn kinds_unshown(&mut self, who: &HolderRef) -> Vec<NoticeKind> {
+                self.unshown(who).iter().map(|n| n.kind).collect()
+            }
+
+            /// `a`'s lease, granted and ended by the scheduler with `cause`.
+            fn ended_by(&mut self, cause: EndCause, confirmed: bool) {
+                self.seed_user("board");
+                let lease = self
+                    .grant(&caller("a"), req("board", Priority::Normal, false, "mine"))
+                    .lease_id;
+                self.store
+                    .tx(|tx| self.sched.end_lease(tx, &lease, cause, confirmed))
+                    .unwrap();
+            }
+        }
+
+        mod on_a_lease_released_and_confirmed {
+            use super::*;
+
+            fn released() -> Fixture {
+                let mut f = fixture();
+                f.seed_user("board");
+                let a = caller("a");
+                let lease = f
+                    .grant(&a, req("board", Priority::Normal, false, "mine"))
+                    .lease_id;
+                f.release(&a, &lease);
+                f.confirm(&a, &lease, Confirm::Clean);
+                f
+            }
+
+            #[test]
+            fn lists_neither_its_cleanup_window_nor_its_end() {
+                let mut f = released();
+                assert_eq!(f.kinds_unshown(&holder("a")), Vec::new());
+            }
+
+            #[test]
+            fn leaves_its_clean_end_pending_for_a_wait() {
+                let mut f = released();
+                f.unshown(&holder("a"));
+                let got = f.take(&holder("a"), 10);
+                assert_eq!(
+                    got.iter().map(|n| n.kind).collect::<Vec<_>>(),
+                    vec![NoticeKind::LeaseEnded]
+                );
+            }
+
+            #[test]
+            fn supersedes_nothing() {
+                let mut f = released();
+                f.unshown(&holder("a"));
+                assert_eq!(f.audit_of("superseded"), Vec::new());
+            }
+        }
+
+        mod on_an_expiry_warning_for_an_extended_lease {
+            use super::*;
+
+            #[test]
+            fn is_not_listed() {
+                let mut f = fixture();
+                f.seed_user("board");
+                let a = caller("a");
+                let lease = f
+                    .grant(&a, req("board", Priority::Normal, false, "mine"))
+                    .lease_id;
+                f.clock.set(T0 + 9 * MIN_MS);
+                f.tick();
+                assert_eq!(
+                    f.kinds_unshown(&holder("a")),
+                    vec![NoticeKind::ExpiryWarning]
+                );
+                f.extend(&a, &lease, T0 + 30 * MIN_MS);
+                assert_eq!(f.kinds_unshown(&holder("a")), Vec::new());
+            }
+        }
+
+        mod on_a_position_change {
+            use super::*;
+
+            #[test]
+            fn is_not_listed() {
+                let mut f = fixture();
+                f.publish(&notice(&holder("a"), NoticeKind::PositionChanged, T0));
+                assert_eq!(f.kinds_unshown(&holder("a")), Vec::new());
+            }
+        }
+
+        mod on_a_lease_ended_leaving_the_unit_dirty {
+            use super::*;
+
+            #[test]
+            fn is_listed() {
+                let mut f = fixture();
+                f.ended_by(EndCause::Expired, false);
+                assert_eq!(f.kinds_unshown(&holder("a")), vec![NoticeKind::LeaseEnded]);
+            }
+        }
+
+        mod on_a_lease_someone_else_ended_cleanly {
+            use super::*;
+
+            #[test]
+            fn is_listed() {
+                let mut f = fixture();
+                f.ended_by(EndCause::AdminForced, true);
+                assert_eq!(f.kinds_unshown(&holder("a")), vec![NoticeKind::LeaseEnded]);
+            }
         }
     }
 }
