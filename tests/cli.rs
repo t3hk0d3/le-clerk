@@ -7684,6 +7684,38 @@ mod cli {
                 }
             }
 
+            mod on_the_same_holder_asking_again_with_an_offer_pending {
+                use super::*;
+
+                /// `sess-1` queued, then offered the unit `x` gave back; its
+                /// first answer and the repeat's.
+                fn asked_again(env: &Env, dir: &Path) -> (Value, Value) {
+                    seed(env, "board", "k1");
+                    let held = hold(env, "x");
+                    let args = ["acquire", "board", "--for", "10m"];
+                    let first = queued_on(env, dir, &args);
+                    free(env, "x", &held);
+                    (first, queued_on(env, dir, &args))
+                }
+
+                #[test]
+                fn returns_the_request_it_was_offered_for() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    let (first, again) = asked_again(&env, &dir);
+                    assert_eq!(again["request_id"], first["request_id"], "{again}");
+                    assert_eq!(again["existing"], true, "{again}");
+                }
+
+                #[test]
+                fn makes_no_second_request() {
+                    let env = Env::new();
+                    let dir = env.dir("alpha");
+                    asked_again(&env, &dir);
+                    assert_eq!(queue_len(&env), 0);
+                }
+            }
+
             mod on_the_same_holder_asking_for_another_target {
                 use super::*;
 

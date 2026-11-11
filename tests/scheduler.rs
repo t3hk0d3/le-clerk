@@ -2125,6 +2125,191 @@ mod dispatch {
         }
     }
 
+    mod on_a_repeat_acquire {
+        use super::*;
+
+        impl Fixture {
+            fn try_repeat(&mut self, r: AcquireRequest, who: &str) -> AcquireOutcome {
+                let who = caller(who);
+                let sched = &self.sched;
+                self.store
+                    .tx(|tx| sched.acquire_unless_checking(tx, &who, r))
+                    .unwrap()
+            }
+        }
+
+        fn any() -> AcquireRequest {
+            req(on("board"), MIN, Priority::Normal, "a")
+        }
+
+        fn id_and_existing(out: &AcquireOutcome) -> (RequestId, bool) {
+            match out {
+                AcquireOutcome::Queued {
+                    request_id,
+                    existing,
+                    ..
+                } => (request_id.clone(), *existing),
+                other => panic!("expected queued, got {other:?}"),
+            }
+        }
+
+        mod while_a_check_of_its_target_runs {
+            use super::*;
+
+            /// `a` queued behind a failing check; the unit has recovered and
+            /// is being checked again.
+            fn rechecking() -> (Fixture, RequestId) {
+                let mut f = blocking();
+                f.probe.fail("u1");
+                let (first, _) = id_and_existing(&f.ask("a"));
+                let jobs = f.jobs();
+                f.finish(jobs);
+                f.probe.heal("u1");
+                f.clock.advance(HEALTH_RECHECK_BACKOFF);
+                (f, first)
+            }
+
+            #[test]
+            fn answers_the_existing_request() {
+                let (mut f, first) = rechecking();
+                let out = f.try_repeat(any(), "a");
+                assert_eq!(id_and_existing(&out), (first, true));
+            }
+
+            #[test]
+            fn says_a_check_is_running() {
+                let (mut f, _) = rechecking();
+                assert_eq!(blocked_by(&f.try_repeat(any(), "a")), checking());
+            }
+
+            #[test]
+            fn makes_no_second_request() {
+                let (mut f, _) = rechecking();
+                f.try_repeat(any(), "a");
+                assert_eq!(f.queued_requests().len(), 1);
+            }
+
+            #[test]
+            fn an_override_still_waits_for_the_check() {
+                let (mut f, _) = rechecking();
+                let mut r = any();
+                r.override_reason = Some("mine".into());
+                assert_eq!(f.try_repeat(r, "a"), AcquireOutcome::Checking);
+            }
+
+            #[test]
+            fn another_holder_is_still_told_to_ask_again() {
+                let (mut f, _) = rechecking();
+                assert_eq!(f.try_repeat(any(), "b"), AcquireOutcome::Checking);
+            }
+        }
+
+        mod with_an_offer_pending_on_the_only_unit {
+            use super::*;
+
+            /// `a` queued for `board`, then offered its only unit.
+            fn offered() -> (Fixture, LeaseId) {
+                let mut f = fixture();
+                f.seed("board", &["u1"]);
+                let held = f.grant(&caller("h"), req(on("board"), MIN, Priority::Normal, "h"));
+                f.queue(&caller("a"), any());
+                f.end(&held.lease_id);
+                f.dispatch();
+                let lease = f.offered_lease(&holder("a"));
+                (f, lease)
+            }
+
+            #[test]
+            fn makes_no_second_request() {
+                let (mut f, _) = offered();
+                f.acquire(&caller("a"), any()).unwrap();
+                assert_eq!(f.queued_requests().len(), 0);
+            }
+
+            #[test]
+            fn the_unit_is_not_offered_again_once_given_back() {
+                let (mut f, lease) = offered();
+                f.acquire(&caller("a"), any()).unwrap();
+                let who = caller("a");
+                let sched = &f.sched;
+                f.store.tx(|tx| sched.claim(tx, &who, &lease)).unwrap();
+                f.end(&lease);
+                f.dispatch();
+                assert_eq!(f.count(&holder("a"), NoticeKind::Offered), 1);
+            }
+        }
+
+        mod with_an_offer_pending {
+            use super::*;
+
+            /// `a` queued for `board`, then offered `u1`; `u2` is free.
+            fn offered() -> (Fixture, RequestId, LeaseId) {
+                let mut f = fixture();
+                f.seed("board", &["u1", "u2"]);
+                let one = f.grant(
+                    &caller("h1"),
+                    req(on_unit("board", "u1"), MIN, Priority::Normal, "h1"),
+                );
+                let two = f.grant(
+                    &caller("h2"),
+                    req(on_unit("board", "u2"), MIN, Priority::Normal, "h2"),
+                );
+                let (first, _) = f.queue(&caller("a"), any());
+                f.end(&one.lease_id);
+                f.dispatch();
+                let lease = f.offered_lease(&holder("a"));
+                f.end(&two.lease_id);
+                (f, first, lease)
+            }
+
+            #[test]
+            fn answers_the_request_it_was_offered_for() {
+                let (mut f, first, _) = offered();
+                let out = f.acquire(&caller("a"), any()).unwrap();
+                assert_eq!(id_and_existing(&out), (first, true));
+            }
+
+            #[test]
+            fn answers_the_same_when_deferring_on_checks() {
+                let (mut f, first, _) = offered();
+                let out = f.try_repeat(any(), "a");
+                assert_eq!(id_and_existing(&out), (first, true));
+            }
+
+            #[test]
+            fn grants_no_other_unit() {
+                let (mut f, _, lease) = offered();
+                f.acquire(&caller("a"), any()).unwrap();
+                let mine = f.with_tx(|tx| leclerk::store::leases::live_leases(tx).unwrap());
+                let ids: Vec<&LeaseId> = mine.iter().map(|l| &l.id).collect();
+                assert_eq!(ids, vec![&lease]);
+            }
+
+            #[test]
+            fn answers_a_repeat_for_the_offered_unit_too() {
+                let (mut f, first, _) = offered();
+                let r = req(on_unit("board", "u1"), MIN, Priority::Normal, "a");
+                let out = f.acquire(&caller("a"), r).unwrap();
+                assert_eq!(id_and_existing(&out), (first, true));
+            }
+
+            #[test]
+            fn leaves_a_request_for_another_unit_alone() {
+                let (mut f, _, _) = offered();
+                let r = req(on_unit("board", "u2"), MIN, Priority::Normal, "a");
+                let out = f.acquire(&caller("a"), r).unwrap();
+                assert!(matches!(out, AcquireOutcome::Granted(_)), "{out:?}");
+            }
+
+            #[test]
+            fn another_holder_gets_its_own_answer() {
+                let (mut f, _, _) = offered();
+                let out = f.acquire(&caller("b"), any()).unwrap();
+                assert!(matches!(out, AcquireOutcome::Granted(_)), "{out:?}");
+            }
+        }
+    }
+
     mod on_a_passing_check_offering_the_unit_to_another_request {
         use super::*;
 

@@ -1045,7 +1045,9 @@ impl Scheduler {
     /// that started earliest (see `interrupt`).
     ///
     /// The queue is settled first (a `dispatch`), so a newcomer never takes a
-    /// unit that an earlier waiter could have been offered.
+    /// unit that an earlier waiter could have been offered. A caller with an
+    /// unclaimed offer on the target gets that offer's request back, marked
+    /// `existing`, first in line.
     ///
     /// # Errors
     /// [`SchedulerError::NotFound`] for a target the caller cannot see;
@@ -1066,7 +1068,9 @@ impl Scheduler {
     /// [`Scheduler::acquire`], except that while no unit can be granted and
     /// a check of a free target unit is on its way it changes nothing and
     /// answers [`AcquireOutcome::Checking`]: asked again once the check is
-    /// back, it answers as if the check had run in place.
+    /// back, it answers as if the check had run in place. A caller already
+    /// queued for the target gets its request back at once, unless it is
+    /// overriding.
     ///
     /// # Errors
     /// As [`Scheduler::acquire`].
@@ -1112,6 +1116,19 @@ impl Scheduler {
             ),
             None => None,
         };
+        // Asked again with an offer out: the offer is the answer. Nothing
+        // new is queued or granted, or the agent would end up with a unit
+        // it never meant to ask for twice.
+        if let Some(request_id) = Self::own_offer(tx, who, resource.row, pinned.map(|u| u.row))? {
+            return Ok(AcquireOutcome::Queued {
+                request_id,
+                position: 1,
+                estimated_wait: None,
+                blocked_by: None,
+                displaced: None,
+                existing: true,
+            });
+        }
         if let Some(unit) = pinned {
             let members = group(tx, unit.row)?;
             if leases::live_leases_on(tx, &members)?
@@ -1163,7 +1180,11 @@ impl Scheduler {
             }
             return self.grant(tx, who, req, &resource, unit, &ask);
         }
-        if checking && defer_on_check {
+        // A repeat need not wait: its request stands whatever the check
+        // says. An override does, as it may displace a lease for nothing.
+        let repeat = req.override_reason.is_none()
+            && Self::own_queued_request(tx, who, resource.row, pinned.map(|u| u.row))?.is_some();
+        if checking && defer_on_check && !repeat {
             return Ok(AcquireOutcome::Checking);
         }
         self.queue_request(tx, who, req, &resource, pinned, &ask)
@@ -1246,6 +1267,26 @@ impl Scheduler {
                 r.holder == who.holder && r.resource_row == resource_row && r.unit_row == unit_row
             })
             .min_by_key(dispatch::queue_key))
+    }
+
+    /// The request behind `who`'s unclaimed offer on the same resource (and
+    /// the same unit, when `unit_row` names one). The request itself left
+    /// the queue when the offer was made.
+    fn own_offer(
+        tx: &Tx,
+        who: &Caller,
+        resource_row: i64,
+        unit_row: Option<i64>,
+    ) -> Result<Option<RequestId>, SchedulerError> {
+        Ok(leases::live_leases(tx)?
+            .into_iter()
+            .filter(|l| {
+                l.state == LeaseState::Offered
+                    && l.holder == who.holder
+                    && l.resource_row == resource_row
+                    && unit_row.is_none_or(|u| u == l.unit_row)
+            })
+            .find_map(|l| l.request_id))
     }
 
     /// Queue an acquire that found no free unit, then either override the
