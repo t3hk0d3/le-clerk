@@ -27,6 +27,7 @@ use clap::{Args, ValueEnum};
 use leclerk::client::wire::{NoticeKind, NoticeView};
 use leclerk::client::{ApiError, Client};
 use leclerk::clock::{Clock, SystemClock};
+use leclerk::config::Config;
 use leclerk::model::{Caller, HolderRef, LeaseId, NoticeId, RequestId, UnitSettings};
 use leclerk::store::notices::{self, NoticeFilter};
 use serde_json::{Value, json};
@@ -482,7 +483,16 @@ pub async fn run(ctx: &Ctx, args: RunArgs) -> anyhow::Result<()> {
     } else {
         note(|| granted_text(&lease));
     }
-    let code = supervise(&client, &caller, &lease, &args.command).await?;
+    // The grace after SIGTERM is the lease's cleanup window.
+    let grace = Config::load(&ctx.paths).unwrap_or_default().cleanup_window;
+    let code = supervise(
+        &client,
+        &caller,
+        &lease,
+        &args.command,
+        Duration::from_secs(grace),
+    )
+    .await?;
     if agent {
         ctx.out.child_exit(code)?;
     }
@@ -891,31 +901,62 @@ impl<'a> LeaseWatch<'a> {
     }
 }
 
-/// Run `command` while holding `lease`, then give the lease back: cleanup
-/// confirmed on exit 0, else ended at once with the unit dirty. SIGTERM
-/// goes on to the command, and SIGINT too unless the terminal already
-/// delivered it (Ctrl+C); an override, an expiry or an
-/// administrator's release sends it SIGTERM at the lease's deadline.
-/// Returns the command's exit code (128 + signal when killed).
-async fn supervise(
+/// The longest `clerk run` waits after SIGTERM before it sends SIGKILL.
+const KILL_GRACE_MAX: Duration = Duration::from_secs(30);
+
+/// What `supervise` knows of its command's lease while it runs.
+#[derive(Default)]
+struct Progress {
+    /// When the lease's end calls for SIGTERM.
+    stop_at: Option<Instant>,
+    /// When SIGKILL follows SIGTERM; set once SIGTERM was sent.
+    kill_at: Option<Instant>,
+    stopped: bool,
+    /// The last batch handled: the poll in flight acknowledges it first, but
+    /// the command may end before that poll gets to.
+    unacknowledged: Vec<NoticeId>,
+    /// Off once the daemon was stopped: polling on would only reconnect.
+    polling: bool,
+}
+
+impl Progress {
+    /// Print `batch` and take the earliest stop time it, or the lease's own
+    /// state (`over`), gives.
+    fn learn(&mut self, batch: &[NoticeView], over: Option<Instant>) {
+        for n in batch {
+            note(|| notice_text(n));
+            if let Some(at) = stop_time(n) {
+                self.stop_at = Some(self.stop_at.map_or(at, |s| s.min(at)));
+            }
+        }
+        if let Some(at) = over {
+            self.stop_at = Some(self.stop_at.map_or(at, |s| s.min(at)));
+        }
+        self.unacknowledged = batch.iter().map(|n| n.id.clone()).collect();
+    }
+}
+
+/// Start `command` for `lease_id`; `None` when it cannot run, after the
+/// lease was given back.
+async fn spawn_command(
     client: &Client,
     caller: &Caller,
     lease: &Value,
+    lease_id: &str,
     command: &[OsString],
-) -> anyhow::Result<u8> {
-    let lease_id = id(lease, "lease_id")?;
+) -> anyhow::Result<Option<tokio::process::Child>> {
     let (program, rest) = command
         .split_first()
         .ok_or_else(|| UsageError("clerk run needs a command after --".to_owned()))?;
-    let mut child = match tokio::process::Command::new(program)
+    match tokio::process::Command::new(program)
         .args(rest)
-        .env("CLERK_LEASE_ID", &lease_id)
+        .env("CLERK_LEASE_ID", lease_id)
         .env("CLERK_RESOURCE", text(&lease["resource"]))
         .env("CLERK_UNIT", text(&lease["unit"]))
         .envs(unit_env(&lease["settings"]))
         .spawn()
     {
-        Ok(child) => child,
+        Ok(child) => Ok(Some(child)),
         Err(e) => {
             note(|| {
                 format!(
@@ -923,55 +964,74 @@ async fn supervise(
                     program.to_string_lossy()
                 )
             });
-            finish(client, caller, &lease_id).await?;
-            return Ok(127);
+            finish(client, caller, lease_id).await?;
+            Ok(None)
         }
+    }
+}
+
+/// Send `sig` to the command `pid`, which `clerk run` has not reaped yet
+/// (`child.wait()` has not returned while its loop runs). It shares our
+/// process group, so only the command itself is signalled.
+fn send_signal(pid: Option<libc::pid_t>, sig: libc::c_int) {
+    if let Some(pid) = pid {
+        // SAFETY: kill(2) on our own child, which has not been reaped.
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
+/// Run `command` while holding `lease`, then give the lease back: cleanup
+/// confirmed on exit 0, else ended at once with the unit dirty. SIGTERM
+/// goes on to the command, and SIGINT too unless the terminal already
+/// delivered it (Ctrl+C); an override, an expiry or an
+/// administrator's release sends it SIGTERM at the lease's deadline, and
+/// SIGKILL `kill_grace` (at most 30 s) later if it is still running.
+/// Returns the command's exit code (128 + signal when killed).
+async fn supervise(
+    client: &Client,
+    caller: &Caller,
+    lease: &Value,
+    command: &[OsString],
+    kill_grace: Duration,
+) -> anyhow::Result<u8> {
+    let lease_id = id(lease, "lease_id")?;
+    let Some(mut child) = spawn_command(client, caller, lease, &lease_id, command).await? else {
+        return Ok(127);
     };
     let pid = child.id().and_then(|p| libc::pid_t::try_from(p).ok());
-    let send = |sig: libc::c_int| {
-        if let Some(pid) = pid {
-            // SAFETY: kill(2) on our own child, which has not been reaped:
-            // `child.wait()` has not returned while the loop runs.
-            unsafe {
-                libc::kill(pid, sig);
-            }
-        }
-    };
+    let kill_grace = kill_grace.min(KILL_GRACE_MAX);
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let watch = LeaseWatch::new(client, caller, &lease_id);
     let wait = |handled, stop_at| watch.next(handled, stop_at);
     let mut notices = Box::pin(wait(Vec::new(), None));
-    // The last batch handled: the poll in flight acknowledges it first, but
-    // the command may end before that poll gets to.
-    let mut unacknowledged = Vec::new();
-    let mut stop_at: Option<Instant> = None;
-    let mut stopped = false;
-    // Off once the daemon was stopped: polling on would only reconnect.
-    let mut polling = true;
+    let mut progress = Progress {
+        polling: true,
+        ..Progress::default()
+    };
     let status = loop {
+        let (stop_at, kill_at) = (progress.stop_at, progress.kill_at);
         let deadline = async move {
             match stop_at {
                 Some(at) => tokio::time::sleep_until(at).await,
                 None => std::future::pending().await,
             }
         };
+        let kill = async move {
+            match kill_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             status = child.wait() => break status?,
-            (batch, over) = &mut notices, if polling => {
+            (batch, over) = &mut notices, if progress.polling => {
                 match batch {
                     Ok(batch) => {
-                        for n in &batch {
-                            note(|| notice_text(n));
-                            if let Some(at) = stop_time(n) {
-                                stop_at = Some(stop_at.map_or(at, |s| s.min(at)));
-                            }
-                        }
-                        if let Some(at) = over {
-                            stop_at = Some(stop_at.map_or(at, |s| s.min(at)));
-                        }
-                        unacknowledged = batch.iter().map(|n| n.id.clone()).collect();
-                        notices = Box::pin(wait(unacknowledged.clone(), stop_at));
+                        progress.learn(&batch, over);
+                        notices = Box::pin(wait(progress.unacknowledged.clone(), progress.stop_at));
                     }
                     Err(e) if e.code == "daemon_stopping" => {
                         note(|| {
@@ -979,31 +1039,42 @@ async fn supervise(
                              notices about its lease."
                                 .to_owned()
                         });
-                        polling = false;
+                        progress.polling = false;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "cannot read notices; retrying");
                         tokio::time::sleep(POLL_RETRY).await;
-                        notices = Box::pin(wait(Vec::new(), stop_at));
+                        notices = Box::pin(wait(Vec::new(), progress.stop_at));
                     }
                 }
             }
-            () = deadline, if !stopped => {
+            () = deadline, if !progress.stopped => {
                 note(|| "The lease is over: stopping the command (SIGTERM).".to_owned());
-                send(libc::SIGTERM);
-                stopped = true;
+                send_signal(pid, libc::SIGTERM);
+                progress.stopped = true;
+                progress.kill_at = Some(Instant::now() + kill_grace);
+            }
+            () = kill, if progress.kill_at.is_some() => {
+                note(|| {
+                    format!(
+                        "The command is still running {}s after SIGTERM: killing it (SIGKILL).",
+                        kill_grace.as_secs()
+                    )
+                });
+                send_signal(pid, libc::SIGKILL);
+                progress.kill_at = None;
             }
             // A Ctrl+C on the terminal already reached the command, which
             // shares our foreground process group; pass on only the rest.
             _ = interrupt.recv() => if !terminal_delivers_sigint() {
                 note(|| "Passing SIGINT on to the command.".to_owned());
-                send(libc::SIGINT);
+                send_signal(pid, libc::SIGINT);
             },
-            _ = terminate.recv() => send(libc::SIGTERM),
+            _ = terminate.recv() => send_signal(pid, libc::SIGTERM),
         }
     };
     let code = exit_code(status);
-    acknowledge(client, caller, &unacknowledged).await;
+    acknowledge(client, caller, &progress.unacknowledged).await;
     give_back(client, caller, &lease_id, code).await;
     Ok(code)
 }

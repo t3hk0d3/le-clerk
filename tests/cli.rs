@@ -3585,6 +3585,70 @@ mod cli {
             }
         }
 
+        /// A command that says "started", then ignores SIGTERM.
+        const STUBBORN: &str = "trap '' TERM; echo started; exec sleep 60";
+
+        /// `run` of `command` under a 2 s cleanup window, the lease then
+        /// released by an administrator; its stderr once it ended.
+        fn run_ended_by_admin(command: &str) -> (i32, String, Duration) {
+            let env = Env::new();
+            let config = env.paths().config;
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            fs::write(&config, "cleanup_window = 2\n").unwrap();
+            seed(&env, "board", "k1");
+            let mut child = spawn(
+                &env,
+                &["run", "board", "--for", "10m", "--", "sh", "-c", command],
+                None,
+            );
+            let out = lines(&mut child);
+            assert_eq!(out.recv_timeout(PATIENCE).unwrap(), "started");
+            let lease = unit_status(&env)["occupancy"]["lease_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let released = Instant::now();
+            env.rpc(
+                "admin_release",
+                &user("admin"),
+                json!({ "lease_id": lease }),
+            )
+            .unwrap();
+            let code = code_of(&mut child);
+            let took = released.elapsed();
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+            (code, stderr, took)
+        }
+
+        mod on_the_lease_ending_while_cmd_ignores_sigterm {
+            use super::*;
+
+            #[test]
+            fn sigkills_after_the_cleanup_window() {
+                let (code, _, took) = run_ended_by_admin(STUBBORN);
+                assert_eq!(code, 128 + libc::SIGKILL, "killed, not left running");
+                assert!(took >= Duration::from_millis(1500), "{took:?}");
+            }
+
+            #[test]
+            fn says_so_on_stderr() {
+                let (_, stderr, _) = run_ended_by_admin(STUBBORN);
+                assert!(stderr.contains("SIGKILL"), "{stderr}");
+            }
+        }
+
+        mod on_cmd_exiting_after_sigterm {
+            use super::*;
+
+            #[test]
+            fn sends_no_sigkill() {
+                let (code, stderr, _) = run_ended_by_admin(PATIENT);
+                assert_eq!(code, 7);
+                assert!(!stderr.contains("SIGKILL"), "{stderr}");
+            }
+        }
+
         mod on_sigint {
             use super::*;
 
