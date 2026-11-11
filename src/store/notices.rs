@@ -298,7 +298,7 @@ fn live(tx: &Tx, rows: Vec<(i64, Notice)>, now_ms: i64) -> Result<Vec<(i64, Noti
     Ok(keep)
 }
 
-/// Acknowledged delivery (MCP `lease_wait`): up to `limit` undelivered
+/// Acknowledged delivery (`clerk wait`): up to `limit` undelivered
 /// notices of `holder`, oldest first, returned **without** marking them
 /// delivered. Each is marked returned (`returned_at = now_ms`, kept from
 /// its first return), and stays pending until [`ack`] names it, so a result

@@ -53,18 +53,22 @@ const LONG_POLL_SLACK: Duration = Duration::from_secs(5);
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Most daemons one `ensure_running` call starts.
 const MAX_SPAWNS: u32 = 2;
-/// First and longest pause between connection attempts.
+/// The first, and shortest, pause between connection attempts; each pause is
+/// twice the one before, up to [`BACKOFF_MAX`].
 const BACKOFF_MIN: Duration = Duration::from_millis(10);
+/// The longest pause between connection attempts.
+const BACKOFF_MAX: Duration = Duration::from_millis(200);
 /// How long a waiting client keeps trying to reach the daemon again after
 /// it went away (see [`Client::reconnect`]).
 pub const RECONNECT_FOR: Duration = Duration::from_secs(30);
 /// How long a reconnecting client waits for the daemon to come back by
 /// itself before it starts one.
 pub const RECONNECT_START_AFTER: Duration = Duration::from_secs(3);
-const BACKOFF_MAX: Duration = Duration::from_millis(200);
-/// First and longest pause before asking again after `engine_unavailable`:
-/// the version route still answers then, so `reconnect` returns at once.
+/// The first, and shortest, pause before asking again after
+/// `engine_unavailable`: the version route still answers then, so
+/// `reconnect` returns at once. Doubles up to [`ENGINE_RETRY_MAX`].
 const ENGINE_RETRY_MIN: Duration = Duration::from_millis(100);
+/// The longest pause before asking again after `engine_unavailable`.
 const ENGINE_RETRY_MAX: Duration = Duration::from_secs(2);
 
 /// Why no usable daemon could be reached.

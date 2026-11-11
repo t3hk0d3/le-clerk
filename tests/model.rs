@@ -120,6 +120,12 @@ mod config {
         }
 
         #[test]
+        fn keep_ended_leases_and_audit_90_days_and_notices_7() {
+            let cfg = Config::default();
+            assert_eq!((cfg.retention_days, cfg.notice_retention_days), (90, 7));
+        }
+
+        #[test]
         fn have_the_documented_values() {
             let cfg = Config::default();
             assert_eq!(
@@ -193,6 +199,8 @@ mod config {
                 "claim_window",
                 "yield_window",
                 "health_timeout",
+                "retention_days",
+                "notice_retention_days",
             ] {
                 assert_eq!(invalid_key(&format!("{key} = 0\n")), key);
             }

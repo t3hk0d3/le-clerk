@@ -41,6 +41,7 @@ use crate::scheduler::checks::{CheckPool, CheckTicket};
 use crate::scheduler::session::{Hosting, Sessions};
 use crate::scheduler::{HealthProbe, Scheduler, SchedulerError, liveness};
 use crate::store::notices::{self, Notice, NoticeFilter};
+use crate::store::retention::{self, Retention, Swept};
 use crate::store::{Store, StoreError};
 
 pub use command::*;
@@ -53,6 +54,8 @@ pub const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 pub const NOTICE_BATCH: u32 = 100;
 /// How much longer than `health_timeout` an acquire waits for a check.
 const CHECK_WAIT_SLACK: Duration = Duration::from_secs(2);
+/// Gap between retention sweeps.
+const RETENTION_INTERVAL: Duration = Duration::from_hours(24);
 /// How long the engine waits before retrying after a failed tick.
 const TICK_RETRY: Duration = Duration::from_secs(1);
 
@@ -815,8 +818,8 @@ impl EngineHandle {
 
     /// Up to [`NOTICE_BATCH`] pending notices of `holder`, oldest first,
     /// returned **without** delivering them: they stay pending until
-    /// [`EngineHandle::ack_notices`] names them (acknowledged delivery, for
-    /// MCP). With `filter`, only the notices it matches.
+    /// [`EngineHandle::ack_notices`] names them (acknowledged delivery, as
+    /// `clerk wait` uses it). With `filter`, only the notices it matches.
     ///
     /// # Errors
     /// A storage failure, or `engine_unavailable`.
@@ -851,8 +854,8 @@ impl EngineHandle {
         self.ask(|reply| Job::PendingNotices(holder, reply)).await
     }
 
-    /// Count an open wait of `holder` (a blocking `lease_wait`, or an open
-    /// MCP task) until the returned guard is dropped.
+    /// Count an open wait of `holder` (a `clerk wait` long-poll) until the
+    /// returned guard is dropped.
     #[must_use]
     pub fn open_wait(&self, holder: &HolderRef) -> OpenWait {
         let key = holder_key(holder);
@@ -1042,6 +1045,10 @@ pub struct Engine {
     notices_seen: i64,
     /// The next scheduler deadline, unix ms.
     next_deadline: Option<i64>,
+    /// What the retention sweep keeps.
+    retention: Retention,
+    /// When the retention sweep runs next, unix ms.
+    next_retention: i64,
     stopping: bool,
 }
 
@@ -1087,6 +1094,10 @@ impl Engine {
         let waiters = Arc::new(Waiters::default());
         let handle_config = Arc::new(config.clone());
         let handle_clock = clock.clone();
+        let retention = Retention {
+            lease_days: config.retention_days,
+            notice_days: config.notice_retention_days,
+        };
         let sessions = Sessions::new(Duration::from_secs(config.reconnect_grace));
         let engine = Self {
             store,
@@ -1100,6 +1111,8 @@ impl Engine {
             options,
             notices_seen: 0,
             next_deadline: None,
+            retention,
+            next_retention: i64::MIN,
             stopping: false,
         };
         let signal_waiters = waiters.clone();
@@ -1128,8 +1141,10 @@ impl Engine {
             tracing::error!(error = %e, "cannot read the notice log; waking from the start");
             0
         });
+        self.restart_grace();
         self.boot_sessions();
         self.maintain();
+        self.sweep_retention();
         self.start_checks();
         self.wake_waiters();
         let mut next_probe = Instant::now() + self.options.liveness_interval;
@@ -1148,6 +1163,9 @@ impl Engine {
             }
             if self.sessions_due() {
                 self.expire_sessions();
+            }
+            if self.clock.now_ms() >= self.next_retention {
+                self.sweep_retention();
             }
             self.start_checks();
             self.wake_waiters();
@@ -1174,17 +1192,55 @@ impl Engine {
     fn sleep_for(&self, next_probe: Instant) -> Duration {
         let probe = next_probe.saturating_duration_since(Instant::now());
         let now = self.clock.now_ms();
-        [self.next_deadline, self.sessions.next_expiry()]
-            .into_iter()
-            .flatten()
-            .map(|at| Duration::from_millis(u64::try_from(at.saturating_sub(now)).unwrap_or(0)))
-            .fold(probe, Duration::min)
+        [
+            self.next_deadline,
+            self.sessions.next_expiry(),
+            Some(self.next_retention),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|at| Duration::from_millis(u64::try_from(at.saturating_sub(now)).unwrap_or(0)))
+        .fold(probe, Duration::min)
     }
 
     fn sessions_due(&self) -> bool {
         self.sessions
             .next_expiry()
             .is_some_and(|at| at <= self.clock.now_ms())
+    }
+
+    /// Daemon start: leases that were running when the previous daemon went
+    /// down get their restart grace.
+    fn restart_grace(&mut self) {
+        let result = self.guarded("restart grace", |engine| {
+            let sched = &engine.scheduler;
+            Ok(engine.store.tx(|tx| sched.restart_grace(tx))?)
+        });
+        match result {
+            Ok(0) => {}
+            Ok(graced) => tracing::info!(leases = graced, "restart grace applied"),
+            Err(e) => tracing::error!(error = %e, "cannot apply the restart grace"),
+        }
+    }
+
+    /// Delete what is past retention, then schedule the next sweep a day on
+    /// (a failed sweep too: it is housekeeping, not worth a retry loop).
+    fn sweep_retention(&mut self) {
+        let now = self.clock.now_ms();
+        let keep = self.retention;
+        let result = self.guarded("retention sweep", |engine| {
+            engine
+                .store
+                .tx(|tx| retention::sweep(tx, now, &keep))
+                .map_err(ApiError::from)
+        });
+        match result {
+            Ok(swept) if swept == Swept::default() => {}
+            Ok(swept) => tracing::info!(?swept, "retention sweep"),
+            Err(e) => tracing::error!(error = %e, "retention sweep failed"),
+        }
+        let gap = i64::try_from(RETENTION_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+        self.next_retention = now.saturating_add(gap);
     }
 
     /// Daemon start: every agent session with leases or requests gets the

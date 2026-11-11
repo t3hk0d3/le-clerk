@@ -34,8 +34,7 @@ with `--json`, every command prints JSON instead and none of this applies.
 - **Glyphs**: `▮` free unit, `▯` busy unit, `⚠` unhealthy or dirty. When the
   locale isn't UTF-8, or with `--ascii`: `#`, `.` and `!`.
 - **Layout**: no tables. Every view is a list of blocks: a header line with
-  the IDs and short facts, then indented lines for free text and details
-  (user decision).
+  the IDs and short facts, then indented lines for free text and details.
   - Each top-level block (resource, lease, request, promotion, log entry)
     starts with `•`; nested items (units, queue entries) start with `◦`.
     ASCII fallback: `*` and `-`.

@@ -12,7 +12,7 @@ use serde_json::Value;
 const PLUGIN_DIR: &str = "integrations/claude-code";
 /// The marketplace entry's `source`.
 const PLUGIN_SOURCE: &str = "./integrations/claude-code";
-/// The one skill (user decision: one skill keeps agents' context small).
+/// The one skill (one skill keeps agents' context small).
 const SKILL: &str = "clerk";
 /// The skill's files: the entry point and the references it links.
 const SKILL_FILES: [&str; 3] = ["SKILL.md", "leasing.md", "registering.md"];

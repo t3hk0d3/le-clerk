@@ -1,7 +1,7 @@
 //! `clerk hook session-start|stop|pre-tool-use|session-end`: the real
 //! binary is run with Claude Code's documented hook input on stdin and
 //! `CLAUDE_PID` in its environment, against no daemon, a wedged or slow
-//! fake daemon. (Tests against the real daemon return with Part 2's hooks.)
+//! fake daemon.
 
 mod common;
 

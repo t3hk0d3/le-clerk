@@ -1,5 +1,5 @@
 #!/bin/sh
-# Task 7 live checks: run claude in isolation from the user's own clerk and
+# Live checks: run claude in isolation from the user's own clerk and
 # Claude Code setup. Every inherited CLAUDE*/MCP_*/AGENT_* variable is removed
 # (the checks may run from inside another Claude Code session), the release
 # build of clerk goes first on PATH, the clerk state lives in a temp

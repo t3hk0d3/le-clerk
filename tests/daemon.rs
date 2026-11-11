@@ -819,7 +819,7 @@ mod daemon {
             }
         }
 
-        /// The restart grace (spec §7.2): a cleaning lease whose window
+        /// The restart grace: a cleaning lease whose window
         /// passed while the daemon was down.
         mod on_cleaning_lease_past_its_deadline_during_downtime {
             use super::*;
@@ -1690,7 +1690,7 @@ mod daemon {
 }
 
 // ---------------------------------------------------------------------------
-// Restart grace (spec §7.2), against a ManualClock
+// Restart grace, against a ManualClock
 // ---------------------------------------------------------------------------
 
 mod restart_grace {

@@ -291,6 +291,16 @@ pub struct Finding {
     pub fixed: bool,
 }
 
+/// What one doctor run carries from check to check.
+struct DoctorRun<'a> {
+    /// Who runs it, for the audit entries.
+    who: &'a Caller,
+    /// Repair what can be repaired.
+    fix: bool,
+    /// What it has found so far.
+    findings: Vec<Finding>,
+}
+
 /// The doctor's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
@@ -860,51 +870,81 @@ impl<'a> Admin<'a> {
     /// # Errors
     /// [`AdminError::Store`] or [`AdminError::Scheduler`] on failure.
     pub fn doctor(&self, tx: &Tx, who: &Caller, fix: bool) -> Result<DoctorReport, AdminError> {
-        let mut findings = Vec::new();
-        let mut found = |tx: &Tx, kind, subject: String, fixed: bool| -> Result<(), AdminError> {
-            if fixed {
-                self.audit(
-                    tx,
-                    who,
-                    "doctor_fix",
-                    &json!({ "kind": kind, "subject": subject }),
-                )?;
-            }
-            findings.push(Finding {
-                kind,
-                subject,
-                fixed,
-            });
-            Ok(())
+        let mut run = DoctorRun {
+            who,
+            fix,
+            findings: Vec::new(),
         };
+        self.doctor_orphans(tx, &mut run)?;
+        self.doctor_dead_holders(tx, &mut run)?;
+        self.doctor_texts_and_devices(tx, &mut run)?;
+        self.audit(
+            tx,
+            who,
+            "doctor",
+            &json!({ "fix": fix, "findings": run.findings.len() }),
+        )?;
+        Ok(DoctorReport {
+            findings: run.findings,
+        })
+    }
+
+    /// Record a finding of `run`; a repair is audited.
+    fn doctor_found(
+        &self,
+        tx: &Tx,
+        run: &mut DoctorRun<'_>,
+        kind: FindingKind,
+        subject: String,
+        fixed: bool,
+    ) -> Result<(), AdminError> {
+        if fixed {
+            self.audit(
+                tx,
+                run.who,
+                "doctor_fix",
+                &json!({ "kind": kind, "subject": subject }),
+            )?;
+        }
+        run.findings.push(Finding {
+            kind,
+            subject,
+            fixed,
+        });
+        Ok(())
+    }
+
+    /// Dangling links, leases on missing units, and requests for missing
+    /// resources, in the order their repairs need.
+    fn doctor_orphans(&self, tx: &Tx, run: &mut DoctorRun<'_>) -> Result<(), AdminError> {
+        let fix = run.fix;
         for (a, b) in inventory_sql::dangling_links(tx)? {
             if fix {
                 inventory_sql::delete_link(tx, a, b)?;
             }
-            found(tx, FindingKind::LinkToMissingUnit, format!("{a}-{b}"), fix)?;
+            let kind = FindingKind::LinkToMissingUnit;
+            self.doctor_found(tx, run, kind, format!("{a}-{b}"), fix)?;
         }
         for lease in leases::orphan_leases(tx)? {
             if fix {
                 self.scheduler.end_orphan_lease(tx, &lease)?;
             }
-            found(
-                tx,
-                FindingKind::LeaseOnMissingUnit,
-                lease.id.to_string(),
-                fix,
-            )?;
+            let kind = FindingKind::LeaseOnMissingUnit;
+            self.doctor_found(tx, run, kind, lease.id.to_string(), fix)?;
         }
         for request in leases::orphan_requests(tx)? {
             if fix {
                 self.scheduler.drop_orphan_request(tx, &request)?;
             }
-            found(
-                tx,
-                FindingKind::RequestForMissingResource,
-                request.id.to_string(),
-                fix,
-            )?;
+            let kind = FindingKind::RequestForMissingResource;
+            self.doctor_found(tx, run, kind, request.id.to_string(), fix)?;
         }
+        Ok(())
+    }
+
+    /// Holders of live leases and queued requests whose process is gone.
+    fn doctor_dead_holders(&self, tx: &Tx, run: &mut DoctorRun<'_>) -> Result<(), AdminError> {
+        let fix = run.fix;
         let mut seen: HashSet<HolderRef> = HashSet::new();
         let holders = leases::live_leases(tx)?
             .into_iter()
@@ -918,14 +958,20 @@ impl<'a> Admin<'a> {
                 self.scheduler.holder_gone(tx, &holder)?;
             }
             let subject = serde_json::to_string(&holder).map_err(StoreError::from)?;
-            found(tx, FindingKind::DeadHolder, subject, fix)?;
+            self.doctor_found(tx, run, FindingKind::DeadHolder, subject, fix)?;
         }
+        Ok(())
+    }
+
+    /// Stored text that breaks the text rules, and device units whose path
+    /// is gone. Only reported, never fixed.
+    fn doctor_texts_and_devices(&self, tx: &Tx, run: &mut DoctorRun<'_>) -> Result<(), AdminError> {
         for resource in inventory_sql::list_resources(tx, ScopeFilter::All)? {
             if Description::parse(&resource.description).is_err()
                 || UsageTemplate::parse(&resource.usage, resource.ty).is_err()
             {
                 let subject = label(&resource.id, &resource.scope);
-                found(tx, FindingKind::InvalidResourceText, subject, false)?;
+                self.doctor_found(tx, run, FindingKind::InvalidResourceText, subject, false)?;
             }
             for unit in &resource.units {
                 if Description::parse(&unit.description).is_err() {
@@ -935,23 +981,17 @@ impl<'a> Admin<'a> {
                         unit.id,
                         ScopeSpec::from(&resource.scope)
                     );
-                    found(tx, FindingKind::InvalidUnitText, subject, false)?;
+                    self.doctor_found(tx, run, FindingKind::InvalidUnitText, subject, false)?;
                 }
                 if let UnitSettings::Device { path } = &unit.settings
                     && !health::path_exists(path)
                 {
                     let subject = format!("{}/{}", resource.id, unit.id);
-                    found(tx, FindingKind::MissingDevicePath, subject, false)?;
+                    self.doctor_found(tx, run, FindingKind::MissingDevicePath, subject, false)?;
                 }
             }
         }
-        self.audit(
-            tx,
-            who,
-            "doctor",
-            &json!({ "fix": fix, "findings": findings.len() }),
-        )?;
-        Ok(DoctorReport { findings })
+        Ok(())
     }
 
     /// Every resource with its units, and every link, in the export format

@@ -2435,6 +2435,31 @@ mod cli {
             .unwrap();
     }
 
+    /// Poll until a request is queued for board, so that whatever happens
+    /// next happens to a request that is waiting.
+    fn wait_until_queued(env: &Env) {
+        let deadline = Instant::now() + PATIENCE;
+        while env.ok(&["queue", "board"])[0]["queue"] == json!([]) {
+            assert!(Instant::now() < deadline, "never queued");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Run `check` every 100 ms for `window`: it must hold throughout. The
+    /// daemon probes CLI processes every 2 s, so a 3 s window covers a probe
+    /// of a holder that is gone, which a single look after a pause could
+    /// miss.
+    fn holds_throughout(window: Duration, mut check: impl FnMut()) {
+        let until = Instant::now() + window;
+        loop {
+            check();
+            if Instant::now() >= until {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Board's first unit in the status view.
     fn unit_status(env: &Env) -> Value {
         env.ok(&["status"])["resources"][0]["units"][0].clone()
@@ -2773,18 +2798,19 @@ mod cli {
                     assert!(out.status.success(), "{out:?}");
                     let body: Value = serde_json::from_slice(&out.stdout).unwrap();
                     let lease = lease_of(&body);
-                    // Past the daemon's liveness probes of CLI processes.
-                    std::thread::sleep(Duration::from_secs(3));
-                    let leases = env.ok(&["leases"]);
-                    let listed = leases
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|l| l["occupancy"].clone())
-                        .find(|o| o["lease_id"] == lease.as_str())
-                        .unwrap_or_else(|| panic!("{lease} not listed: {leases}"));
-                    assert_eq!(listed["holder"]["kind"], "user", "{listed}");
-                    assert_eq!(unit_status(&env)["dirty"], Value::Null);
+                    // Across the daemon's liveness probes of CLI processes.
+                    holds_throughout(Duration::from_secs(3), || {
+                        let leases = env.ok(&["leases"]);
+                        let listed = leases
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|l| l["occupancy"].clone())
+                            .find(|o| o["lease_id"] == lease.as_str())
+                            .unwrap_or_else(|| panic!("{lease} not listed: {leases}"));
+                        assert_eq!(listed["holder"]["kind"], "user", "{listed}");
+                        assert_eq!(unit_status(&env)["dirty"], Value::Null);
+                    });
                 }
             }
 
@@ -2798,16 +2824,17 @@ mod cli {
                     let theirs = hold(&env, "x");
                     let mut child =
                         spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
-                    std::thread::sleep(Duration::from_millis(500));
+                    wait_until_queued(&env);
                     free(&env, "x", &theirs);
                     assert_eq!(code_of(&mut child), 0);
                     let body: Value = serde_json::from_str(&stdout_of(&mut child)).unwrap();
                     let lease = lease_of(&body);
-                    std::thread::sleep(Duration::from_secs(3));
-                    let occupancy = unit_status(&env)["occupancy"].clone();
-                    assert_eq!(occupancy["lease_id"], lease.as_str(), "{occupancy}");
-                    assert_eq!(occupancy["state"], "held", "{occupancy}");
-                    assert_eq!(unit_status(&env)["dirty"], Value::Null);
+                    holds_throughout(Duration::from_secs(3), || {
+                        let occupancy = unit_status(&env)["occupancy"].clone();
+                        assert_eq!(occupancy["lease_id"], lease.as_str(), "{occupancy}");
+                        assert_eq!(occupancy["state"], "held", "{occupancy}");
+                        assert_eq!(unit_status(&env)["dirty"], Value::Null);
+                    });
                 }
             }
 
@@ -2851,7 +2878,7 @@ mod cli {
                     let theirs = hold(&env, "x");
                     let mut child =
                         spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
-                    std::thread::sleep(Duration::from_millis(500));
+                    wait_until_queued(&env);
                     free(&env, "x", &theirs);
                     assert_eq!(code_of(&mut child), 0);
                     let occupancy = unit_status(&env)["occupancy"].clone();
@@ -2913,7 +2940,7 @@ mod cli {
                 let theirs = hold(&env, "x");
                 let mut child = spawn(&env, &["acquire", "board", "--for", "10m", "--wait"], None);
                 let _open_stdin = child.stdin.take();
-                std::thread::sleep(Duration::from_millis(500));
+                wait_until_queued(&env);
                 assert!(child.try_wait().unwrap().is_none(), "returned while queued");
                 free(&env, "x", &theirs);
                 assert_eq!(code_of(&mut child), 0);
@@ -3466,7 +3493,7 @@ mod cli {
                     &["run", "board", "--for", "10m", "--", "echo", "ran"],
                     None,
                 );
-                std::thread::sleep(Duration::from_millis(500));
+                wait_until_queued(&env);
                 assert!(child.try_wait().unwrap().is_none(), "ran while queued");
                 free(&env, "x", &theirs);
                 assert_eq!(code_of(&mut child), 0);
@@ -5366,7 +5393,7 @@ mod cli {
         }
     }
 
-    /// Task 11: one voice across the commands: empty states, per-command
+    /// One voice across the commands: empty states, per-command
     /// next steps, plain words, and the same message in both modes.
     mod output_consistency {
         use super::*;
@@ -7461,7 +7488,7 @@ mod cli {
         }
     }
 
-    /// Lease commands as an agent uses them (Task 10).
+    /// Lease commands as an agent uses them.
     mod agent_lease_commands {
         use super::*;
 

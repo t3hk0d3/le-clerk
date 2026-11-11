@@ -300,7 +300,8 @@ pub fn any_live_on(tx: &Tx, units: &[i64]) -> Result<bool, StoreError> {
 /// Leases that are not ended on any of `units`, oldest first.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure. A row that does not decode is logged and
+/// skipped.
 pub fn live_leases_on(tx: &Tx, units: &[i64]) -> Result<Vec<LeaseRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {LEASE_COLUMNS} FROM leases WHERE unit_row = ?1 AND state != 'ended' \
@@ -317,7 +318,8 @@ pub fn live_leases_on(tx: &Tx, units: &[i64]) -> Result<Vec<LeaseRow>, StoreErro
 /// Offers whose claim deadline is before `before`, oldest deadline first.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure. A row that does not decode is logged and
+/// skipped.
 pub fn lapsed_offers(tx: &Tx, before: i64) -> Result<Vec<LeaseRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {LEASE_COLUMNS} FROM leases WHERE state = 'offered' AND claim_deadline < ?1 \
@@ -329,7 +331,8 @@ pub fn lapsed_offers(tx: &Tx, before: i64) -> Result<Vec<LeaseRow>, StoreError> 
 /// Leases that have a running timer: offered, held or cleaning.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure. A row that does not decode is logged and
+/// skipped.
 pub fn timed_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {LEASE_COLUMNS} FROM leases \
@@ -481,7 +484,8 @@ pub fn live_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
 /// Leases in state paused, by row.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure. A row that does not decode is logged and
+/// skipped.
 pub fn paused_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {LEASE_COLUMNS} FROM leases WHERE state = 'paused' ORDER BY row_id"
@@ -805,7 +809,8 @@ pub fn find_request(tx: &Tx, id: &RequestId) -> Result<Option<RequestRow>, Store
 /// order.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure. A row that does not decode is logged and
+/// skipped.
 pub fn queued_requests(tx: &Tx) -> Result<Vec<RequestRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {REQUEST_COLUMNS} FROM requests WHERE state = 'queued' ORDER BY row_id"
@@ -869,7 +874,8 @@ pub fn set_request_holder(tx: &Tx, row: i64, holder: &HolderRef) -> Result<(), S
 /// a damaged database: foreign keys normally cascade), by row.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure. A row that does not decode is logged and
+/// skipped.
 pub fn orphan_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {LEASE_COLUMNS} FROM leases WHERE state != 'ended' \
@@ -883,7 +889,8 @@ pub fn orphan_leases(tx: &Tx) -> Result<Vec<LeaseRow>, StoreError> {
 /// Queued requests whose resource, or pinned unit, does not exist, by row.
 ///
 /// # Errors
-/// [`StoreError`] on SQL failure or a damaged row.
+/// [`StoreError`] on SQL failure. A row that does not decode is logged and
+/// skipped.
 pub fn orphan_requests(tx: &Tx) -> Result<Vec<RequestRow>, StoreError> {
     let mut stmt = tx.conn().prepare(&format!(
         "SELECT {REQUEST_COLUMNS} FROM requests WHERE state = 'queued' \

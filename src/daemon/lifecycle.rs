@@ -37,7 +37,6 @@ use crate::daemon::server::{self, ServerInfo};
 use crate::engine::{Command, DaemonStopArgs, Engine, EngineHandle};
 use crate::health::HealthChecker;
 use crate::model::{Caller, HolderRef};
-use crate::scheduler::{Scheduler, SchedulerError};
 use crate::store::{Store, StoreError};
 
 /// Test hook: when set, the daemon reports this version instead of its own
@@ -77,9 +76,6 @@ pub enum RunError {
     /// The database could not be opened.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// The restart grace could not be applied.
-    #[error("cannot apply the restart grace: {0}")]
-    Grace(#[from] SchedulerError),
     /// The engine thread or the async runtime could not start.
     #[error("cannot start: {0}")]
     Start(io::Error),
@@ -164,22 +160,17 @@ fn start_and_serve(
         .build()
         .map_err(RunError::Start)?;
     // Signal handlers go in before the slow part of start-up, so a SIGTERM
-    // during the database open or the grace pass is caught (and served as
-    // a clean stop) rather than killing the process half-way.
+    // during the database open is caught (and served as a clean stop)
+    // rather than killing the process half-way.
     let signals = {
         let _context = runtime.enter();
         Signals::install().map_err(RunError::Start)?
     };
-    let mut store = Store::open(&paths.db)?;
+    let store = Store::open(&paths.db)?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let health = Arc::new(HealthChecker::new(Duration::from_secs(
         config.health_timeout,
     )));
-    let grace = Scheduler::new(clock.clone(), config.clone(), health.clone());
-    let graced = store.tx(|tx| grace.restart_grace(tx))?;
-    if graced > 0 {
-        tracing::info!(leases = graced, "restart grace applied");
-    }
     let engine = Engine::spawn(store, clock, config, health).map_err(RunError::Start)?;
     let served = runtime.block_on(serve(listener, engine, info, signals, paths.stop_marker()));
     // A custom check still running would outlive the daemon.

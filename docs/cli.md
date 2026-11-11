@@ -156,7 +156,8 @@ A client refuses a daemon of another version (exit 5) and says to restart it.
 | database (`clerk.db`), daemon log | `~/.local/state/clerk/` | `<dir>/state/` |
 | config (`config.toml`) | `~/.config/clerk/` | `<dir>/config/` |
 
-`config.toml` sets timings, in seconds unless noted:
+`config.toml` sets timings, in seconds unless noted, and how long finished
+records are kept, in days:
 
 ```toml
 warning_lead_max = 300      # expiry warning, at most this early
@@ -167,6 +168,11 @@ claim_window = 300
 yield_window = 120
 health_timeout = 10
 reconnect_grace = 60        # an agent's leases after its Claude Code exits
+retention_days = 90         # days (not seconds): ended leases and the audit log
+notice_retention_days = 7   # days: delivered notices, and notices nobody will take
 ```
+
+The daemon sweeps once a day, and at start, for what is past retention.
+Live leases, and notices a live holder has not been given, are never swept.
 
 The socket path must stay under 107 bytes; pick a short `CLERK_HOME`.

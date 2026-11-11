@@ -214,7 +214,7 @@ impl Scheduler {
         }
     }
 
-    /// The restart grace (spec §7.2), run once at daemon startup before the
+    /// The restart grace, run once at daemon startup before the
     /// first tick: a cleaning lease whose cleanup deadline passed while the
     /// daemon was down gets a fresh cleanup window from now, and an offer
     /// whose claim deadline passed gets a fresh claim window. Each change is
@@ -444,7 +444,7 @@ impl Scheduler {
 
     /// Expire a held lease: it starts cleaning. The window runs from
     /// `max(ends_at, now)`: in normal running that is the lease's end, and
-    /// after downtime the holder still gets a full window from now (§5.4).
+    /// after downtime the holder still gets a full window from now.
     fn expire(&self, tx: &Tx, lease: &LeaseRow) -> Result<(), SchedulerError> {
         let now = self.now();
         let start = lease.ends_at.map_or(now, |e| e.max(now));

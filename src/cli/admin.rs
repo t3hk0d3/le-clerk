@@ -1,5 +1,5 @@
-//! `clerk admin …`: the hard management tools, each mapped 1:1 to a phase 1
-//! `admin_*` call.
+//! `clerk admin …`: the hard management tools, each mapped 1:1 to an `admin_*` RPC
+//! method.
 //!
 //! The gate runs before any daemon call: agents need `--override`, and a
 //! state-changing subcommand also needs the person's confirmation (a prompt

@@ -86,14 +86,8 @@ async fn steps(
     // Since when steps go unanswered: the give-up budget outlives a step.
     let mut unreached_since: Option<Instant> = None;
     loop {
-        if !host_alive(&host) {
-            return finish(
-                md,
-                &ended("Claude Code process running this session has exited"),
-            );
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            return finish(md, &empty(&["No notices arrived before --timeout."]));
+        if let Some(over) = due_to_stop(md, &host, deadline) {
+            return over;
         }
         // A step, reconnecting included, ends by --timeout, and soon enough
         // to notice the host gone.
@@ -134,27 +128,64 @@ async fn steps(
             }
             Some("notices") => {
                 let all = step["notices"].as_array().cloned().unwrap_or_default();
-                let notices = actionable(client, caller, session_id, all).await?;
-                if notices.is_empty() {
-                    continue;
-                }
-                if args.follow {
-                    for notice in notices {
-                        let claimed = claim_if_offered(client, caller, &notice).await;
-                        let line = follow_line(&notice, claimed);
-                        print(md, &line)?;
-                        ack(client, session_id, &[&notice]).await?;
-                    }
-                } else {
-                    print(md, &batch(client, caller, &notices).await)?;
-                    let all: Vec<&Value> = notices.iter().collect();
-                    ack(client, session_id, &all).await?;
+                if show_notices(client, caller, session_id, args, md, all).await? {
                     return Ok(());
                 }
             }
             other => anyhow::bail!("the daemon answered the wait with {other:?}"),
         }
     }
+}
+
+/// The end of the wait before the next step: `Some` once the host process
+/// has exited or `--timeout` has passed.
+fn due_to_stop(
+    md: Format,
+    host: &leclerk::model::Host,
+    deadline: Option<Instant>,
+) -> Option<anyhow::Result<()>> {
+    if !host_alive(host) {
+        return Some(finish(
+            md,
+            &ended("Claude Code process running this session has exited"),
+        ));
+    }
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Some(finish(
+            md,
+            &empty(&["No notices arrived before --timeout."]),
+        ));
+    }
+    None
+}
+
+/// Print what a step brought and acknowledge it. Returns whether the wait
+/// is over: a batch wait ends at its first notices, `--follow` goes on.
+async fn show_notices(
+    client: &Client,
+    caller: &Caller,
+    session_id: &str,
+    args: &WaitArgs,
+    md: Format,
+    all: Vec<Value>,
+) -> anyhow::Result<bool> {
+    let notices = actionable(client, caller, session_id, all).await?;
+    if notices.is_empty() {
+        return Ok(false);
+    }
+    if args.follow {
+        for notice in notices {
+            let claimed = claim_if_offered(client, caller, &notice).await;
+            let line = follow_line(&notice, claimed);
+            print(md, &line)?;
+            ack(client, session_id, &[&notice]).await?;
+        }
+        return Ok(false);
+    }
+    print(md, &batch(client, caller, &notices).await)?;
+    let all: Vec<&Value> = notices.iter().collect();
+    ack(client, session_id, &all).await?;
+    Ok(true)
 }
 
 /// The result of a batch wait over `notices`: offers claimed on the way

@@ -3584,3 +3584,131 @@ mod agent_policy {
         }
     }
 }
+
+mod retention_sweep {
+    use super::*;
+    use rusqlite::Connection;
+
+    const DAY: Duration = Duration::from_hours(24);
+    /// Far enough from the epoch that "20 days ago" is a positive time.
+    const START: i64 = 400 * 86_400_000;
+
+    /// An engine over a file database, with a fast liveness probe so an idle
+    /// engine looks at the clock often.
+    struct Rig {
+        _dir: tempfile::TempDir,
+        db: std::path::PathBuf,
+        clock: Arc<ManualClock>,
+        _handle: EngineHandle,
+    }
+
+    impl Rig {
+        /// Started, and past its start-up sweep: a marker notice the sweep
+        /// takes is gone.
+        fn started() -> Self {
+            let rig = Self::start_with(|c| delivered_days_before_start(c, "marker", 20));
+            rig.wait_for_notices(0);
+            rig
+        }
+
+        /// `seed` runs on the database before the engine starts.
+        fn start_with(seed: impl FnOnce(&Connection)) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("clerk.db");
+            let store = Store::open(&db).unwrap();
+            let conn = Connection::open(&db).unwrap();
+            conn.busy_timeout(PATIENCE).unwrap();
+            seed(&conn);
+            let clock = Arc::new(ManualClock::new(START));
+            let handle = Engine::spawn_with(
+                store,
+                clock.clone(),
+                Config::default(),
+                Arc::new(Healthy),
+                EngineOptions {
+                    liveness_interval: Duration::from_millis(20),
+                },
+            )
+            .unwrap();
+            Self {
+                _dir: dir,
+                db,
+                clock,
+                _handle: handle,
+            }
+        }
+
+        fn conn(&self) -> Connection {
+            let conn = Connection::open(&self.db).unwrap();
+            conn.busy_timeout(PATIENCE).unwrap();
+            conn
+        }
+
+        fn notices(&self) -> i64 {
+            self.conn()
+                .query_row("SELECT COUNT(*) FROM notices", [], |r| r.get(0))
+                .unwrap()
+        }
+
+        /// Poll until the notice count is `want`.
+        fn wait_for_notices(&self, want: i64) {
+            let until = Instant::now() + PATIENCE;
+            while self.notices() != want {
+                assert!(
+                    Instant::now() < until,
+                    "notices stayed at {}",
+                    self.notices()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// A notice delivered `days` days before `START`.
+    fn delivered_days_before_start(conn: &Connection, id: &str, days: i64) {
+        let at = START - days * 86_400_000;
+        conn.execute(
+            "INSERT INTO notices (notice_id, holder, kind, payload, created_at, delivered_at) \
+             VALUES (?1, '{\"kind\":\"user\",\"tag\":\"a\"}', 'offered', '{}', ?2, ?2)",
+            rusqlite::params![id, at],
+        )
+        .unwrap();
+    }
+
+    mod on_start {
+        use super::*;
+
+        #[test]
+        fn sweeps_notices_delivered_long_ago() {
+            let rig = Rig::start_with(|c| delivered_days_before_start(c, "n1", 20));
+            rig.wait_for_notices(0);
+        }
+    }
+
+    mod a_day_later {
+        use super::*;
+
+        #[test]
+        fn sweeps_again() {
+            let rig = Rig::started();
+            delivered_days_before_start(&rig.conn(), "n2", 20);
+            rig.clock.advance(DAY + Duration::from_secs(1));
+            rig.wait_for_notices(0);
+        }
+    }
+
+    mod before_a_day_has_passed {
+        use super::*;
+
+        #[test]
+        fn does_not_sweep_again() {
+            let rig = Rig::started();
+            delivered_days_before_start(&rig.conn(), "n3", 20);
+            rig.clock.advance(Duration::from_hours(23));
+            // Many probe intervals pass: an engine that swept on every wake
+            // would have taken it.
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(rig.notices(), 1);
+        }
+    }
+}

@@ -552,9 +552,9 @@ async fn acknowledge_printed(client: &Client, caller: &Caller, batch: &[NoticeVi
 // Shared steps
 // ---------------------------------------------------------------------------
 
-/// Claim the offered `lease`. When the caller already holds it (an agent
-/// session's MCP `lease_wait` claims its offers too), its current state is
-/// the answer, as for MCP's claim.
+/// Claim the offered `lease`. When the caller already holds it (a `clerk
+/// wait` in the same agent session claims its offers too), its current
+/// state is the answer.
 ///
 /// Debug builds only: `CLERK_TEST_CLAIM_DELAY_MS` delays the claim, so
 /// tests can press Ctrl+C while an offer is pending. Release builds never

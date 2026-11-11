@@ -488,6 +488,134 @@ mod store {
             }
         }
 
+        mod on_a_db_whose_schema_is_newer_than_the_binarys {
+            use super::*;
+
+            /// A migrated database a newer binary has moved on by one.
+            fn ahead() -> (TempDir, std::path::PathBuf) {
+                let (dir, path) = database_at(INSTALLED_MIGRATIONS);
+                Store::open(&path).unwrap();
+                let latest = user_version(&path);
+                Connection::open(&path)
+                    .unwrap()
+                    .pragma_update(None, "user_version", latest + 1)
+                    .unwrap();
+                (dir, path)
+            }
+
+            #[test]
+            fn refuses_with_store_too_new() {
+                let (_dir, path) = ahead();
+                let refused = Store::open(&path).unwrap_err();
+                assert_eq!(refused.code(), "store_too_new");
+            }
+
+            #[test]
+            fn leaves_the_schema_version_as_it_was() {
+                let (_dir, path) = ahead();
+                let before = user_version(&path);
+                let _ = Store::open(&path);
+                assert_eq!(user_version(&path), before);
+            }
+
+            #[test]
+            fn the_daemon_exits_5() {
+                let env = TestEnv::new();
+                let home = env.home().to_path_buf();
+                let paths = Paths::from_lookup(move |k| {
+                    (k == "CLERK_HOME").then(|| home.clone().into_os_string())
+                })
+                .unwrap();
+                fs::create_dir_all(paths.db.parent().unwrap()).unwrap();
+                Store::open(&paths.db).unwrap();
+                let latest = user_version(&paths.db);
+                Connection::open(&paths.db)
+                    .unwrap()
+                    .pragma_update(None, "user_version", latest + 1)
+                    .unwrap();
+                let out = env
+                    .cmd()
+                    .args(["--json", "daemon"])
+                    .timeout(common::PATIENCE)
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.code(), Some(5), "{out:?}");
+                let answer: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(answer["error"]["code"], "store_too_new");
+            }
+        }
+
+        mod on_a_db_with_notices_and_leases {
+            use super::*;
+
+            fn migrated() -> (TempDir, std::path::PathBuf) {
+                let (dir, path) = database_at(INSTALLED_MIGRATIONS);
+                Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO notices (row_id, notice_id, holder, kind, payload, \
+                         created_at, delivered_at, returned_at, hook_shown_at) \
+                         VALUES (7, 'n7', 'h', 'offered', '{}', 1, 2, 3, 4)",
+                        [],
+                    )
+                    .unwrap();
+                Store::open(&path).unwrap();
+                (dir, path)
+            }
+
+            #[test]
+            fn keeps_the_notices_with_their_row_ids() {
+                let (_dir, path) = migrated();
+                let row: (i64, String, Option<i64>, Option<i64>, Option<i64>) =
+                    Connection::open(&path)
+                        .unwrap()
+                        .query_row(
+                            "SELECT row_id, notice_id, delivered_at, returned_at, hook_shown_at \
+                             FROM notices",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                        )
+                        .unwrap();
+                assert_eq!(row, (7, "n7".into(), Some(2), Some(3), Some(4)));
+            }
+
+            #[test]
+            fn drops_the_notice_columns_nothing_used() {
+                let (_dir, path) = migrated();
+                let conn = Connection::open(&path).unwrap();
+                for column in [
+                    "lease_row",
+                    "unit_row",
+                    "cleanup_deadline",
+                    "claim_deadline",
+                ] {
+                    let present: bool = conn
+                        .query_row(
+                            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('notices') \
+                             WHERE name = ?1)",
+                            [column],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert!(!present, "{column}");
+                }
+            }
+
+            #[test]
+            fn indexes_the_live_leases_only() {
+                let (_dir, path) = migrated();
+                let sql: String = Connection::open(&path)
+                    .unwrap()
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE name = 'leases_live'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert!(sql.contains("WHERE state != 'ended'"), "{sql}");
+            }
+        }
+
         mod on_the_installed_daemons_db {
             use super::*;
 
@@ -868,12 +996,22 @@ impl Fixture {
     }
 }
 
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+thread_local! {
+    /// What this thread's events are being captured into, if anything.
+    static CAPTURE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
 
-impl Write for Captured {
+/// Writes each log line into the calling thread's [`CAPTURE`], or nowhere.
+#[derive(Clone, Copy)]
+struct ThreadCapture;
+
+impl Write for ThreadCapture {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        CAPTURE.with(|c| {
+            if let Some(buffer) = c.borrow_mut().as_mut() {
+                buffer.extend_from_slice(bytes);
+            }
+        });
         Ok(bytes.len())
     }
 
@@ -882,24 +1020,33 @@ impl Write for Captured {
     }
 }
 
-impl MakeWriter<'_> for Captured {
+impl MakeWriter<'_> for ThreadCapture {
     type Writer = Self;
 
     fn make_writer(&self) -> Self {
-        self.clone()
+        *self
     }
 }
 
 /// `f`'s value and what it logged on this thread.
+///
+/// One global subscriber serves every test: a subscriber set per call lets a
+/// parallel test thread cache "nobody listens" for a log site, and the
+/// capture then misses the event.
 fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    let value = tracing::subscriber::with_default(subscriber, f);
-    let log = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
-    (value, log)
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(ThreadCapture)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other subscriber in this test binary");
+    });
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let value = f();
+    let captured = CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    (value, String::from_utf8_lossy(&captured).into_owned())
 }
 
 mod dispatch_order {

@@ -1,5 +1,4 @@
-//! Durations as people and agents write them: `<n>s|m|h|d` (`--for`, and
-//! the MCP tools' `for`).
+//! Durations as people and agents write them: `<n>s|m|h|d` (`--for`).
 
 use std::time::Duration;
 

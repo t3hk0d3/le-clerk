@@ -1,5 +1,5 @@
 //! `clerk admin …`: every subcommand sits behind the gate and maps 1:1 to
-//! a phase 1 `admin_*` call. Confirmation prompts run under a
+//! an `admin_*` RPC method. Confirmation prompts run under a
 //! pseudo-terminal (`script`).
 
 mod common;

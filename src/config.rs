@@ -25,9 +25,13 @@ pub const HEALTH_TIMEOUT_SECS: u64 = 10;
 /// Reconnection grace of an agent session whose last liveness stream
 /// closed, seconds.
 pub const RECONNECT_GRACE_SECS: u64 = 60;
+/// How long ended leases and audit entries are kept, days.
+pub const RETENTION_DAYS: u64 = 90;
+/// How long delivered notices, and notices nobody will take, are kept, days.
+pub const NOTICE_RETENTION_DAYS: u64 = 7;
 
 /// Timing configuration; every value is in seconds except the ratio and the
-/// `*_ms` values (milliseconds).
+/// retention periods (days).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -47,6 +51,11 @@ pub struct Config {
     pub health_timeout: u64,
     /// Reconnection grace.
     pub reconnect_grace: u64,
+    /// Days an ended lease and an audit entry are kept.
+    pub retention_days: u64,
+    /// Days a delivered notice, and a notice for a holder that is gone, is
+    /// kept.
+    pub notice_retention_days: u64,
 }
 
 impl Default for Config {
@@ -60,6 +69,8 @@ impl Default for Config {
             yield_window: YIELD_WINDOW_SECS,
             health_timeout: HEALTH_TIMEOUT_SECS,
             reconnect_grace: RECONNECT_GRACE_SECS,
+            retention_days: RETENTION_DAYS,
+            notice_retention_days: NOTICE_RETENTION_DAYS,
         }
     }
 }
@@ -85,8 +96,8 @@ pub enum ConfigError {
     },
     /// A value is out of range; `key` names it.
     #[error(
-        "invalid config value for {key}: windows and timeouts must be positive, \
-         warning_lead_ratio between 0 and 1"
+        "invalid config value for {key}: windows, timeouts and retention periods must be \
+         positive, warning_lead_ratio between 0 and 1"
     )]
     Invalid {
         /// The offending key.
@@ -133,8 +144,8 @@ impl Config {
     }
 
     /// Check the values: `warning_lead_ratio` is a number in `[0, 1]`, and
-    /// the cleanup, claim and yield windows, the health timeout and the MCP
-    /// intervals are positive.
+    /// the cleanup, claim and yield windows, the health timeout and the
+    /// retention periods are positive.
     ///
     /// # Errors
     /// [`ConfigError::Invalid`] naming the first offending key.
@@ -149,6 +160,8 @@ impl Config {
             ("claim_window", self.claim_window),
             ("yield_window", self.yield_window),
             ("health_timeout", self.health_timeout),
+            ("retention_days", self.retention_days),
+            ("notice_retention_days", self.notice_retention_days),
         ] {
             if value == 0 {
                 return Err(ConfigError::Invalid { key });

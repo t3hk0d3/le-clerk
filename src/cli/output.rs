@@ -12,7 +12,6 @@ use leclerk::client::{ApiError, DaemonError};
 use leclerk::daemon::RunError;
 use leclerk::error::ErrorCode;
 use leclerk::scope::ScopeError;
-use leclerk::store::StoreError;
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -213,7 +212,7 @@ impl From<anyhow::Error> for Failure {
                     exit: EXIT_DAEMON,
                 };
             }
-            Ok(RunError::Store(store @ StoreError::TooNew { .. })) => {
+            Ok(RunError::Store(store)) if store.is_too_new() => {
                 return Self {
                     code: store.code().to_owned(),
                     message: store.to_string(),

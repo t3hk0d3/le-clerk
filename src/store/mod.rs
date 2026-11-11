@@ -4,6 +4,7 @@ pub mod audit;
 pub mod inventory;
 pub mod leases;
 pub mod notices;
+pub mod retention;
 pub mod sessions;
 
 use std::cell::RefCell;
@@ -13,7 +14,7 @@ use std::fs;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
-use rusqlite_migration::{M, Migrations};
+use rusqlite_migration::{M, MigrationDefinitionError, Migrations};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -53,6 +54,22 @@ pub enum StoreError {
         /// This binary's ([`VOCABULARY_VERSION`]).
         known: i64,
     },
+    /// A newer binary migrated the schema past the last migration this one
+    /// knows.
+    #[error(
+        "the clerk database schema is newer than this clerk knows: a newer clerk migrated it; \
+         run that clerk instead"
+    )]
+    SchemaTooNew,
+}
+
+impl StoreError {
+    /// Whether a newer binary wrote the database, by vocabulary or schema,
+    /// so that this one must leave it alone.
+    #[must_use]
+    pub fn is_too_new(&self) -> bool {
+        matches!(self, Self::TooNew { .. } | Self::SchemaTooNew)
+    }
 }
 
 impl ErrorCode for StoreError {
@@ -63,7 +80,7 @@ impl ErrorCode for StoreError {
             StoreError::Json(_) => "json_error",
             StoreError::Io(_) => "io_error",
             StoreError::Corrupt(_) => "corrupt_database",
-            StoreError::TooNew { .. } => "store_too_new",
+            StoreError::TooNew { .. } | StoreError::SchemaTooNew => "store_too_new",
         }
     }
 }
@@ -91,6 +108,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0016_request_skip_checks.sql")),
         M::up(include_str!("migrations/0017_lease_overdue.sql")),
         M::up(include_str!("migrations/0018_vocabulary.sql")),
+        M::up(include_str!("migrations/0019_retention.sql")),
     ])
 }
 
@@ -108,7 +126,8 @@ impl Store {
     ///
     /// # Errors
     /// [`StoreError`] when the file cannot be created, opened or migrated;
-    /// [`StoreError::TooNew`] when a newer binary wrote it.
+    /// [`StoreError::TooNew`] or [`StoreError::SchemaTooNew`] when a newer
+    /// binary wrote it.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -138,7 +157,12 @@ impl Store {
                 known: VOCABULARY_VERSION,
             });
         }
-        migrations().to_latest(&mut conn)?;
+        migrations().to_latest(&mut conn).map_err(|e| match e {
+            rusqlite_migration::Error::MigrationDefinition(
+                MigrationDefinitionError::DatabaseTooFarAhead,
+            ) => StoreError::SchemaTooNew,
+            other => other.into(),
+        })?;
         if stored_vocabulary(&conn)? != Some(VOCABULARY_VERSION) {
             conn.execute(
                 "INSERT OR REPLACE INTO store_vocabulary (id, vocabulary_version) VALUES (1, ?1)",

@@ -27,6 +27,16 @@ The single styleguide for this project. Every task and plan follows it.
 - No `unwrap()` / `expect()` outside tests, except for proven invariants, with
   a comment stating the invariant.
 - API error codes are `snake_case` strings derived from the enum variant.
+  The deliberate exceptions, where the code says more than the variant name
+  or one code covers two variants:
+  - `StoreError::Sqlite` is `database_error`, `Corrupt` is `corrupt_database`.
+  - `StoreError::TooNew` and `SchemaTooNew` are both `store_too_new`: a newer
+    clerk wrote the database, whichever way, and this one refuses it.
+  - `AdminError::Invalid` is `invalid_argument`.
+  - `IdError::Invalid` is `invalid_id`, as `Invalid` alone would say nothing
+    on the wire.
+  - `ScopeError::Git` is `git_failed`.
+  A new exception goes in this list.
 
 ## Time
 - Never call `SystemTime::now()` outside `clock.rs`.
