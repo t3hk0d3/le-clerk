@@ -5187,13 +5187,12 @@ mod cli {
         }
 
         #[test]
-        fn a_list_is_one_block_per_item_without_next() {
+        fn a_list_is_one_block_per_item() {
             let env = Env::new();
             seed(&env, "board", "k1");
             let dir = env.dir("alpha");
             let (text, _) = stdout(env.agent_md("sess-1", &dir).arg("resources"));
             assert!(text.starts_with("## board\n"), "{text}");
-            assert!(!text.contains("Next:"), "{text}");
         }
 
         #[test]
@@ -5300,6 +5299,494 @@ mod cli {
                     .args(["acquire", "board", "--for", "10m"]),
             );
             assert!(body["next"].is_string(), "{body}");
+        }
+    }
+
+    /// Task 11: one voice across the commands: empty states, per-command
+    /// next steps, plain words, and the same message in both modes.
+    mod output_consistency {
+        use super::*;
+
+        const LEASE: &str = "lse_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+        /// Stdout and exit code of `cmd`.
+        fn stdout(cmd: &mut Command) -> (String, Option<i32>) {
+            let out = cmd.output().unwrap();
+            (String::from_utf8(out.stdout).unwrap(), out.status.code())
+        }
+
+        /// `clerk <args>` as agent session `sess-1`, printing Markdown.
+        fn md(env: &Env, dir: &Path, args: &[&str]) -> (String, Option<i32>) {
+            stdout(env.agent_md("sess-1", dir).args(args))
+        }
+
+        /// The last line, which must be the next step.
+        fn next_of(text: &str) -> &str {
+            let last = text.trim_end().lines().last().unwrap();
+            assert!(last.starts_with("Next: "), "{text}");
+            last
+        }
+
+        /// The last non-empty line before the next step: the summary.
+        fn summary_of(text: &str) -> &str {
+            let lines: Vec<&str> = text.trim_end().lines().collect();
+            lines[..lines.len() - 1]
+                .iter()
+                .rev()
+                .find(|l| !l.is_empty())
+                .unwrap()
+        }
+
+        /// A two-unit pool `board` (u1, u2), the users x and y holding both.
+        fn pool_held(env: &Env) {
+            seed(env, "board", "k1");
+            env.ok(&["unit", "add", "board", "u2", "--key", "k2"]);
+            for who in ["x", "y"] {
+                let grant = acquire(env, &user(who), "board");
+                assert_eq!(grant["outcome"], "granted", "{grant}");
+            }
+        }
+
+        /// A project resource `boards` with unit `b1`, made by `sess-1`.
+        fn boards(env: &Env, dir: &Path) {
+            md(
+                env,
+                dir,
+                &["resource", "create", "boards", "--type", "generic"],
+            );
+            md(env, dir, &["unit", "add", "boards", "b1", "--key", "k1"]);
+        }
+
+        mod resources_empty {
+            use super::*;
+
+            #[test]
+            fn says_no_resources_are_registered() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let (text, code) = md(&env, &dir, &["resources"]);
+                assert_eq!(code, Some(0), "{text}");
+                assert!(text.contains("No resources registered"), "{text}");
+            }
+
+            #[test]
+            fn next_is_how_to_register() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let (text, _) = md(&env, &dir, &["resources"]);
+                assert!(next_of(&text).contains("clerk resource create"), "{text}");
+            }
+
+            #[test]
+            fn status_says_the_same() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let (text, _) = md(&env, &dir, &["status"]);
+                assert!(text.contains("No resources registered"), "{text}");
+                assert!(next_of(&text).contains("clerk resource create"), "{text}");
+            }
+
+            #[test]
+            fn a_person_is_told_how_to_register() {
+                let env = Env::new();
+                let shown = env.tty("NO_COLOR=1 \"$CLERK\" resources");
+                assert!(shown.contains("No resources registered"), "{shown}");
+                assert!(shown.contains("clerk resource create"), "{shown}");
+            }
+        }
+
+        mod resource_create {
+            use super::*;
+
+            #[test]
+            fn next_says_to_add_units() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let (text, code) = md(
+                    &env,
+                    &dir,
+                    &["resource", "create", "boards", "--type", "generic"],
+                );
+                assert_eq!(code, Some(0), "{text}");
+                let next = next_of(&text);
+                assert!(next.contains("clerk unit add boards"), "{next}");
+                assert!(!next.contains("clerk acquire"), "{next}");
+            }
+        }
+
+        mod resource_delete {
+            use super::*;
+
+            #[test]
+            fn next_says_to_drop_the_ids_from_notes() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                md(
+                    &env,
+                    &dir,
+                    &["resource", "create", "boards", "--type", "generic"],
+                );
+                let (text, code) = md(&env, &dir, &["resource", "delete", "boards"]);
+                assert_eq!(code, Some(0), "{text}");
+                let next = next_of(&text);
+                assert!(next.contains("notes"), "{next}");
+                assert!(!next.contains("clerk acquire"), "{next}");
+            }
+        }
+
+        mod unit_remove {
+            use super::*;
+
+            #[test]
+            fn next_says_to_drop_the_ids_from_notes() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                boards(&env, &dir);
+                let (text, code) = md(&env, &dir, &["unit", "remove", "boards", "b1"]);
+                assert_eq!(code, Some(0), "{text}");
+                let next = next_of(&text);
+                assert!(next.contains("notes"), "{next}");
+                assert!(!next.contains("clerk acquire"), "{next}");
+            }
+        }
+
+        mod unit_retire {
+            use super::*;
+
+            #[test]
+            fn a_free_unit_is_removed_now() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                boards(&env, &dir);
+                let (text, _) = md(&env, &dir, &["unit", "retire", "boards", "b1"]);
+                let next = next_of(&text);
+                assert!(next.contains("removed now"), "{next}");
+                assert!(next.contains("notes"), "{next}");
+            }
+
+            #[test]
+            fn a_held_unit_goes_after_the_lease() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                boards(&env, &dir);
+                md(&env, &dir, &["acquire", "boards", "--for", "10m"]);
+                let (text, _) = md(&env, &dir, &["unit", "retire", "boards", "b1"]);
+                let next = next_of(&text);
+                assert!(next.contains("after its lease"), "{next}");
+            }
+        }
+
+        mod queue_status_and_resources {
+            use super::*;
+
+            #[test]
+            fn status_ends_with_a_summary_and_next() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let dir = env.dir("alpha");
+                let (text, _) = md(&env, &dir, &["status"]);
+                assert!(summary_of(&text).contains("1 resource"), "{text}");
+                next_of(&text);
+            }
+
+            #[test]
+            fn resources_ends_with_a_summary_and_next() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let dir = env.dir("alpha");
+                let (text, _) = md(&env, &dir, &["resources"]);
+                assert!(summary_of(&text).contains("1 resource"), "{text}");
+                next_of(&text);
+            }
+
+            #[test]
+            fn queue_ends_with_a_summary_and_next() {
+                let env = Env::new();
+                seed(&env, "board", "k1");
+                let dir = env.dir("alpha");
+                let (text, code) = md(&env, &dir, &["queue", "board"]);
+                assert_eq!(code, Some(0), "{text}");
+                assert!(summary_of(&text).contains("queued for board"), "{text}");
+                next_of(&text);
+            }
+        }
+
+        mod not_found {
+            use super::*;
+
+            #[test]
+            fn an_agent_is_told_the_kind_and_id() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let (text, code) = md(&env, &dir, &["release", LEASE]);
+                assert_eq!(code, Some(3), "{text}");
+                let message = text.lines().nth(1).unwrap();
+                assert!(message.contains(&format!("lease \"{LEASE}\"")), "{text}");
+            }
+
+            #[test]
+            fn a_resource_the_scheduler_cannot_find_is_named() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let error = error_of(
+                    env.agent("sess-1", &dir)
+                        .args(["acquire", "nosuch", "--for", "5m"]),
+                    3,
+                );
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("resource \"nosuch\""), "{message}");
+            }
+
+            #[test]
+            fn a_person_is_told_the_same() {
+                let env = Env::new();
+                let error = error_of(env.cmd().args(["--json", "resource", "show", "nope"]), 3);
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("resource \"nope\""), "{message}");
+            }
+        }
+
+        mod leases_mine {
+            use super::*;
+
+            #[test]
+            fn says_no_clerk_wait_is_running() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let (text, _) = md(&env, &dir, &["leases", "--mine"]);
+                assert!(text.contains("no clerk wait is running"), "{text}");
+                assert!(!text.contains("armed"), "{text}");
+            }
+
+            #[test]
+            fn keeps_the_wire_field_in_json() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let body = json_of(env.agent("sess-1", &dir).args(["leases", "--mine"]));
+                assert_eq!(body["armed"], false, "{body}");
+                assert!(
+                    body["summary"]
+                        .to_string()
+                        .contains("no clerk wait is running"),
+                    "{body}"
+                );
+            }
+        }
+
+        mod release_of_an_ended_lease {
+            use super::*;
+
+            fn held(env: &Env, dir: &Path) -> String {
+                seed(env, "board", "k1");
+                lease_of(&json_of(
+                    env.agent("sess-1", dir)
+                        .args(["acquire", "board", "--for", "10m"]),
+                ))
+            }
+
+            #[test]
+            fn json_omits_ends_at_and_cleanup_deadline() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let lease = held(&env, &dir);
+                let body = json_of(env.agent("sess-1", &dir).args(["release", &lease]));
+                assert_eq!(body["state"], "ended", "{body}");
+                assert!(body.get("ends_at").is_none(), "{body}");
+                assert!(body.get("cleanup_deadline").is_none(), "{body}");
+            }
+
+            #[test]
+            fn markdown_omits_ends_at_and_cleanup_deadline() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let lease = held(&env, &dir);
+                let (text, _) = md(&env, &dir, &["release", &lease]);
+                assert!(text.contains("- state: ended"), "{text}");
+                assert!(!text.contains("ends_at"), "{text}");
+                assert!(!text.contains("cleanup_deadline"), "{text}");
+            }
+        }
+
+        mod timestamps {
+            use super::*;
+
+            #[test]
+            fn a_just_written_time_is_not_in_the_future() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                md(
+                    &env,
+                    &dir,
+                    &["resource", "create", "boards", "--type", "generic"],
+                );
+                let (text, _) = md(&env, &dir, &["unit", "add", "boards", "b1", "--key", "k1"]);
+                assert!(!text.contains("in 0s"), "{text}");
+            }
+        }
+
+        mod queued_pooled_request {
+            use super::*;
+
+            #[test]
+            fn json_lists_every_held_unit() {
+                let env = Env::new();
+                pool_held(&env);
+                let dir = env.dir("alpha");
+                let out = env
+                    .agent("sess-1", &dir)
+                    .args(["acquire", "board", "--for", "5m"])
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.code(), Some(6), "{out:?}");
+                let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+                let blocked = &body["blocked_by"];
+                assert_eq!(blocked["kind"], "held", "{body}");
+                let mut all = vec![blocked["unit"].as_str().unwrap()];
+                all.extend(
+                    blocked["also_held"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|u| u["unit"].as_str().unwrap()),
+                );
+                all.sort_unstable();
+                assert_eq!(all, ["u1", "u2"], "{body}");
+            }
+
+            #[test]
+            fn markdown_names_each_unit() {
+                let env = Env::new();
+                pool_held(&env);
+                let dir = env.dir("alpha");
+                let (text, code) = md(&env, &dir, &["acquire", "board", "--for", "5m"]);
+                assert_eq!(code, Some(6), "{text}");
+                assert!(text.contains("u1") && text.contains("u2"), "{text}");
+            }
+
+            #[test]
+            fn a_person_sees_all_held_and_the_soonest_free() {
+                let env = Env::new();
+                pool_held(&env);
+                let shown = env.tty("NO_COLOR=1 \"$CLERK\" acquire board --for 5m < /dev/null");
+                assert!(
+                    shown.contains("all 2 units held; soonest free: u"),
+                    "{shown}"
+                );
+            }
+        }
+
+        mod help {
+            use super::*;
+
+            #[test]
+            fn global_flags_sit_under_their_own_heading() {
+                let env = Env::new();
+                let (text, _) = stdout(env.cmd().args(["extend", "--help"]));
+                let at = text
+                    .find("Global options:")
+                    .unwrap_or_else(|| panic!("{text}"));
+                assert!(text[at..].contains("--json"), "{text}");
+                assert!(!text[..at].contains("--json"), "{text}");
+            }
+
+            #[test]
+            fn aquire_suggests_acquire_first() {
+                let env = Env::new();
+                let error = error_of(env.cmd().args(["--json", "aquire", "board"]), 2);
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("'acquire'"), "{message}");
+                assert!(!message.contains("'queue'"), "{message}");
+            }
+
+            #[test]
+            fn extend_with_a_bare_duration_hints_for() {
+                let env = Env::new();
+                let error = error_of(env.cmd().args(["--json", "extend", LEASE, "10m"]), 2);
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("--for 10m"), "{message}");
+            }
+        }
+
+        mod types {
+            use super::*;
+
+            #[test]
+            fn json_names_the_flag_of_each_setting() {
+                let env = Env::new();
+                let body = env.ok(&["types"]);
+                assert_eq!(body["types"][0]["settings"][0]["flag"], "--path", "{body}");
+            }
+
+            #[test]
+            fn a_person_sees_the_flags() {
+                let env = Env::new();
+                let shown = env.tty("NO_COLOR=1 \"$CLERK\" types");
+                for flag in ["--path", "--key", "--host", "--port"] {
+                    assert!(shown.contains(flag), "{flag}: {shown}");
+                }
+            }
+        }
+
+        mod skip_checks {
+            use super::*;
+
+            #[test]
+            fn the_message_names_the_flag() {
+                let env = Env::new();
+                let error = error_of(
+                    env.cmd()
+                        .args(["--json", "acquire", "board", "--for", "5m", "--skip-checks"]),
+                    2,
+                );
+                let message = error["message"].as_str().unwrap();
+                assert!(
+                    message.contains("--skip-checks needs a specific unit"),
+                    "{message}"
+                );
+            }
+        }
+
+        mod scope_flag {
+            use super::*;
+
+            #[test]
+            fn project_means_this_directorys_project_everywhere() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                json_of(env.cmd().current_dir(&dir).args([
+                    "resource", "create", "probe", "--type", "generic", "--scope", "project",
+                ]));
+                let shown = json_of(
+                    env.cmd()
+                        .current_dir(&dir)
+                        .args(["resource", "show", "probe", "--scope", "project"]),
+                );
+                assert_eq!(shown["scope"], json!({"project": canonical(&dir)}));
+            }
+
+            #[test]
+            fn create_takes_project_with_a_path_too() {
+                let env = Env::new();
+                let dir = env.dir("alpha");
+                let scope = format!("project:{}", canonical(&dir));
+                let body = json_of(env.cmd().current_dir(&dir).args([
+                    "resource", "create", "probe", "--type", "generic", "--scope", &scope,
+                ]));
+                assert_eq!(
+                    body["resource"]["scope"],
+                    json!({"project": canonical(&dir)})
+                );
+            }
+
+            #[test]
+            fn create_and_unit_add_help_say_the_same() {
+                let env = Env::new();
+                for args in [["resource", "create", "--help"], ["unit", "add", "--help"]] {
+                    let (text, _) = stdout(env.cmd().args(args));
+                    assert!(text.contains("project:<path>"), "{text}");
+                    assert!(text.contains("this directory's project"), "{text}");
+                }
+            }
         }
     }
 
@@ -6527,7 +7014,7 @@ mod cli {
                 use super::*;
 
                 #[test]
-                fn names_the_holder_and_purpose_of_the_one_ending_first() {
+                fn says_all_are_held_and_names_the_holder_of_the_one_ending_first() {
                     let env = Env::new();
                     bench(&env);
                     hold_for(&env, "esp32-c6/b1", "30m", "third");
@@ -6537,7 +7024,10 @@ mod cli {
                         shown.contains("\n  b2 is held by cli for \"fourth\", ends in "),
                         "{shown}"
                     );
-                    assert!(!shown.contains("third"), "{shown}");
+                    assert!(
+                        shown.contains("all 2 units held; soonest free: b2 in 10m, then b1 in "),
+                        "{shown}"
+                    );
                 }
 
                 #[test]

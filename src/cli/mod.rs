@@ -23,7 +23,9 @@ mod wait;
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::builder::StyledStr;
+use clap::error::{ContextKind, ContextValue};
+use clap::{CommandFactory, Parser, Subcommand};
 use leclerk::client::{self, Client, DaemonError, DaemonInfo};
 use leclerk::config::{Config, Paths};
 use leclerk::daemon;
@@ -45,17 +47,22 @@ pub struct UsageError(pub String);
 #[command(name = "clerk", version = leclerk::VERSION, arg_required_else_help = true)]
 struct Cli {
     /// Print JSON, even on a terminal.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     json: bool,
     /// Print only ASCII: `#`, `.` and `!` for the unit glyphs (also the
     /// default when the locale is not UTF-8).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     ascii: bool,
     /// Why an agent does this for the user (the reason is recorded in the
     /// audit log). Agents need it for `approve`, `promotions`, `admin`,
     /// `log`, `release --force`, `acquire` of a unit another holder has (it
     /// takes the unit from them) and `daemon stop`.
-    #[arg(long = "override", global = true, value_name = "REASON")]
+    #[arg(
+        long = "override",
+        global = true,
+        value_name = "REASON",
+        help_heading = "Global options"
+    )]
     override_reason: Option<String>,
     #[command(subcommand)]
     command: Command,
@@ -199,12 +206,13 @@ enum Command {
 }
 
 impl Command {
-    /// The top-level command name, as typed.
+    /// The command name, as typed: the top-level one, with the subcommand
+    /// for `resource` and `unit` (`unit retire`).
     fn name(&self) -> &'static str {
         match self {
             Self::Daemon { .. } => "daemon",
-            Self::Resource { .. } => "resource",
-            Self::Unit { .. } => "unit",
+            Self::Resource { action } => action.name(),
+            Self::Unit { action } => action.name(),
             Self::Status => "status",
             Self::Resources(_) => "resources",
             Self::Leases { .. } => "leases",
@@ -285,7 +293,7 @@ impl Ctx {
 pub fn run() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(e) => return parse_failure(&e),
+        Err(e) => return parse_failure(&with_suggestions(e)),
     };
     render::install(cli.json, cli.ascii);
     let mut out = Output::new(Mode::detect(cli.json));
@@ -322,6 +330,71 @@ pub fn run() -> ExitCode {
             Err(e) => out.fail(Failure::from(e)),
         },
     }
+}
+
+/// `e` with the suggestions clap lacks for the frequent mistakes: the
+/// closest command first for a mistyped one (`aquire`), and `--for` for a
+/// bare duration after `extend <lease>`.
+fn with_suggestions(mut e: clap::Error) -> clap::Error {
+    use clap::error::ErrorKind;
+    let usage = match e.get(ContextKind::Usage) {
+        Some(ContextValue::StyledStr(u)) => u.to_string(),
+        _ => String::new(),
+    };
+    let invalid = |e: &clap::Error, kind| match e.get(kind) {
+        Some(ContextValue::String(v)) => Some(v.clone()),
+        _ => None,
+    };
+    match e.kind() {
+        ErrorKind::InvalidSubcommand if usage.contains("clerk [OPTIONS] <COMMAND>") => {
+            if let Some(typed) = invalid(&e, ContextKind::InvalidSubcommand) {
+                let commands = Cli::command();
+                let closest = commands
+                    .get_subcommands()
+                    .map(|c| (edit_distance(&typed, c.get_name()), c.get_name().to_owned()))
+                    .min()
+                    .filter(|(distance, _)| *distance <= 2);
+                if let Some((_, name)) = closest {
+                    e.insert(
+                        ContextKind::SuggestedSubcommand,
+                        ContextValue::Strings(vec![name]),
+                    );
+                }
+            }
+        }
+        ErrorKind::UnknownArgument if usage.contains("clerk extend") => {
+            if let Some(typed) = invalid(&e, ContextKind::InvalidArg)
+                && leclerk::duration::parse_duration(&typed).is_ok()
+            {
+                e.insert(
+                    ContextKind::Suggested,
+                    ContextValue::StyledStrs(vec![StyledStr::from(format!(
+                        "extend a lease with `clerk extend <lease> --for {typed}`"
+                    ))]),
+                );
+            }
+        }
+        _ => {}
+    }
+    e
+}
+
+/// The Levenshtein distance between `a` and `b`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != *cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
 }
 
 /// A command line clap refused. Help and version text print as clap prints

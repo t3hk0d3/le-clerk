@@ -43,8 +43,8 @@ with `--json`, every command prints JSON instead and none of this applies.
     top-level block in `resources`, `status`, `leases`, `promotions`). `log`
     keeps one line per entry, without blank lines.
 - **Errors**: the first sentence says what happened and names the missing thing
-  (`not found: resource "nope"`); JSON error messages never carry clap's
-  "try '--help'" tail.
+  (`not found: resource "nope"; ...`), the same words for people and agents;
+  JSON error messages never carry clap's "try '--help'" tail.
 
 ## Mock-ups
 

@@ -113,11 +113,39 @@ impl From<ApiError> for Failure {
     fn from(e: ApiError) -> Self {
         Self {
             exit: exit_for(&e.code),
+            message: named_not_found(&e).unwrap_or(e.message),
             code: e.code,
-            message: e.message,
             details: e.details,
         }
     }
+}
+
+/// The one `not_found` message, for people and agents alike: what kind of
+/// thing is missing, its id, and where to see the ones there are. `None`
+/// unless the daemon named the missing thing.
+fn named_not_found(e: &ApiError) -> Option<String> {
+    if e.code != "not_found" {
+        return None;
+    }
+    let details = e.details.as_ref()?;
+    let (kind, id) = (details.get("kind")?.as_str()?, details.get("id")?.as_str()?);
+    let lister = match kind {
+        "resource" => "`clerk resources` lists them.".to_owned(),
+        "unit" => format!(
+            "`clerk resource show {}` lists its units.",
+            id.split('/').next().unwrap_or(id)
+        ),
+        "lease" => "`clerk leases` lists the live ones.".to_owned(),
+        "request" => "`clerk leases` lists the queued requests.".to_owned(),
+        "promotion" => "`clerk promotions` lists the pending ones.".to_owned(),
+        _ => String::new(),
+    };
+    let mut message = format!("not found: {kind} \"{id}\"");
+    if !lister.is_empty() {
+        message.push_str("; ");
+        message.push_str(&lister);
+    }
+    Some(message)
 }
 
 impl From<DaemonError> for Failure {
@@ -406,19 +434,14 @@ impl Output {
     }
 }
 
-/// A failure as people read it: the message (for `not_found` with
-/// details, `not found: <kind> "<id>"`), then one `  key: value` line per
-/// other detail.
+/// A failure as people read it: the message, then one `  key: value` line
+/// per detail (a `not_found` message already names the kind and id).
 fn human_failure(f: &Failure) -> String {
-    let named = f.details.as_ref().and_then(|d| {
-        let kind = d.get("kind")?.as_str()?;
-        let id = d.get("id")?.as_str()?;
-        Some((kind, id))
+    let named = f.details.as_ref().is_some_and(|d| {
+        d.get("kind").is_some_and(Value::is_string) && d.get("id").is_some_and(Value::is_string)
     });
-    if f.code == "not_found"
-        && let Some((kind, id)) = named
-    {
-        return format!("not found: {kind} \"{id}\"");
+    if f.code == "not_found" && named {
+        return f.message.clone();
     }
     let mut text = f.message.clone();
     if let Some(Value::Object(details)) = &f.details {

@@ -14,15 +14,21 @@ use serde_json::{Map, Value};
 #[must_use]
 pub fn render(command: &str, value: &Value, now_ms: i64) -> String {
     match value {
-        Value::Array(items) => items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let title = title(item).unwrap_or_else(|| format!("item {}", i + 1));
-                format!("## {title}\n{}", body(item, now_ms, &[]))
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n"),
+        Value::Array(items) => {
+            let mut parts: Vec<String> = items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let title = title(item).unwrap_or_else(|| format!("item {}", i + 1));
+                    format!("## {title}\n{}", body(item, now_ms, &[]))
+                })
+                .collect();
+            if let Some((summary, next)) = super::next::note_list(command, items) {
+                parts.push(summary.join("\n"));
+                parts.push(format!("Next: {next}"));
+            }
+            parts.join("\n\n")
+        }
         Value::Object(m) => {
             let (summary, next) = match (m.get("summary"), m.get("next")) {
                 (Some(Value::Array(s)), Some(Value::String(n))) => (
@@ -34,7 +40,15 @@ pub fn render(command: &str, value: &Value, now_ms: i64) -> String {
                 ),
                 _ => super::next::note(command, value),
             };
-            let mut out = block(value, now_ms);
+            let mut shown = value.clone();
+            super::next::hide_ended_times(&mut shown);
+            if command == "leases" {
+                // Said in the summary ("a clerk wait is running").
+                if let Some(m) = shown.as_object_mut() {
+                    m.remove("armed");
+                }
+            }
+            let mut out = block(&shown, now_ms);
             let summary: Vec<String> = summary.into_iter().filter(|l| !l.is_empty()).collect();
             if !summary.is_empty() {
                 out.push_str("\n\n");
@@ -271,7 +285,7 @@ fn body(value: &Value, now_ms: i64, skip: &[&str]) -> String {
     let mut lines = Vec::new();
     let mut sections = Vec::new();
     for (k, v) in m {
-        if skip.contains(&k.as_str()) || is_empty(v) {
+        if skip.contains(&k.as_str()) || omitted(k, v) {
             continue;
         }
         if let Value::String(text) = v
@@ -294,11 +308,28 @@ fn body(value: &Value, now_ms: i64, skip: &[&str]) -> String {
 fn field(key: &str, v: &Value, now_ms: i64, indent: usize) -> String {
     let pad = " ".repeat(indent);
     match v {
+        // A free unit says so in one word.
+        Value::Object(m)
+            if key == "occupancy"
+                && m.len() == 1
+                && m.get("kind").and_then(Value::as_str) == Some("free") =>
+        {
+            format!("{pad}- occupancy: free")
+        }
         Value::Object(m) => {
             let inner: Vec<String> = m
                 .iter()
-                .filter(|(_, x)| !is_empty(x))
-                .map(|(k, x)| field(k, x, now_ms, indent + 2))
+                .filter(|(k, x)| !omitted(k, x))
+                .map(|(k, x)| match (key, k.as_str(), x.as_str()) {
+                    // A dirty record's reason in words, not its wire name.
+                    ("dirty", "reason", Some(reason)) => field(
+                        k,
+                        &Value::String(super::views::dirty_explanation(reason).to_owned()),
+                        now_ms,
+                        indent + 2,
+                    ),
+                    _ => field(k, x, now_ms, indent + 2),
+                })
                 .collect();
             format!("{pad}- {key}:\n{}", inner.join("\n"))
         }
@@ -313,7 +344,7 @@ fn field(key: &str, v: &Value, now_ms: i64, indent: usize) -> String {
                 .map(|x| match x {
                     Value::Object(m) => m
                         .iter()
-                        .filter(|(_, y)| !is_empty(y))
+                        .filter(|(k, y)| !omitted(k, y))
                         .map(|(k, y)| field(k, y, now_ms, indent + 2))
                         .collect::<Vec<_>>()
                         .join("\n"),
@@ -334,6 +365,7 @@ fn field(key: &str, v: &Value, now_ms: i64, indent: usize) -> String {
 /// as a span.
 fn scalar(key: &str, v: &Value, now_ms: i64) -> String {
     match v {
+        Value::String(s) if key == "state" && s == "cleaning" => "in cleanup".to_owned(),
         Value::String(s) => s.clone(),
         Value::Number(n) if is_time(key) => n.as_i64().map_or_else(
             || n.to_string(),
@@ -354,11 +386,18 @@ fn scalar(key: &str, v: &Value, now_ms: i64) -> String {
 
 /// A field's label: a duration loses its `_ms` (its value says the unit).
 fn label(key: &str) -> &str {
-    if is_duration(key) {
-        key.strip_suffix("_ms").unwrap_or(key)
-    } else {
-        key
+    match key {
+        "retiring" => "being retired",
+        "shadows_user" => "hides the user resource of the same id",
+        _ if is_duration(key) => key.strip_suffix("_ms").unwrap_or(key),
+        _ => key,
     }
+}
+
+/// A field not worth a line: empty, or a flag that is off and says nothing
+/// by being off (`retiring`, `shadows_user`).
+fn omitted(key: &str, v: &Value) -> bool {
+    is_empty(v) || (matches!(key, "retiring" | "shadows_user") && *v == Value::Bool(false))
 }
 
 /// Null, an empty string, list or object.
@@ -562,7 +601,7 @@ mod tests {
 
     #[test]
     fn a_list_is_one_block_per_item_without_next() {
-        let md = render("resources", &json!([{"id": "a"}, {"id": "b"}]), NOW);
+        let md = render("log", &json!([{"id": "a"}, {"id": "b"}]), NOW);
         assert!(md.contains("## a\n") && md.contains("## b\n"), "{md}");
         assert!(!md.contains("Next:"), "{md}");
     }
@@ -600,6 +639,74 @@ mod tests {
         assert_eq!(
             md,
             "## Error: not_found\nno such lease. Run `clerk leases --mine`."
+        );
+    }
+
+    #[test]
+    fn a_resource_list_ends_with_its_summary_and_next() {
+        let md = render("resources", &json!([{"id": "a"}, {"id": "b"}]), NOW);
+        assert!(md.contains("## a\n") && md.contains("## b\n"), "{md}");
+        assert!(md.contains("\n\n2 resources registered."), "{md}");
+        assert!(
+            md.trim_end().lines().last().unwrap().starts_with("Next: "),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn an_empty_resource_list_says_none_are_registered() {
+        let md = render("resources", &json!([]), NOW);
+        assert!(md.starts_with("No resources registered."), "{md}");
+        assert!(
+            md.contains("Next: Register one with `clerk resource create"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn a_cleaning_lease_is_in_cleanup() {
+        let md = render("x", &json!({"lease_id": "L1", "state": "cleaning"}), NOW);
+        assert!(md.contains("- state: in cleanup"), "{md}");
+        assert!(!md.contains("cleaning"), "{md}");
+    }
+
+    #[test]
+    fn the_armed_flag_is_said_in_the_summary_not_as_a_field() {
+        let v = json!({"leases": [], "requests": [], "armed": false});
+        let md = render("leases", &v, NOW);
+        assert!(!md.contains("armed"), "{md}");
+        assert!(md.contains("no clerk wait is running"), "{md}");
+    }
+
+    #[test]
+    fn a_free_occupancy_is_one_word() {
+        let md = render(
+            "x",
+            &json!({"id": "u1", "occupancy": {"kind": "free"}}),
+            NOW,
+        );
+        assert!(md.contains("- occupancy: free"), "{md}");
+    }
+
+    #[test]
+    fn a_dirty_reason_is_in_words() {
+        let md = render(
+            "x",
+            &json!({"dirty": {"at": NOW, "reason": "holder_gone"}}),
+            NOW,
+        );
+        assert!(md.contains("the last holder went away"), "{md}");
+        assert!(!md.contains("holder_gone"), "{md}");
+    }
+
+    #[test]
+    fn an_ended_lease_shows_no_end_or_cleanup_time() {
+        let v = json!({"lease_id": "L1", "state": "ended", "ends_at": NOW + 60_000,
+                       "cleanup_deadline": NOW + 120_000});
+        let md = render("release", &v, NOW);
+        assert!(
+            !md.contains("ends_at") && !md.contains("cleanup_deadline"),
+            "{md}"
         );
     }
 }

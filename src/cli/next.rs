@@ -18,9 +18,22 @@ pub fn annotate(command: &str, value: &mut Value) {
     if !value.is_object() {
         return;
     }
+    hide_ended_times(value);
     let (summary, next) = note(command, value);
     value["summary"] = json!(summary);
     value["next"] = json!(next);
+}
+
+/// Drop `ends_at` and `cleanup_deadline` from an ended lease: the times
+/// of a lease that is over contradict `state: ended`.
+pub fn hide_ended_times(value: &mut Value) {
+    if value["state"] == "ended"
+        && value["lease_id"].is_string()
+        && let Some(m) = value.as_object_mut()
+    {
+        m.remove("ends_at");
+        m.remove("cleanup_deadline");
+    }
 }
 
 /// The next step after an error with `code`, for the end of its message.
@@ -322,10 +335,14 @@ fn after_lease_actions(v: &Value, base: String) -> String {
 fn leases(v: &Value) -> (Vec<String>, String) {
     (
         vec![format!(
-            "{} lease(s), {} queued request(s); a wait is {}armed.",
+            "{} lease(s), {} queued request(s); {}.",
             v["leases"].as_array().map_or(0, Vec::len),
             v["requests"].as_array().map_or(0, Vec::len),
-            if v["armed"] == true { "" } else { "not " }
+            if v["armed"] == true {
+                "a clerk wait is running"
+            } else {
+                "no clerk wait is running"
+            }
         )],
         after_lease_actions(
             v,
@@ -338,6 +355,137 @@ fn leases(v: &Value) -> (Vec<String>, String) {
             },
         ),
     )
+}
+
+/// The next step after a `resource` or `unit` subcommand.
+fn inventory_next(command: &str, v: &Value) -> String {
+    match command {
+        "resource create" => format!(
+            "The resource has no units yet, so it cannot be acquired: add one with `clerk unit \
+             add {} <unit> --path <p>` (a device), `--host <h> --port <n>` (a service) or \
+             `--key <k>` (generic); `clerk types` lists the settings.",
+            v["resource"]["id"].as_str().unwrap_or("<resource>")
+        ),
+        "resource delete" | "unit remove" => {
+            "It is gone: remove its ids from your notes (the project's docs or your memory)."
+                .to_owned()
+        }
+        "unit retire" => retired_next(v),
+        _ => "Record the resource and unit ids in the project's docs or your memory; \
+              `clerk acquire <resource> --for <d> --purpose <text>` before using one."
+            .to_owned(),
+    }
+}
+
+/// The next step after `unit retire`: the unit went now, or goes after its
+/// lease.
+fn retired_next(v: &Value) -> String {
+    let id = format!(
+        "{}/{}",
+        s(&v["retired"], "resource"),
+        s(&v["retired"], "unit")
+    );
+    if v["retired"]["removed"] == false {
+        format!(
+            "Unit {id} is in use, so it goes after its lease ends and is never granted again; \
+             remove its id from your notes once it is gone."
+        )
+    } else {
+        format!("Unit {id} was removed now: remove its id from your notes.")
+    }
+}
+
+/// `1 unit`, `2 units`.
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// What to do when nothing is registered.
+const REGISTER: &str = "Register one with `clerk resource create <id> --type \
+                        device|service|generic` (see `clerk types`), then `clerk unit add`.";
+
+/// The note of `status`: counts of resources, units and queued requests.
+fn status(v: &Value) -> (Vec<String>, String) {
+    let resources = v["resources"].as_array().map_or(&[][..], Vec::as_slice);
+    if resources.is_empty() {
+        return (
+            vec!["No resources registered.".to_owned()],
+            REGISTER.to_owned(),
+        );
+    }
+    let units: Vec<&Value> = resources
+        .iter()
+        .flat_map(|r| r["units"].as_array().into_iter().flatten())
+        .collect();
+    let free = units
+        .iter()
+        .filter(|u| u["occupancy"]["kind"] == "free")
+        .count();
+    let queued: usize = resources
+        .iter()
+        .map(|r| r["queue"].as_array().map_or(0, Vec::len))
+        .sum();
+    (
+        vec![format!(
+            "{}, {}: {free} free, {} held, {} queued.",
+            count(resources.len(), "resource"),
+            count(units.len(), "unit"),
+            units.len() - free,
+            count(queued, "request"),
+        )],
+        "Take a free unit with `clerk acquire <resource> --for <d> --purpose <text>`; `clerk \
+         leases --mine` shows where you stand."
+            .to_owned(),
+    )
+}
+
+/// The summary and next step of a list result (`resources`, `queue`), shown
+/// after its blocks in Markdown. `None` for commands whose lists end no
+/// further.
+#[must_use]
+pub fn note_list(command: &str, items: &[Value]) -> Option<(Vec<String>, String)> {
+    match command {
+        "resources" | "resource list" if items.is_empty() => Some((
+            vec!["No resources registered.".to_owned()],
+            REGISTER.to_owned(),
+        )),
+        "resources" | "resource list" => Some((
+            vec![format!("{} registered.", count(items.len(), "resource"))],
+            "Read a resource's units and usage with `clerk resource show <id>`; take a unit \
+             with `clerk acquire <id> --for <d> --purpose <text>`."
+                .to_owned(),
+        )),
+        "queue" => {
+            let summary: Vec<String> = items
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} queued for {}.",
+                        count(r["queue"].as_array().map_or(0, Vec::len), "request"),
+                        s(r, "resource")
+                    )
+                })
+                .collect();
+            let resource = items
+                .first()
+                .map_or_else(|| "<resource>".to_owned(), |r| s(r, "resource"));
+            let any = items
+                .iter()
+                .any(|r| r["queue"].as_array().is_some_and(|q| !q.is_empty()));
+            let next = if any {
+                "Requests are served in this order. `clerk cancel <request id>` withdraws your \
+                 own; `clerk leases --mine` shows where you stand."
+                    .to_owned()
+            } else {
+                format!(
+                    "Nobody waits: `clerk acquire {resource} --for <d> --purpose <text>` asks \
+                     for a unit."
+                )
+            };
+            Some((summary, next))
+        }
+        _ => None,
+    }
 }
 
 /// The summary lines and next step for `command`'s result `v`.
@@ -417,12 +565,10 @@ pub fn note(command: &str, v: &Value) -> (Vec<String>, String) {
              with settings of that type."
                 .to_owned(),
         ),
-        "resource" | "unit" => (
-            Vec::new(),
-            "Record the resource and unit ids in the project's docs or your memory; \
-             `clerk acquire <resource> --for <d> --purpose <text>` before using one."
-                .to_owned(),
-        ),
+        c if c.starts_with("resource") || c.starts_with("unit") => {
+            (Vec::new(), inventory_next(c, v))
+        }
+        "status" => status(v),
         "leases" => leases(v),
         "daemon" if v["running"] == false => (
             vec!["The clerk daemon is stopped.".to_owned()],
@@ -622,5 +768,118 @@ mod tests {
         let mut v = json!([1, 2]);
         annotate("resources", &mut v);
         assert_eq!(v, json!([1, 2]));
+    }
+
+    #[test]
+    fn leases_says_whether_a_clerk_wait_is_running() {
+        let (summary, _) = note(
+            "leases",
+            &json!({"leases": [], "requests": [], "armed": true}),
+        );
+        assert!(
+            summary[0].contains("a clerk wait is running"),
+            "{summary:?}"
+        );
+        let (summary, _) = note("leases", &mine(&json!([])));
+        assert!(
+            summary[0].contains("no clerk wait is running"),
+            "{summary:?}"
+        );
+        assert!(!summary[0].contains("armed"), "{summary:?}");
+    }
+
+    #[test]
+    fn resource_create_says_to_add_units() {
+        let (_, next) = note("resource create", &json!({"resource": {"id": "boards"}}));
+        assert!(next.contains("clerk unit add boards"), "{next}");
+        assert!(!next.contains("clerk acquire"), "{next}");
+    }
+
+    #[test]
+    fn deleting_or_removing_says_to_drop_the_ids_from_notes() {
+        for (command, v) in [
+            (
+                "resource delete",
+                json!({"deleted": {"resource": "boards"}}),
+            ),
+            (
+                "unit remove",
+                json!({"removed": {"resource": "boards", "unit": "b1"}}),
+            ),
+        ] {
+            let (_, next) = note(command, &v);
+            assert!(next.contains("notes"), "{command}: {next}");
+            assert!(!next.contains("clerk acquire"), "{command}: {next}");
+        }
+    }
+
+    #[test]
+    fn retiring_says_whether_the_unit_went_now_or_after_the_lease() {
+        let retired = |removed: bool| json!({"retired": {"resource": "boards", "unit": "b1", "removed": removed}});
+        let (_, now) = note("unit retire", &retired(true));
+        assert!(now.contains("removed now"), "{now}");
+        let (_, later) = note("unit retire", &retired(false));
+        assert!(later.contains("after its lease"), "{later}");
+    }
+
+    #[test]
+    fn an_empty_resource_list_says_none_are_registered() {
+        let (summary, next) = note_list("resources", &[]).unwrap();
+        assert_eq!(summary, ["No resources registered."]);
+        assert!(next.contains("clerk resource create"), "{next}");
+    }
+
+    #[test]
+    fn a_resource_list_is_counted() {
+        let items = [json!({"id": "a"}), json!({"id": "b"})];
+        let (summary, _) = note_list("resources", &items).unwrap();
+        assert_eq!(summary, ["2 resources registered."]);
+    }
+
+    #[test]
+    fn status_counts_resources_units_and_the_queue() {
+        let v = json!({"resources": [
+            {"id": "a", "units": [{"occupancy": {"kind": "free"}},
+                                  {"occupancy": {"kind": "held"}}],
+             "queue": [{"request_id": "r1"}]},
+        ]});
+        let (summary, _) = note("status", &v);
+        assert_eq!(
+            summary,
+            ["1 resource, 2 units: 1 free, 1 held, 1 request queued."]
+        );
+    }
+
+    #[test]
+    fn an_empty_status_says_none_are_registered() {
+        let (summary, next) = note("status", &json!({"resources": []}));
+        assert_eq!(summary, ["No resources registered."]);
+        assert!(next.contains("clerk resource create"), "{next}");
+    }
+
+    #[test]
+    fn a_queue_is_counted_and_next_says_how_to_ask() {
+        let items = [json!({"resource": "board", "queue": []})];
+        let (summary, next) = note_list("queue", &items).unwrap();
+        assert_eq!(summary, ["0 requests queued for board."]);
+        assert!(next.contains("clerk acquire board"), "{next}");
+    }
+
+    #[test]
+    fn annotate_drops_the_end_times_of_an_ended_lease() {
+        let mut v = json!({"lease_id": "L1", "state": "ended", "ends_at": 5,
+                           "cleanup_deadline": 6});
+        annotate("release", &mut v);
+        assert!(
+            v.get("ends_at").is_none() && v.get("cleanup_deadline").is_none(),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn annotate_keeps_the_end_of_a_live_lease() {
+        let mut v = json!({"lease_id": "L1", "state": "held", "ends_at": 5});
+        annotate("extend", &mut v);
+        assert_eq!(v["ends_at"], 5);
     }
 }

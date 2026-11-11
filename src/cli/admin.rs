@@ -19,6 +19,8 @@ use clap::{Args, Subcommand};
 use leclerk::admin::{HolderSpec, ScopeSpec};
 use leclerk::client::ApiError;
 use leclerk::clock::{Clock, SystemClock};
+use leclerk::model::Scope;
+use leclerk::scope::ProjectResolver;
 use serde_json::{Map, Value, json};
 
 use super::caller::CallerKind;
@@ -38,11 +40,32 @@ pub struct AdminArgs {
     action: AdminAction,
 }
 
+/// A `--scope` value: `user`, `project` (the project of the working
+/// directory) or `project:<path>`.
+///
+/// # Errors
+/// A message naming the accepted forms.
+pub fn parse_scope(s: &str) -> Result<ScopeSpec, String> {
+    if s == "project" {
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("cannot tell this directory's project: {e}"))?;
+        let key = ProjectResolver::resolve(&cwd).map_err(|e| e.to_string())?;
+        return Ok(ScopeSpec::from(&Scope::Project(key)));
+    }
+    ScopeSpec::parse(s).map_err(|_| {
+        format!(
+            "{s:?} is not a scope: use user, project (this directory's project) or \
+             project:<path>"
+        )
+    })
+}
+
 /// Where a resource lives, for ids that exist in more than one scope.
 #[derive(Args)]
 pub struct ScopeFlag {
-    /// `user` or `project:<path>`; default: your project, then user scope.
-    #[arg(long, value_parser = ScopeSpec::parse, value_name = "SCOPE")]
+    /// `user`, `project` (this directory's project) or `project:<path>`;
+    /// default: your project, then user scope.
+    #[arg(long, value_parser = parse_scope, value_name = "SCOPE")]
     pub scope: Option<ScopeSpec>,
 }
 
@@ -110,11 +133,12 @@ pub enum AdminAction {
     Move {
         /// The resource id.
         resource: String,
-        /// The scope to move it to: `user` or `project:<path>`.
-        #[arg(long, value_parser = ScopeSpec::parse, value_name = "SCOPE")]
+        /// The scope to move it to: `user`, `project` (this directory's project) or
+        /// `project:<path>`.
+        #[arg(long, value_parser = parse_scope, value_name = "SCOPE")]
         to: ScopeSpec,
         /// Its current scope, when the id exists in several.
-        #[arg(long = "from", value_parser = ScopeSpec::parse, value_name = "SCOPE")]
+        #[arg(long = "from", value_parser = parse_scope, value_name = "SCOPE")]
         from: Option<ScopeSpec>,
     },
     /// Rename a resource, or with --unit one of its units.
@@ -183,10 +207,10 @@ pub struct LinkArgs {
     /// `<resource>/<unit>`.
     b: String,
     /// The scope of the first unit's resource.
-    #[arg(long, value_parser = ScopeSpec::parse, value_name = "SCOPE")]
+    #[arg(long, value_parser = parse_scope, value_name = "SCOPE")]
     scope_a: Option<ScopeSpec>,
     /// The scope of the second unit's resource.
-    #[arg(long, value_parser = ScopeSpec::parse, value_name = "SCOPE")]
+    #[arg(long, value_parser = parse_scope, value_name = "SCOPE")]
     scope_b: Option<ScopeSpec>,
 }
 

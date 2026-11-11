@@ -3,6 +3,8 @@
 //! the caller (an agent session acts as itself; the user as the lease's
 //! `User` holder) and prints the daemon's answer.
 
+use std::fmt::Write as _;
+
 use clap::ValueEnum;
 use leclerk::model::{HealthSpec, ResourceType, allowed_builtins, placeholder_keys};
 use serde_json::{Value, json};
@@ -27,22 +29,68 @@ pub enum OnOff {
     Off,
 }
 
-/// The settings fields of each type, as (name, required, meaning).
-fn settings_fields(ty: ResourceType) -> &'static [(&'static str, bool, &'static str)] {
+/// A setting of a unit: its wire name, the `clerk unit add` flag that sets
+/// it, whether it is required, and what it means.
+struct Setting {
+    name: &'static str,
+    flag: &'static str,
+    required: bool,
+    meaning: &'static str,
+}
+
+const fn setting(
+    name: &'static str,
+    flag: &'static str,
+    required: bool,
+    meaning: &'static str,
+) -> Setting {
+    Setting {
+        name,
+        flag,
+        required,
+        meaning,
+    }
+}
+
+const DEVICE: &[Setting] = &[setting(
+    "path",
+    "--path",
+    true,
+    "filesystem path of the device node",
+)];
+
+const SERVICE: &[Setting] = &[
+    setting(
+        "mode",
+        "--listen",
+        true,
+        "\"connect\" to a running server (the default) or \"listen\" on a reserved port (give \
+         --listen)",
+    ),
+    setting("host", "--host", true, "host name or address"),
+    setting("port", "--port", true, "TCP port, not 0"),
+    setting("scheme", "--scheme", false, "URL scheme, e.g. \"http\""),
+    setting(
+        "service_id",
+        "--service-id",
+        false,
+        "service-specific identifier",
+    ),
+];
+
+const GENERIC: &[Setting] = &[setting(
+    "identity_key",
+    "--key",
+    true,
+    "a key naming the thing",
+)];
+
+/// The settings fields of each type.
+fn settings_fields(ty: ResourceType) -> &'static [Setting] {
     match ty {
-        ResourceType::Device => &[("path", true, "filesystem path of the device node")],
-        ResourceType::Service => &[
-            (
-                "mode",
-                true,
-                "\"connect\" to a running server or \"listen\" on a reserved port",
-            ),
-            ("host", true, "host name or address"),
-            ("port", true, "TCP port, not 0"),
-            ("scheme", false, "URL scheme, e.g. \"http\""),
-            ("service_id", false, "service-specific identifier"),
-        ],
-        ResourceType::Generic => &[("identity_key", true, "a key naming the thing")],
+        ResourceType::Device => DEVICE,
+        ResourceType::Service => SERVICE,
+        ResourceType::Generic => GENERIC,
     }
 }
 
@@ -69,8 +117,9 @@ pub fn types(ctx: &Ctx) -> anyhow::Result<()> {
         checks.push("custom");
         let fields: Vec<Value> = settings_fields(ty)
             .iter()
-            .map(|(name, required, meaning)| {
-                json!({"name": name, "required": required, "description": meaning})
+            .map(|f| {
+                json!({"name": f.name, "flag": f.flag, "required": f.required,
+                       "description": f.meaning})
             })
             .collect();
         json!({
@@ -83,21 +132,42 @@ pub fn types(ctx: &Ctx) -> anyhow::Result<()> {
         })
     })
     .collect();
-    ctx.out.emit(&View::new(json!({ "types": types }), |v| {
-        v["types"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|t| {
-                format!(
-                    "{}: {}",
-                    super::output::plain(&t["type"]),
-                    super::output::plain(&t["description"])
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }))
+    ctx.out
+        .emit(&View::new(json!({ "types": types }), types_text))
+}
+
+/// `clerk types` for people: each type with the flag of each setting, its
+/// health checks and its usage placeholders.
+fn types_text(v: &Value) -> String {
+    let plain = super::output::plain;
+    v["types"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            let mut text = format!("{}: {}", plain(&t["type"]), plain(&t["description"]));
+            for f in t["settings"].as_array().into_iter().flatten() {
+                let _ = write!(
+                    text,
+                    "\n  {} ({}): {}",
+                    plain(&f["flag"]),
+                    if f["required"] == true {
+                        "required"
+                    } else {
+                        "optional"
+                    },
+                    plain(&f["description"])
+                );
+            }
+            let _ = write!(text, "\n  health checks: {}", plain(&t["health_checks"]));
+            let placeholders = plain(&t["usage_placeholders"]);
+            if !placeholders.is_empty() {
+                let _ = write!(text, "\n  usage placeholders: {placeholders}");
+            }
+            text
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Call `method` on `lease` as its holder with `extra` arguments and print

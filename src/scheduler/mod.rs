@@ -268,13 +268,18 @@ pub enum BlockedBy {
     /// Free target units are being health-checked; the request is offered
     /// one as soon as a check passes.
     Checking { units: Vec<UnitId> },
-    /// Target units are held: the lease that ends first.
+    /// Target units are held: the lease that ends first, and the others
+    /// (for a request that any unit of the resource will do, every unit is
+    /// held, soonest end first).
     Held {
         unit: UnitId,
         holder: HolderRef,
         lease_id: LeaseId,
         purpose: String,
         ends_at: Option<i64>,
+        /// The other held target units; absent when there are none.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        also_held: Vec<HeldUnit>,
     },
     /// A unit linked to a target unit (the same physical thing) is leased:
     /// the lease that ends first. Its resource, unit, holder and purpose are
@@ -287,6 +292,16 @@ pub enum BlockedBy {
         purpose: Option<String>,
         ends_at: Option<i64>,
     },
+}
+
+/// A held target unit named next to the one that frees first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeldUnit {
+    pub unit: UnitId,
+    pub holder: HolderRef,
+    pub lease_id: LeaseId,
+    pub purpose: String,
+    pub ends_at: Option<i64>,
 }
 
 /// A free unit whose last health check failed.
@@ -558,6 +573,8 @@ pub struct HolderView {
     pub resource: ResourceId,
     pub unit: UnitId,
     pub ends_at: Option<i64>,
+    /// When the cleanup window ends, while cleaning.
+    pub cleanup_deadline: Option<i64>,
 }
 
 /// One queued request in a status report.
@@ -654,6 +671,30 @@ fn health_text(result: HealthResult) -> String {
     }
 }
 
+/// The lease that ends first among the `held` target units, with the other
+/// held units after it; `None` when none is held.
+fn held_blocker(mut held: Vec<(&Unit, LeaseRow)>) -> Option<BlockedBy> {
+    held.sort_by_key(|(_, l)| l.ends_at.unwrap_or(i64::MAX));
+    let mut held = held.into_iter();
+    let (unit, lease) = held.next()?;
+    Some(BlockedBy::Held {
+        unit: unit.id.clone(),
+        holder: lease.holder,
+        lease_id: lease.id,
+        purpose: lease.purpose,
+        ends_at: lease.ends_at,
+        also_held: held
+            .map(|(unit, lease)| HeldUnit {
+                unit: unit.id.clone(),
+                holder: lease.holder,
+                lease_id: lease.id,
+                purpose: lease.purpose,
+                ends_at: lease.ends_at,
+            })
+            .collect(),
+    })
+}
+
 /// What keeps a request just queued on the resource at `resource_row`
 /// (only the unit at `pinned`, when set) from a unit: a free target unit
 /// being checked (`checking` says which are), else every free target unit
@@ -722,16 +763,10 @@ fn blocked_by(
             recheck_ms: u64::try_from(HEALTH_RECHECK_BACKOFF.as_millis()).unwrap_or(u64::MAX),
         }));
     }
-    let ending = |l: &LeaseRow| l.ends_at.unwrap_or(i64::MAX);
-    if let Some((unit, lease)) = held.into_iter().min_by_key(|(_, l)| ending(l)) {
-        return Ok(Some(BlockedBy::Held {
-            unit: unit.id.clone(),
-            holder: lease.holder,
-            lease_id: lease.id,
-            purpose: lease.purpose,
-            ends_at: lease.ends_at,
-        }));
+    if let Some(blocker) = held_blocker(held) {
+        return Ok(Some(blocker));
     }
+    let ending = |l: &LeaseRow| l.ends_at.unwrap_or(i64::MAX);
     if let Some((unit, lease)) = linked.into_iter().min_by_key(|(_, l)| ending(l)) {
         let held_on = inventory_sql::load_resource(tx, lease.resource_row)?;
         let visible = can_see(who.project.as_ref(), &held_on.scope);
@@ -1696,6 +1731,7 @@ impl Scheduler {
                                 resource: held_on.id.clone(),
                                 unit: lease_unit.id.clone(),
                                 ends_at: lease.ends_at,
+                                cleanup_deadline: lease.cleanup_deadline,
                             })
                         } else {
                             Occupancy::HeldInAnotherProject

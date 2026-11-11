@@ -248,10 +248,14 @@ pub fn scope(scope: &Value) -> String {
 }
 
 /// How far `at_ms` is from `now_ms`, rounded in its largest unit:
-/// `in 27m`, `9s ago`.
+/// `in 27m`, `9s ago`; `just now` within a second either way (a time the
+/// daemon wrote a moment ago must not read as the future).
 #[must_use]
 pub fn when(at_ms: i64, now_ms: i64) -> String {
     let delta = at_ms - now_ms;
+    if delta.unsigned_abs() < 1000 {
+        return "just now".to_owned();
+    }
     let span = span_ms(delta.unsigned_abs());
     if delta >= 0 {
         format!("in {span}")
@@ -639,7 +643,7 @@ mod tests {
         }
     }
 
-    mod when {
+    mod relative_time {
         use super::*;
 
         #[test]
@@ -723,6 +727,23 @@ mod tests {
         #[test]
         fn wide_keeps_it_whole() {
             assert_eq!(short_id("req_01M71FTC912K", true), "req_01M71FTC912K");
+        }
+    }
+
+    mod just_now {
+        use super::*;
+
+        #[test]
+        fn a_time_within_a_second_is_just_now() {
+            assert_eq!(when(1_000_300, 1_000_000), "just now");
+            assert_eq!(when(999_700, 1_000_000), "just now");
+            assert_eq!(when(1_000_000, 1_000_000), "just now");
+        }
+
+        #[test]
+        fn later_times_keep_their_span() {
+            assert_eq!(when(1_005_000, 1_000_000), "in 5s");
+            assert_eq!(when(995_000, 1_000_000), "5s ago");
         }
     }
 }

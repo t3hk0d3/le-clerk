@@ -1389,13 +1389,31 @@ fn blocked_text(b: &Value, style: Style) -> Option<String> {
                 }
             ))
         }
-        "held" => Some(format!(
-            "{} is held by {}{}{}.",
-            text(&b["unit"]),
-            render::holder(&b["holder"]),
-            purpose(b),
-            ends(b)
-        )),
+        "held" => {
+            let first = format!(
+                "{} is held by {}{}{}.",
+                text(&b["unit"]),
+                render::holder(&b["holder"]),
+                purpose(b),
+                ends(b)
+            );
+            let Some(also) = b["also_held"].as_array().filter(|a| !a.is_empty()) else {
+                return Some(first);
+            };
+            // Any unit of a pool will do, and all are held.
+            let order: Vec<String> = std::iter::once(b)
+                .chain(also)
+                .map(|u| match u["ends_at"].as_i64() {
+                    Some(at) => format!("{} {}", text(&u["unit"]), render::when(at, now)),
+                    None => text(&u["unit"]),
+                })
+                .collect();
+            Some(format!(
+                "all {} units held; soonest free: {}.\n  {first}",
+                order.len(),
+                order.join(", then ")
+            ))
+        }
         "linked" => Some(match b["held_resource"].as_str() {
             Some(r) => format!(
                 "{} is busy: the same device is held as {}/{} by {}{}{}.",

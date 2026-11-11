@@ -393,6 +393,14 @@ pub fn text(v: &Value) -> String {
     plain(v)
 }
 
+/// A lease state in plain words: `cleaning` is `in cleanup`.
+fn state_words(state: &Value) -> String {
+    match state.as_str() {
+        Some("cleaning") => "in cleanup".to_owned(),
+        _ => text(state),
+    }
+}
+
 /// `user` or `project <folder>`.
 pub fn scope_text(scope: &Value) -> String {
     render::scope(scope)
@@ -517,6 +525,21 @@ fn resource_header(r: &Value, units: &[Value], tags: bool, style: Style) -> Stri
     t
 }
 
+/// A lease in its cleanup window, in words: `in cleanup (lease ended 18s
+/// ago, confirm due in 2m)`.
+fn cleanup_text(o: &Value, now_ms: i64) -> String {
+    let when = |key: &str| o[key].as_i64().map(|at| render::when(at, now_ms));
+    // A lease given back early still has its old end in the future.
+    let ended = match o["ends_at"].as_i64() {
+        Some(at) if at <= now_ms => format!("lease ended {}", render::when(at, now_ms)),
+        _ => "lease given back".to_owned(),
+    };
+    match when("cleanup_deadline") {
+        Some(due) => format!("in cleanup ({ended}, confirm due {due})"),
+        None => "in cleanup".to_owned(),
+    }
+}
+
 /// One unit of the status view: its line, then its description and the
 /// holder's purpose on an indented line.
 fn unit_block(u: &Value, now_ms: i64, style: Style) -> String {
@@ -527,28 +550,36 @@ fn unit_block(u: &Value, now_ms: i64, style: Style) -> String {
     if let Some(d) = some_text(&u["description"]) {
         details.push(d.to_owned());
     }
+    // "free" means healthy and clean: a failed check and a dirty record are
+    // spelled out whatever the occupancy.
+    let health = unhealthy_message(u).map(|why| {
+        let mut warning = format!("unhealthy: {why}");
+        if let Some(at) = u["last_health_at"].as_i64() {
+            let _ = write!(warning, " (checked {})", render::when(at, now_ms));
+        }
+        style.warn(&warning)
+    });
     match o["kind"].as_str() {
         Some("free") => {
-            if let Some(why) = unhealthy_message(u) {
-                let mut warning = format!("unhealthy: {why}");
-                if let Some(at) = u["last_health_at"].as_i64() {
-                    let _ = write!(warning, " (checked {})", render::when(at, now_ms));
+            match &health {
+                Some(warning) => {
+                    let _ = write!(t, "{} {warning}", render::BUSY);
                 }
-                let _ = write!(t, "{} {}", render::BUSY, style.warn(&warning));
-            } else {
-                let _ = write!(t, "{} free", render::FREE);
-                if let Some(reason) = u["dirty"]["reason"].as_str() {
-                    let mut warning = format!("dirty: {reason}");
-                    if let Some(at) = u["dirty"]["at"].as_i64() {
-                        let _ = write!(warning, " {}", render::when(at, now_ms));
-                    }
-                    let _ = write!(
-                        warning,
-                        " ({})",
-                        render::holder(&u["dirty"]["previous_holder"])
-                    );
-                    let _ = write!(t, "{SEP}{}", style.warn(&warning));
+                None => {
+                    let _ = write!(t, "{} free", render::FREE);
                 }
+            }
+            if let Some(reason) = u["dirty"]["reason"].as_str() {
+                let mut warning = format!("dirty: {reason}");
+                if let Some(at) = u["dirty"]["at"].as_i64() {
+                    let _ = write!(warning, " {}", render::when(at, now_ms));
+                }
+                let _ = write!(
+                    warning,
+                    " ({})",
+                    render::holder(&u["dirty"]["previous_holder"])
+                );
+                let _ = write!(t, "{SEP}{}", style.warn(&warning));
             }
         }
         Some("held") => {
@@ -561,6 +592,7 @@ fn unit_block(u: &Value, now_ms: i64, style: Style) -> String {
                 match state.as_str() {
                     "held" => format!("held by {holder}"),
                     "offered" => format!("offered to {holder}"),
+                    "cleaning" => format!("{}, held by {holder}", cleanup_text(o, now_ms)),
                     other => format!("{other}, held by {holder}"),
                 }
             );
@@ -568,10 +600,15 @@ fn unit_block(u: &Value, now_ms: i64, style: Style) -> String {
                 // Held through a linked unit: the same physical thing.
                 let _ = write!(t, " as {}", unit_ref(&o["resource"], &o["unit"], style));
             }
-            if let Some(at) = o["ends_at"].as_i64() {
+            if o["state"] != "cleaning"
+                && let Some(at) = o["ends_at"].as_i64()
+            {
                 let _ = write!(t, "{SEP}ends {}", render::when(at, now_ms));
             }
             let _ = write!(t, "{SEP}{}", text(&o["lease_id"]));
+            if let Some(warning) = &health {
+                let _ = write!(t, "{SEP}{warning}");
+            }
             if let Some(p) = some_text(&o["purpose"]) {
                 details.push(render::quoted(p));
             }
@@ -611,13 +648,21 @@ fn queue_entry_text(q: &Value) -> String {
     t
 }
 
+/// The empty state of `status` and `resources`: nothing is registered, and
+/// how to register.
+fn no_resources() -> String {
+    "No resources registered.\nRegister one with `clerk resource create <id> --type \
+     device|service|generic` (see `clerk types`), then add its units with `clerk unit add`."
+        .to_owned()
+}
+
 fn status_text(v: &Value) -> String {
     let now = SystemClock.now_ms();
     let style = Style::current();
     let width = render::width();
     let resources = v["resources"].as_array().cloned().unwrap_or_default();
     if resources.is_empty() {
-        return "No resources.".to_owned();
+        return no_resources();
     }
     let mut out = Vec::new();
     for r in &resources {
@@ -660,7 +705,7 @@ fn resources_text(v: &Value, status: &Value) -> String {
     let width = render::width();
     let list = v.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
-        return "No resources.".to_owned();
+        return no_resources();
     }
     let mut out = Vec::new();
     for r in &list {
@@ -806,9 +851,11 @@ fn leases_text(v: &Value) -> String {
             "{ITEM}{}  {}{SEP}{}",
             text(&o["lease_id"]),
             unit_ref(&o["resource"], &o["unit"], style),
-            text(&o["state"])
+            state_words(&o["state"])
         );
-        if let Some(at) = o["ends_at"].as_i64() {
+        if o["state"] != "cleaning"
+            && let Some(at) = o["ends_at"].as_i64()
+        {
             let _ = write!(t, "{SEP}ends {}", render::when(at, now));
         }
         let _ = write!(t, "{SEP}{}", render::holder(&o["holder"]));
@@ -846,9 +893,11 @@ fn my_leases_text(v: &Value) -> String {
             "{ITEM}{}  {}{SEP}{}",
             text(&l["lease_id"]),
             unit_ref(&l["resource"], &l["unit"], style),
-            text(&l["state"])
+            state_words(&l["state"])
         );
-        if let Some(at) = l["ends_at"].as_i64() {
+        if l["state"] != "cleaning"
+            && let Some(at) = l["ends_at"].as_i64()
+        {
             let _ = write!(t, "{SEP}ends {}", render::when(at, now));
         }
         let _ = write!(t, "\n{}", brief_text(l));
@@ -960,7 +1009,17 @@ fn audit_what(e: &Value, wide: bool) -> String {
     let style = Style::current();
     let d = &e["detail"];
     let mut head = String::new();
-    if let Some(r) = d["resource"].as_str() {
+    // A resource event names its resource as `id`.
+    let own_id = d["resource"]
+        .is_null()
+        .then(|| d["id"].as_str())
+        .flatten()
+        .filter(|_| {
+            e["action"]
+                .as_str()
+                .is_some_and(|a| a.starts_with("resource_"))
+        });
+    if let Some(r) = d["resource"].as_str().or(own_id) {
         head.push_str(&style.id(r));
         if let Some(u) = d["unit"].as_str() {
             let _ = write!(head, "/{u}");
@@ -983,7 +1042,10 @@ fn audit_what(e: &Value, wide: bool) -> String {
     let consumed = ["resource", "unit", "holder", "purpose", "override_reason"];
     if let Value::Object(map) = d {
         for (key, value) in map {
-            if consumed.contains(&key.as_str()) || value.is_null() {
+            if consumed.contains(&key.as_str())
+                || value.is_null()
+                || (own_id.is_some() && key == "id")
+            {
                 continue;
             }
             let shown = match value.as_str() {
@@ -1002,7 +1064,14 @@ fn audit_what(e: &Value, wide: bool) -> String {
                         Some(reason) => format!("{}: {reason}", key.replace('_', " ")),
                         None => continue,
                     },
-                    other => format!("{}: {}", key.replace('_', " "), plain(other)),
+                    other => {
+                        // An empty list or text has nothing to label.
+                        let shown = plain(other);
+                        if shown.is_empty() {
+                            continue;
+                        }
+                        format!("{}: {shown}", key.replace('_', " "))
+                    }
                 },
             };
             parts.push(shown);
@@ -1162,5 +1231,101 @@ mod tests {
             audit_what(&e, false),
             "otbr by cli · req_01M71FTC… · \"late\""
         );
+    }
+
+    fn plain() -> Style {
+        Style {
+            color: false,
+            unicode: true,
+        }
+    }
+
+    #[test]
+    fn a_free_unit_shows_its_failed_check_and_its_dirty_record() {
+        let u = json!({"id": "main", "resource": "svc", "occupancy": {"kind": "free"},
+                       "last_health": "unhealthy: connect failed",
+                       "dirty": {"reason": "override", "at": 0,
+                                 "previous_holder": {"kind": "user", "tag": "x"}}});
+        let t = unit_block(&u, 60_000, plain());
+        assert!(t.contains("unhealthy: connect failed"), "{t}");
+        assert!(t.contains("dirty: override"), "{t}");
+    }
+
+    #[test]
+    fn a_held_unit_shows_a_failed_check() {
+        let u = json!({"id": "main", "resource": "svc", "last_health": "unhealthy: path missing",
+                       "occupancy": {"kind": "held", "state": "held", "resource": "svc",
+                                     "unit": "main", "lease_id": "L1",
+                                     "holder": {"kind": "user", "tag": "x"}}});
+        let t = unit_block(&u, 0, plain());
+        assert!(t.contains("held by"), "{t}");
+        assert!(t.contains("unhealthy: path missing"), "{t}");
+    }
+
+    #[test]
+    fn a_cleaning_unit_is_in_cleanup_with_when_it_ended_and_is_due() {
+        let now = 1_000_000;
+        let u = json!({"id": "b1", "resource": "r",
+                       "occupancy": {"kind": "held", "state": "cleaning", "resource": "r",
+                                     "unit": "b1", "lease_id": "L1",
+                                     "ends_at": now - 18_000,
+                                     "cleanup_deadline": now + 120_000,
+                                     "holder": {"kind": "agent_session", "session_id": "sess-B"}}});
+        let t = unit_block(&u, now, plain());
+        assert!(
+            t.contains("in cleanup (lease ended 18s ago, confirm due in 2m)"),
+            "{t}"
+        );
+        assert!(!t.contains("cleaning"), "{t}");
+        assert!(!t.contains("ends 18s ago"), "{t}");
+    }
+
+    #[test]
+    fn a_lease_given_back_early_does_not_claim_to_have_ended_in_the_future() {
+        let now = 1_000_000;
+        let u = json!({"id": "b1", "resource": "r",
+                       "occupancy": {"kind": "held", "state": "cleaning", "resource": "r",
+                                     "unit": "b1", "lease_id": "L1",
+                                     "ends_at": now + 300_000,
+                                     "cleanup_deadline": now + 120_000,
+                                     "holder": {"kind": "user", "tag": "x"}}});
+        let t = unit_block(&u, now, plain());
+        assert!(
+            t.contains("in cleanup (lease given back, confirm due in 2m)"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn an_empty_status_is_none_registered_with_how_to_register() {
+        let t = status_text(&json!({"resources": []}));
+        assert!(t.starts_with("No resources registered."), "{t}");
+        assert!(t.contains("clerk resource create"), "{t}");
+    }
+
+    #[test]
+    fn audit_entries_leave_out_empty_labels() {
+        let e = json!({
+            "actor": {"kind": "user", "tag": "clerk"},
+            "action": "holder_gone",
+            "detail": {"holder": {"kind": "agent_session", "session_id": "s"},
+                       "leases_ended": [], "requests_dropped": ["req_1"]}
+        });
+        let t = audit_what(&e, false);
+        assert!(!t.contains("leases ended"), "{t}");
+        assert!(t.contains("requests dropped: req_1"), "{t}");
+    }
+
+    #[test]
+    fn a_resource_event_has_the_resource_as_its_subject() {
+        let e = json!({
+            "actor": {"kind": "agent_session", "session_id": "sess-A"},
+            "action": "resource_created",
+            "detail": {"id": "boards", "type": "generic", "tags": []}
+        });
+        let t = audit_what(&e, false);
+        assert!(t.starts_with("boards by agent sess-A"), "{t}");
+        assert!(!t.contains("id: boards"), "{t}");
+        assert!(!t.contains("tags"), "{t}");
     }
 }

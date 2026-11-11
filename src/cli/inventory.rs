@@ -8,12 +8,13 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};
+use leclerk::admin::ScopeSpec;
 use leclerk::client::ApiError;
 use leclerk::model::{BuiltinCheck, Check, HealthSpec, ResourceType, Scope, ServiceMode};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
-use super::admin::ScopeFlag;
+use super::admin::{self, ScopeFlag};
 use super::caller::{self, CallerKind};
 use super::input::{self, InputSpec};
 use super::output::View;
@@ -43,6 +44,19 @@ pub enum ResourceAction {
     },
 }
 
+impl ResourceAction {
+    /// The command as typed: `resource create`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Create(_) => "resource create",
+            Self::Update(_) => "resource update",
+            Self::Delete { .. } => "resource delete",
+            Self::List(_) => "resource list",
+            Self::Show { .. } => "resource show",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum UnitAction {
     /// Add a unit to a resource.
@@ -53,6 +67,18 @@ pub enum UnitAction {
     Remove(UnitRef),
     /// Retire a unit: removed now, or once its lease ends.
     Retire(UnitRef),
+}
+
+impl UnitAction {
+    /// The command as typed: `unit add`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Add(_) => "unit add",
+            Self::Update(_) => "unit update",
+            Self::Remove(_) => "unit remove",
+            Self::Retire(_) => "unit retire",
+        }
+    }
 }
 
 /// What kind of thing a resource leases out.
@@ -74,7 +100,7 @@ impl From<TypeArg> for ResourceType {
 }
 
 /// Where a new resource lives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeArg {
     /// Every project of this user.
@@ -174,10 +200,11 @@ pub struct CreateArgs {
     /// What kind of thing it is.
     #[arg(long = "type", value_enum)]
     ty: Option<TypeArg>,
-    /// `user` or `project` (the working directory's project). Default:
-    /// `user`; in an agent session, the session's project when there is one.
-    #[arg(long, value_enum)]
-    scope: Option<ScopeArg>,
+    /// `user`, `project` (this directory's project) or `project:<path>`.
+    /// Default: `user`; in an agent session, the session's project when
+    /// there is one.
+    #[arg(long, value_parser = admin::parse_scope, value_name = "SCOPE")]
+    scope: Option<ScopeSpec>,
     #[command(flatten)]
     text: TextArgs,
     /// Search tags.
@@ -380,19 +407,26 @@ async fn create(ctx: &Ctx, args: CreateArgs) -> anyhow::Result<()> {
                 .to_owned(),
         )
     })?;
-    let scope = match once("scope", "--scope", args.scope, doc.scope)? {
+    let by_doc = doc
+        .scope
+        .map(|scope| match scope {
+            ScopeArg::User => Ok(Scope::User),
+            ScopeArg::Project => caller.project.clone().map(Scope::Project).ok_or_else(|| {
+                UsageError(
+                    "Cannot use scope project: the working directory resolves to no project. \
+                     Run clerk from inside the project, or use scope user."
+                        .to_owned(),
+                )
+            }),
+        })
+        .transpose()?;
+    let scope = match once("scope", "--scope", args.scope.map(|s| s.scope()), by_doc)? {
+        Some(scope) => scope,
         // An agent registers what it finds for its own project by default.
         None if caller::is_agent(&caller) => {
             caller.project.clone().map_or(Scope::User, Scope::Project)
         }
-        None | Some(ScopeArg::User) => Scope::User,
-        Some(ScopeArg::Project) => Scope::Project(caller.project.clone().ok_or_else(|| {
-            UsageError(
-                "Cannot use --scope project: the working directory resolves to no project. Run \
-                 clerk from inside the project, or use --scope user."
-                    .to_owned(),
-            )
-        })?),
+        None => Scope::User,
     };
     let mut a = Map::new();
     a.insert("id".into(), json!(args.id));
@@ -702,13 +736,24 @@ async fn remove_unit(ctx: &Ctx, r: UnitRef, method: &'static str) -> anyhow::Res
     let caller = ctx.caller(CallerKind::Interactive)?;
     let mut a = json!({"resource": r.resource, "unit": r.unit});
     r.scope.put(&mut a);
-    ctx.client().await?.call(method, &caller, a).await?;
+    let client = ctx.client().await?;
+    client.call(method, &caller, a).await?;
     let done = if method == "retire_unit" {
         "retired"
     } else {
         "removed"
     };
-    let value = json!({ done: {"resource": r.resource, "unit": r.unit} });
+    let mut value = json!({ done: {"resource": r.resource, "unit": r.unit} });
+    if done == "retired" {
+        // A unit in use stays, flagged, until its lease ends.
+        let mut get = json!({ "id": r.resource });
+        r.scope.put(&mut get);
+        let resource = client.call("get_resource", &caller, get).await?;
+        let stays = resource["units"]
+            .as_array()
+            .is_some_and(|units| units.iter().any(|u| u["id"] == r.unit.as_str()));
+        value[done]["removed"] = json!(!stays);
+    }
     ctx.out.emit(&View::new(value, move |v| {
         let u = &v[done];
         let name = format!(
@@ -716,10 +761,12 @@ async fn remove_unit(ctx: &Ctx, r: UnitRef, method: &'static str) -> anyhow::Res
             views::text(&u["resource"]),
             views::text(&u["unit"])
         );
-        if done == "retired" {
-            format!("Retired unit {name}: it goes now, or once its lease ends.")
-        } else {
+        if done != "retired" {
             format!("Removed unit {name}.")
+        } else if u["removed"] == false {
+            format!("Retired unit {name}: it is in use, so it goes once its lease ends.")
+        } else {
+            format!("Retired unit {name}: it was removed now.")
         }
     }))
 }

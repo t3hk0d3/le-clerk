@@ -7,7 +7,7 @@ the map. Concepts are explained in [concepts.md](concepts.md).
 
 ```sh
 clerk types                                   # types, settings, checks, placeholders
-clerk resource create <id> --type device|service|generic [--scope user|project] \
+clerk resource create <id> --type device|service|generic [--scope user|project|project:<path>] \
   [--description …] [--tag …]… [--usage … | --usage-file …] \
   [--health <check>]… [--health-command <script>]
 clerk resource update <id> [--description …] [--add-tag …] [--remove-tag …] [--usage …]
@@ -37,7 +37,8 @@ usage: |
 ```
 
 Without `--scope`, people create in user scope and agents in their project
-(hardware should still go to user scope).
+(hardware should still go to user scope). Every `--scope` takes `user`,
+`project` (the project of the working directory) or `project:<path>`.
 
 ## Leasing
 

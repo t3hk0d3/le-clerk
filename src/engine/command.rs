@@ -610,7 +610,7 @@ impl Command {
             && args.target.unit.is_none()
         {
             return Err(ApiError::invalid_argument(
-                "skip_checks needs a specific unit (<resource>/<unit>): you vouch for that one \
+                "--skip-checks needs a specific unit (<resource>/<unit>): you vouch for that one \
                  unit, not for any unit of the resource",
             ));
         }
